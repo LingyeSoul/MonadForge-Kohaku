@@ -6,8 +6,26 @@ import { chartRegistry, mountChart, stageBase, epochAt } from '../core/charts.js
 import { cmpSel } from '../core/state.js';
 
 let cmpCache = [];
+/* False after clearCompare() — the echarts instance lingers but shows nothing,
+ * so the empty-state overlay must not trust the registry alone. */
+let cmpRendered = false;
 
 export function getCmpSel() { return cmpSel; }
+
+/* Guide the user inside the chart stage instead of showing a bare black box. */
+function syncCmpEmpty() {
+  const el = $('#cmp-empty');
+  if (!el) return;
+  if (cmpSel.size === 0) {
+    el.textContent = 'SELECT RUNS — 从上方选择运行开始对比';
+    el.classList.remove('hidden');
+  } else if (!cmpRendered) {
+    el.textContent = 'READY — 点击「开始对比」渲染曲线';
+    el.classList.remove('hidden');
+  } else {
+    el.classList.add('hidden');
+  }
+}
 
 export function renderComparePicker() {
   const box = $('#cmp-list');
@@ -34,6 +52,7 @@ export function renderComparePicker() {
   if (focusedId) $$('.cmp-run').find(el => el.dataset.id === focusedId)?.focus({ preventScroll: true });
   $('#cmp-count').textContent = cmpSel.size;
   $('#cmp-go').disabled = cmpSel.size < 1;
+  syncCmpEmpty();
 }
 
 export async function loadCompare() {
@@ -159,14 +178,17 @@ export function renderCompareChart(d) {
           const ep = epochAt(step, run.epoch_spans);
           if (ep != null) epStr = ` · E${ep}`;
         }
-        return `${p.marker}${p.seriesName}${epStr}<span style="float:right;margin-left:16px">${fmtNum(p.value[1])}</span>`;
+        return `${p.marker}${esc(p.seriesName)}${epStr}<span style="float:right;margin-left:16px">${fmtNum(p.value[1])}</span>`;
       });
     return [`step ${step}`, ...rows].join('<br>');
   };
 
   const chart = mountChart('cmp-chart', opt);
+  cmpRendered = true;
+  syncCmpEmpty();
   const tb = $('#cmp-table tbody');
-  tb.innerHTML = runs.map(r => `<tr>
+  tb.innerHTML = runs.map((r, i) => `<tr>
+    <td><span class="cmp-swatch" style="background:${palette[i % palette.length]}"></span></td>
     <td>${esc(runLabel(r))}</td>
     <td>${fmtNum(r.final_avr_loss)}</td>
     <td>${r.steps ?? '—'}</td>
@@ -181,6 +203,7 @@ function clearCompare() {
   $('#cmp-spans').checked = true;
   const ch = chartRegistry.get('cmp-chart');
   if (ch) ch.clear();
+  cmpRendered = false;
   $('#cmp-table tbody').innerHTML = '';
   renderComparePicker();
   window.dispatchEvent(new CustomEvent('ra:compare-picked', { detail: { ids: [] } }));
@@ -189,6 +212,7 @@ function clearCompare() {
 export function initCompare() {
   $('#cmp-go').addEventListener('click', runCompare);
   $('#cmp-clear').addEventListener('click', clearCompare);
+  syncCmpEmpty();
   const onChartOption = () => {
     if (!$('#cmp-chart').childElementCount) return;
     api('/api/compare', {

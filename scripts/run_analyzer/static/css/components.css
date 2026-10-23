@@ -147,7 +147,7 @@
   transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
 }
 .checkbox input:checked + span { background: var(--volt); border-color: var(--volt); }
-.checkbox input:focus-visible + span { outline: 1px solid var(--volt); outline-offset: 2px; }
+.checkbox input:focus-visible + span { outline: 2px solid var(--ink); outline-offset: 2px; }
 
 .chart { width: 100%; }
 .chart-pad { padding: 0 18px 18px; }

@@ -194,8 +194,8 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer); settingsDiscardRes
 .dataset-row img { width: 54px; height: 62px; object-fit: contain; border-radius: 3px; background: rgba(0,0,0,.15); }
 .dataset-row-copy { min-width: 0; flex: 1; }
 .dataset-row-copy strong, .dataset-row-copy small { display: block; overflow-wrap: anywhere; }
-.dataset-row-copy strong { font-size: 12px; font-weight: 500; }
-.dataset-row-copy small { font-size: 10px; opacity: .65; }
+.dataset-row-copy strong { font-size: var(--fs-caption); font-weight: 500; }
+.dataset-row-copy small { font-size: var(--fs-nano); opacity: .65; }
 .caption-dot { width: 6px; height: 6px; border: 1px solid rgba(var(--v-theme-on-surface), .35); border-radius: 50%; margin-top: 4px; }
 .caption-dot.present { background: rgb(var(--v-theme-primary)); border-color: transparent; }
 .stage-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; }
@@ -205,7 +205,7 @@ onBeforeUnmount(() => { disposed = true; clearTimeout(timer); settingsDiscardRes
 .curation-form-card :deep(.v-card-text) { padding-top: 12px; }
 .curation-form-card :deep(.v-card-actions) { padding: 12px 16px 16px; }
 .stage-summary { max-width: 90ch; line-height: 1.7; }
-.stage-reference { margin-top: 16px; font-size: 13px; color: var(--text-secondary); }
+.stage-reference { margin-top: 16px; font-size: var(--fs-small); color: var(--text-secondary); }
 .stage-reference summary { cursor: pointer; }
 .stage-document { margin-top: 12px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow: auto; line-height: 1.65; }
 .path-label { overflow-wrap: anywhere; }

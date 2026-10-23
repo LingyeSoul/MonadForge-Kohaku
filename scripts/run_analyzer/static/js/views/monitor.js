@@ -57,6 +57,18 @@ function bindMonitorControls() {
   if (monBound) return;
   monBound = true;
   const persist = () => saveState({ monitor: { ui: monUI, runId: monRunId } });
+  /* Reflect the persisted monUI state into the static controls before
+   * binding, so a restored session shows the actual smoothing/scale/series. */
+  const smooth = $('#mon-smooth');
+  smooth.value = monUI.smooth;
+  $('#mon-smooth-v').textContent = monUI.smooth;
+  $$('#mon-seg-scale button').forEach(b => b.classList.toggle('active', (b.dataset.scale === '1') === !!monUI.log));
+  $('#mon-bands').checked = !!monUI.bands;
+  $('#mon-raw').checked = !!monUI.raw;
+  $$('#mon-chip-loss .sc-chip').forEach(ch => {
+    ch.classList.toggle('active', !!monUI.show[ch.dataset.tag]);
+    ch.classList.toggle('dim', !monUI.show[ch.dataset.tag]);
+  });
   /* D13：事件流过滤 */
   $$('#mon-feed-filter button').forEach(b => b.addEventListener('click', () => {
     $$('#mon-feed-filter button').forEach(x => x.classList.remove('active'));
@@ -64,7 +76,6 @@ function bindMonitorControls() {
     monFeedFilter = b.dataset.f;
     if (monData) renderMonFeed();
   }));
-  const smooth = $('#mon-smooth');
   const onSmooth = () => {
     monUI.smooth = +smooth.value;
     $('#mon-smooth-v').textContent = smooth.value;
@@ -190,7 +201,7 @@ function renderMonKpis() {
   if (prevSig && prevSig !== newSig) {
     box.querySelectorAll('.kpi-value').forEach(el => {
       el.classList.add('flash');
-      setTimeout(() => el.classList.remove('flash'), 350);
+      setTimeout(() => el.classList.remove('flash'), 300);
     });
   }
   box.dataset.v = newSig;
@@ -224,11 +235,11 @@ function renderMonFilm() {
     const flash = newCount > 0 && i >= items.length - newCount ? ' flash' : '';
     const ar = s.w && s.h ? ` style="--ar: ${s.w} / ${s.h}"` : '';
     const size = s.w && s.h ? `<span class="g-size">${s.w}×${s.h}</span>` : '';
-    return `<div class="g-item${flash}" tabindex="0" data-i="${i}" role="button" aria-label="sample"${ar}>
+    return `<div class="g-item${flash}" tabindex="0" data-i="${i}" role="button" aria-label="${esc(fn || `sample ${i + 1}`)}"${ar}>
       <img src="${sampleUrl(s, monData.id)}" alt="sample" loading="lazy">
       <div class="g-cap"><span>${s.global_step != null ? `step ${s.global_step}` : ''}</span>${size}</div>
     </div>`;
-  }).join('') || '<div class="g-cap" style="flex:1;color:#999">无采样</div>';
+  }).join('') || '<div class="g-cap mon-dim" style="flex:1">无采样</div>';
   if (stickRight) box.scrollLeft = box.scrollWidth;
   $$('.g-item', box).forEach(el => {
     const open = () => openLightbox(items[+el.dataset.i], monData.id);
@@ -261,7 +272,7 @@ function renderMonEpochs() {
       <td>${fmtNum(s.mean, 5)}</td><td>${fmtNum(s.std, 5)}</td>
       <td>${s.n}</td><td>${sp ? `${sp[0]}~${sp[1]}` : '—'}</td>
     </tr>`;
-  }).join('') || '<tr><td colspan="7" style="text-align:left;color:#999">等待数据…</td></tr>';
+  }).join('') || '<tr><td colspan="7" class="mon-dim" style="text-align:left">等待数据…</td></tr>';
 }
 
 function zoomMonToEp(tr) {

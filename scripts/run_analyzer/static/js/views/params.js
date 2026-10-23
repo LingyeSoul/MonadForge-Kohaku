@@ -2,7 +2,7 @@
 
 import { $, $$, esc } from '../core/dom.js';
 
-export function renderParams(d) {
+export function renderParams(d, preserve) {
   const secs = d.params.sections || [];
   const keyline = d.params.keyline || [];
   $('#sec-params').innerHTML = `
@@ -42,14 +42,24 @@ export function renderParams(d) {
         </div>
       </div>`;
     }).join('') || '<div class="empty-state mono">NO MATCH</div>';
-    $$('.param-sec .param-sec-head', box).forEach(h => h.addEventListener('click', () => {
-      h.parentElement.classList.toggle('collapsed');
-    }));
-    $$('.param-sec .param-sec-head', box).forEach(h => h.addEventListener('keydown', e => {
-      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); h.parentElement.classList.toggle('collapsed'); }
-    }));
+    const heads = $$('.param-sec .param-sec-head', box);
+    const syncHead = h => h.setAttribute('aria-expanded', String(!h.parentElement.classList.contains('collapsed')));
+    heads.forEach(h => {
+      syncHead(h);
+      h.addEventListener('click', () => { h.parentElement.classList.toggle('collapsed'); syncHead(h); });
+      h.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); h.parentElement.classList.toggle('collapsed'); syncHead(h); }
+      });
+    });
   };
-  render('');
+  const initialQ = preserve && preserve.paramQ ? preserve.paramQ.toLowerCase() : '';
+  render(initialQ);
+  if (preserve) {
+    if (preserve.paramQ) $('#param-search').value = preserve.paramQ;
+    $$('#param-sections .param-sec').forEach(s => {
+      if (preserve.collapsed.has(s.dataset.i)) s.classList.add('collapsed');
+    });
+  }
   $('#param-search').addEventListener('input', e => render(e.target.value.toLowerCase()));
   $('#param-expand-all').addEventListener('click', () => $$('.param-sec', box).forEach(s => s.classList.remove('collapsed')));
   $('#param-collapse-all').addEventListener('click', () => $$('.param-sec', box).forEach(s => s.classList.add('collapsed')));

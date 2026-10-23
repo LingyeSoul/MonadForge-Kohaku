@@ -210,12 +210,12 @@ function clearWallpaper() {
   min-width: 0;
 }
 .appearance-option__label {
-  font-size: 14px;
+  font-size: var(--fs-body);
   font-weight: 500;
 }
 .appearance-option__hint {
   margin: 2px 0 0;
-  font-size: 12px;
+  font-size: var(--fs-caption);
   color: var(--text-muted);
 }
 .appearance-slider {
@@ -238,7 +238,7 @@ function clearWallpaper() {
 }
 .appearance-slider__value {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-caption);
   color: var(--text-secondary);
 }
 .appearance-file-input {

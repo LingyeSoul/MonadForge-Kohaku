@@ -572,7 +572,7 @@ onBeforeUnmount(() => {
 }
 
 .section-heading h2 {
-  font-size: 15px;
+  font-size: var(--fs-md);
   font-weight: 600;
   line-height: 1.4;
 }
@@ -591,9 +591,9 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: center;
   min-width: 0;
-  color: #fff;
+  color: rgb(var(--v-theme-on-primary));
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-caption);
   white-space: nowrap;
   transition: width 180ms ease;
 }
@@ -604,9 +604,9 @@ onBeforeUnmount(() => {
   padding: 0 8px;
 }
 
-.segment-0 { background: #9b4720; }
-.segment-1 { background: #b87333; }
-.segment-2 { background: #c58b2b; }
+.segment-0 { background: var(--forge-ember); }
+.segment-1 { background: var(--forge-gold); }
+.segment-2 { background: var(--forge-amber); }
 
 .stage-grid {
   display: grid;
@@ -619,7 +619,7 @@ onBeforeUnmount(() => {
 .readiness-header {
   padding: 0 12px 8px;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--fs-caption);
   font-weight: 500;
 }
 
@@ -652,12 +652,12 @@ onBeforeUnmount(() => {
   border-radius: 50%;
   color: var(--forge-gold);
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-caption);
 }
 
 .step-range {
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: var(--fs-small);
 }
 
 .mobile-label { display: none; }
@@ -678,13 +678,13 @@ onBeforeUnmount(() => {
 .summary-value {
   color: var(--text-primary);
   font-family: var(--font-mono);
-  font-size: 18px;
+  font-size: var(--fs-lg);
   font-weight: 600;
 }
 
 .summary-label {
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--fs-caption);
 }
 
 .readiness-grid {
@@ -707,7 +707,7 @@ onBeforeUnmount(() => {
 .path-cell {
   min-width: 0;
   overflow-wrap: anywhere;
-  font-size: 11px;
+  font-size: var(--fs-micro);
   line-height: 1.5;
 }
 
@@ -732,7 +732,7 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 8px;
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: var(--fs-small);
 }
 
 /* The navigation rail reduces the available space even on desktop screens. */
@@ -756,7 +756,7 @@ onBeforeUnmount(() => {
     display: block;
     margin-bottom: 5px;
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: var(--fs-micro);
   }
 
   .readiness-row {
@@ -782,7 +782,7 @@ onBeforeUnmount(() => {
     width: 100%;
     grid-template-columns: minmax(0, 1fr) 40px 40px;
   }
-  .schedule-segment { font-size: 10px; }
+  .schedule-segment { font-size: var(--fs-nano); }
   .source-summary { gap: 14px; flex-wrap: wrap; }
   .action-bar > div:last-child { width: 100%; }
   .action-bar .v-btn { flex: 1 1 auto; }

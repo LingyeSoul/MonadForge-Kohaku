@@ -16,8 +16,10 @@ export const useNotifyStore = defineStore('notify', () => {
   const current = ref<NotifyItem | null>(null)
   let queue: NotifyItem[] = []
 
-  function show(message: string, type: NotifyType = 'info', timeout = 3000) {
-    const item: NotifyItem = { id: nextId++, message, type, timeout }
+  function show(message: string, type: NotifyType = 'info', timeout?: number) {
+    // Errors stay until dismissed (timeout 0); transient types auto-close.
+    const effective = timeout ?? (type === 'error' ? 0 : 3000)
+    const item: NotifyItem = { id: nextId++, message, type, timeout: effective }
     if (!current.value) {
       current.value = item
     } else {

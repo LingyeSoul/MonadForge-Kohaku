@@ -49,7 +49,11 @@
       <template #append><v-btn variant="text" size="small" @click="refreshView">{{ t('ppRefresh') }}</v-btn></template>
     </v-alert>
 
-    <div v-if="!historyError && visibleTasks.length === 0" class="workspace-empty flex-grow-1">
+    <div v-if="!historyError && historyLoading && historyTasks.length === 0" class="flex-grow-1 d-flex align-center justify-center">
+      <v-progress-linear indeterminate color="primary" height="2" style="max-width: 320px;" />
+    </div>
+
+    <div v-else-if="!historyError && visibleTasks.length === 0" class="workspace-empty flex-grow-1">
       <div class="workspace-empty__mark"><v-icon icon="mdi-format-list-checks" size="32" /></div>
       <h2>{{ taskFilter === 'all' ? t('taskNoHistory') : t('taskNoMatches') }}</h2>
       <div v-if="taskFilter !== 'all'">
@@ -303,7 +307,7 @@
 </template>
 
 <script setup lang="ts">
-import { canResumeTask, isTaskActive, isTaskStoppable, isTaskTerminal } from '../utils/taskState.ts'
+import { canResumeTask, isTaskActive, isTaskStoppable, isTaskTerminal, taskStateColor as stateColor, taskStateIcon as stateIcon } from '../utils/taskState.ts'
 import { useRoute } from 'vue-router'
 import QwenTaskResults from '../components/QwenTaskResults.vue'
 const route = useRoute()
@@ -324,6 +328,7 @@ const historyTotal = ref(0)
 const historyPage = ref(1)
 const historyPageSize = 25
 const historyError = ref(false)
+const historyLoading = ref(true)
 let historyRequestId = 0
 const visibleTasks = computed(() => historyTasks.value)
 const displayedTasks = computed(() => {
@@ -334,6 +339,7 @@ const displayedTasks = computed(() => {
 
 async function loadPage() {
   const requestId = ++historyRequestId
+  historyLoading.value = true
   try {
     const result = await taskStore.fetchTaskPage({
       state: taskFilter.value,
@@ -345,11 +351,13 @@ async function loadPage() {
     historyTotal.value = result.total
     if (selectedTask.value && !result.tasks.some(task => task.task_id === selectedTask.value)) selectedTask.value = ''
     historyError.value = false
+    historyLoading.value = false
   } catch {
     if (requestId !== historyRequestId) return
     historyTasks.value = []
     historyTotal.value = 0
     historyError.value = true
+    historyLoading.value = false
   }
 }
 
@@ -444,23 +452,6 @@ async function confirmAction() {
 function onTaskDone() {
   void refreshView()
 }
-
-function stateColor(state: string) {
-  if (state === 'paused') return 'warning'
-  if (state === 'running' || state === 'stopping') return 'primary'
-  if (state === 'success') return 'success'
-  if (state === 'failed') return 'error'
-  return undefined
-}
-
-function stateIcon(state: string) {
-  if (state === 'paused') return 'mdi-pause-circle'
-  if (state === 'running' || state === 'stopping') return 'mdi-progress-clock'
-  if (state === 'success') return 'mdi-check-circle'
-  if (state === 'failed') return 'mdi-alert-circle'
-  if (state === 'cancelled') return 'mdi-cancel'
-  return 'mdi-clock-outline'
-}
 </script>
 
 <style scoped>
@@ -480,7 +471,7 @@ function stateIcon(state: string) {
 
 /* Card hover */
 :deep(.v-card) {
-  transition: border-color 0.2s, box-shadow 0.2s;
+  transition: border-color var(--dur-slow) ease, box-shadow var(--dur-slow) ease;
 }
 
 /* Empty state ember icon */

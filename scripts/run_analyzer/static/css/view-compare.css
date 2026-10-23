@@ -33,6 +33,22 @@
 }
 .cmp-table td { padding: 9px 14px; font-family: var(--font-mono); font-size: var(--ts-sm); border-bottom: 1px solid var(--g2); }
 
+/* Color swatch column ties each table row to its chart line color. */
+.cmp-swatch { display: inline-block; width: 10px; height: 10px; }
+
+/* Empty-state overlay inside the chart stage (no runs selected / not rendered). */
+#cmp-stage-wrap { position: relative; }
+.cmp-empty {
+  position: absolute;
+  top: 44px; right: 0; bottom: 0; left: 0;
+  display: grid;
+  place-items: center;
+  color: var(--g5);
+  font-size: var(--ts-sm);
+  letter-spacing: 0.2em;
+  pointer-events: none;
+}
+
 @media (max-width: 600px) {
   .cmp-run { display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: 4px 12px; }
   .cmp-run .cb { grid-row: 1 / 3; }

@@ -326,7 +326,7 @@
                 auto-grow
                 max-rows="10"
                 hide-details
-                style="font-family: monospace; font-size: 13px;"
+                style="font-family: monospace; font-size: var(--fs-small);"
               />
             </v-card-text>
           </v-expand-transition>
@@ -1455,7 +1455,7 @@ function waitForTask(taskId: string): Promise<void> {
   border-radius: 4px;
   background: rgba(var(--v-theme-surface-variant), 0.45);
   font-family: 'JetBrains Mono', monospace;
-  font-size: 13px;
+  font-size: var(--fs-small);
 }
 
 .config-editor {
@@ -1469,7 +1469,7 @@ function waitForTask(taskId: string): Promise<void> {
   display: flex;
   align-items: center;
   color: rgb(var(--v-theme-warning));
-  font-size: 12px;
+  font-size: var(--fs-caption);
 }
 .config-section {
   background: transparent;

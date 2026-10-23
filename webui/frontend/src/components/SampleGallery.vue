@@ -163,7 +163,7 @@ function labelFor(s: SampleInfo): string {
 
 .sample-card-latest {
   border-color: var(--forge-amber);
-  box-shadow: 0 0 0 1px var(--forge-amber), 0 0 12px rgba(199, 91, 26, 0.18);
+  box-shadow: 0 0 0 1px var(--forge-amber), 0 0 12px rgb(var(--v-theme-primary) / 0.18);
 }
 
 .sample-thumb {
@@ -181,7 +181,7 @@ function labelFor(s: SampleInfo): string {
   overflow-wrap: anywhere;
   padding: 2px 6px;
   border-radius: 4px;
-  font-size: 10px;
+  font-size: var(--fs-nano);
   font-weight: 500;
   background: rgba(0, 0, 0, 0.65);
   color: #fff;
@@ -211,7 +211,7 @@ function labelFor(s: SampleInfo): string {
 
 .sample-overlay-text {
   color: #fff;
-  font-size: 11px;
+  font-size: var(--fs-micro);
   line-height: 1.3;
   display: -webkit-box;
   -webkit-line-clamp: 3;

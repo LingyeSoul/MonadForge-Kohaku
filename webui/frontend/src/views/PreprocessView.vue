@@ -1066,11 +1066,11 @@ watch(() => workspace.family, async (family) => {
 }
 .preprocess-path-wide { grid-column: 1 / -1; }
 .preprocess-run-paths > div { min-width: 0; }
-.preprocess-run-paths dt { font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
+.preprocess-run-paths dt { font-size: var(--fs-caption); color: var(--text-secondary); margin-bottom: 6px; }
 .preprocess-run-paths dd {
   margin: 0;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-caption);
   line-height: 1.65;
   overflow-wrap: anywhere;
   user-select: text;
@@ -1104,13 +1104,13 @@ watch(() => workspace.family, async (family) => {
 
 /* Pipeline action cards: hover transition */
 :deep(.v-card) {
-  transition: border-color 0.2s, box-shadow 0.2s;
+  transition: border-color var(--dur-slow) ease, box-shadow var(--dur-slow) ease;
 }
 
 /* Status chips: ember tint for active/selected */
 :deep(.v-chip--selected),
 :deep(.v-chip[aria-selected="true"]) {
-  background: rgba(199, 91, 26, 0.12) !important;
+  background: rgb(var(--v-theme-primary) / 0.12) !important;
   border-color: var(--forge-ember) !important;
 }
 

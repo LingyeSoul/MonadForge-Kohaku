@@ -22,6 +22,7 @@
 }
 .runs-table th.sortable { cursor: pointer; }
 .runs-table th.sortable:hover { color: var(--ink); }
+.runs-table th.sorted { color: var(--ink); }
 .th-arrow { font-size: var(--ts-nano); margin-left: 4px; }
 .runs-table tbody tr {
   border-bottom: 1px solid var(--g2);

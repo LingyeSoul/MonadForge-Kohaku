@@ -5,7 +5,7 @@
       <span class="text-caption text-medium-emphasis">{{ totalLabel }}</span>
     </WorkspaceHeading>
 
-    <v-tabs v-model="datasetTab" class="mb-4 flex-shrink-0" aria-label="Dataset workspace">
+    <v-tabs v-model="datasetTab" class="mb-4 flex-shrink-0" :aria-label="t('dsTabsAria')">
       <v-tab value="browse">{{ t('dsTitle') }}</v-tab>
       <v-tab value="curation">{{ curationTitle }}</v-tab>
     </v-tabs>
@@ -121,6 +121,7 @@
             variant="text"
             density="compact"
             :active="showTaggerSettings"
+            :aria-label="t('tgSettings')"
             @click="showTaggerSettings = !showTaggerSettings"
           />
         </v-col>
@@ -277,7 +278,12 @@
             class="mx-auto dataset-card"
             variant="tonal"
             :class="{ 'border-primary': selectedImage?.path === img.path }"
+            role="button"
+            :aria-label="img.stem"
+            tabindex="0"
             @click="activateImage(img)"
+            @keydown.enter.prevent="activateImage(img)"
+            @keydown.space.prevent="activateImage(img)"
           >
             <div v-if="selectionMode" class="selection-checkbox" @click.stop="toggleSelection(img.path)">
               <v-checkbox-btn :model-value="selectedPaths.has(img.path)" density="compact" color="primary" />
@@ -1810,8 +1816,11 @@ async function _onKeyDown(e: KeyboardEvent) {
     }
   }
 
-  // Global navigation (only when not typing)
-  if (!isInput && !editorDialog.value) {
+  // Global navigation: skip when typing or when an interactive control
+  // (slider, select, pagination, button) owns the focus — arrows belong to it.
+  const target = e.target as HTMLElement | null
+  const onControl = Boolean(target?.closest('input, textarea, select, button, [role="slider"], [role="combobox"], [role="listbox"], [contenteditable="true"]'))
+  if (!isInput && !onControl && !editorDialog.value) {
     if (e.key === 'ArrowRight') {
       e.preventDefault()
       navigateImage(1)
@@ -1901,7 +1910,7 @@ onUnmounted(() => {
 
 .caption-editor :deep(.v-field) {
   font-family: monospace;
-  font-size: 13px;
+  font-size: var(--fs-small);
 }
 
 /* Tag preview */
@@ -1909,7 +1918,7 @@ onUnmounted(() => {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
-  font-size: 12px;
+  font-size: var(--fs-caption);
   line-height: 1.6;
 }
 
@@ -1922,7 +1931,7 @@ onUnmounted(() => {
   padding: 1px 6px;
   border-radius: 4px;
   border: 1px solid;
-  font-size: 11px;
+  font-size: var(--fs-micro);
 }
 
 .tag-plain {
@@ -1943,9 +1952,9 @@ onUnmounted(() => {
 /* Diff display */
 .diff-output {
   font-family: monospace;
-  font-size: 12px;
+  font-size: var(--fs-caption);
   line-height: 1.5;
-  background: rgba(0, 0, 0, 0.2);
+  background: rgba(var(--v-theme-on-surface), 0.06);
   border-radius: 4px;
   padding: 8px 12px;
   max-height: 450px;
@@ -1974,7 +1983,7 @@ onUnmounted(() => {
 
 /* Grammar guide */
 .grammar-guide {
-  font-size: 11px;
+  font-size: var(--fs-micro);
   line-height: 1.5;
   color: var(--text-muted);
   padding: 4px 8px;
@@ -1995,11 +2004,11 @@ onUnmounted(() => {
 /* Inline diff */
 .inline-diff {
   font-family: monospace;
-  font-size: 12px;
+  font-size: var(--fs-caption);
   line-height: 1.5;
   padding: 4px 8px;
   border-radius: 4px;
-  background: rgba(0, 0, 0, 0.15);
+  background: rgba(var(--v-theme-on-surface), 0.05);
   max-height: 80px;
   overflow-y: auto;
   word-break: break-all;

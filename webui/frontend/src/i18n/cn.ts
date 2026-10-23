@@ -439,6 +439,8 @@ export default {
 
   // Merge View extras
   tgAutoTag: '自动打标',
+  tgSettings: '打标设置',
+  dsTabsAria: '数据集工作区',
   tgTagging: '打标中...',
   tgTagComplete: '已标注 {count} 张图片',
   tgTagSkipped: '跳过 {count} 张',

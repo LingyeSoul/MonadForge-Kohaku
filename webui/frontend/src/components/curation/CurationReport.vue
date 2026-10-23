@@ -105,10 +105,10 @@ async function replay(): Promise<void> {
 watch(() => [props.job.id, props.job.state], () => { void load() }, { immediate: true })
 </script>
 <style scoped>
-.report-json { max-height: 360px; overflow: auto; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.report-json { max-height: 360px; overflow: auto; font-size: var(--fs-caption); white-space: pre-wrap; overflow-wrap: anywhere; }
 .report-table-wrap { overflow: auto; max-height: 450px; }
 .report-table-wrap td { max-width: 340px; overflow-wrap: anywhere; }
-.proposal-text, .proposal-diff { white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid rgba(var(--v-theme-on-surface), .15); border-radius: 6px; padding: 12px; font-size: 12px; min-height: 60px; }
+.proposal-text, .proposal-diff { white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid rgba(var(--v-theme-on-surface), .15); border-radius: 6px; padding: 12px; font-size: var(--fs-caption); min-height: 60px; }
 .proposal-path { overflow-wrap: anywhere; }
 .proposal-diff del { background: #d84c4c33; color: #ff9696; }
 .proposal-diff ins { background: #40aa7033; color: #81dca5; text-decoration: none; }

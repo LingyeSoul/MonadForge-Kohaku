@@ -1,7 +1,7 @@
 /* theme.js — JS 侧设计令牌（与 css/tokens.css 同步） */
 
 export const MONO = '"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
-export const SANS = '"Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", sans-serif';
+export const SANS = '"Noto Sans CJK SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif';
 
 export const C = {
   ink: '#191919', paper: '#FFFFFF', stage: '#000000',

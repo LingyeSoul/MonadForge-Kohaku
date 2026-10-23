@@ -120,7 +120,7 @@ defineExpose({ showFieldHelp })
   min-height: 0;
   flex: 1 1 auto;
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: var(--fs-small);
   line-height: 1.65;
   overflow-wrap: anywhere;
 }
@@ -141,7 +141,7 @@ defineExpose({ showFieldHelp })
 }
 .guide-html :deep(h1) { font-size: 20px; line-height: 1.4; }
 .guide-html :deep(h2) { font-size: 17px; line-height: 1.5; }
-.guide-html :deep(h3) { font-size: 14px; line-height: 1.5; }
+.guide-html :deep(h3) { font-size: var(--fs-body); line-height: 1.5; }
 
 .guide-html :deep(p) {
   margin-bottom: 0.5em;
@@ -230,7 +230,7 @@ defineExpose({ showFieldHelp })
   border-radius: var(--radius-sm);
   padding: 10px 14px;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-caption);
 }
 
 .guide-html :deep(code) {

@@ -868,7 +868,7 @@ function stateColor(state: string) {
 
 /* File tree: hover highlight */
 :deep(.v-list-item:hover) {
-  background: rgba(199, 91, 26, 0.06) !important;
+  background: rgb(var(--v-theme-primary) / 0.06) !important;
 }
 
 /* Weight slider: ember track */
@@ -884,10 +884,10 @@ function stateColor(state: string) {
   padding: 8px 12px;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
-  transition: border-color 0.15s;
+  transition: border-color var(--dur-base) ease;
 }
 :deep(.v-selection-control--selected) {
   border-color: var(--forge-ember) !important;
-  background: rgba(199, 91, 26, 0.04);
+  background: rgb(var(--v-theme-primary) / 0.04);
 }
 </style>

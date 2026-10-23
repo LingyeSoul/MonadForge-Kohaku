@@ -48,7 +48,10 @@ function bindPick(tr, r) {
   const cb = tr.querySelector('.run-pick');
   cb.addEventListener('click', e => e.stopPropagation());
   cb.addEventListener('change', () => {
-    if (cb.checked) { if (cmpSel.size < 8) cmpSel.add(r.id); else cb.checked = false; }
+    if (cb.checked) {
+      if (cmpSel.size < 8) cmpSel.add(r.id);
+      else { cb.checked = false; toast('对比最多选择 8 项'); }
+    }
     else cmpSel.delete(r.id);
     syncPickBar();
     window.dispatchEvent(new CustomEvent('ra:compare-picked', { detail: { ids: [...cmpSel] } }));
@@ -75,7 +78,7 @@ export function renderRuns() {
   rows.sort((a, b) => {
     let av, bv;
     switch (runFilter.sort) {
-      case 'final_avr_loss': case 'min_loss': case 'steps': case 'duration_s': case 'submitted_at':
+      case 'final_avr_loss': case 'min_loss': case 'steps': case 'actual_epochs': case 'duration_s': case 'submitted_at':
         av = num(runFilter.sort)(a); bv = num(runFilter.sort)(b); break;
       case 'run_name': case 'method':
         av = str(runFilter.sort)(a); bv = str(runFilter.sort)(b); break;
@@ -124,14 +127,38 @@ export function renderRuns() {
     tb.appendChild(tr);
   });
   syncPickBar();
+  syncSortUI();
+}
+
+/* Sort direction + active-column feedback on the table headers. */
+function syncSortUI() {
+  $$('#runs-table th[data-sort]').forEach(th => {
+    const arrow = $('.th-arrow', th);
+    if (!arrow) return;
+    const active = th.dataset.sort === runFilter.sort;
+    arrow.textContent = active ? (runFilter.dir === 1 ? '▲' : '▼') : '';
+    th.classList.toggle('sorted', active);
+  });
 }
 
 export async function loadRuns() {
   try {
     const d = await api('/api/runs');
     runsCache = d.runs;
+    setRunsError(null);
     renderRuns();
-  } catch (e) { toast(String(e.message || e)); }
+  } catch (e) { setRunsError(String(e.message || e)); toast(String(e.message || e)); }
+}
+
+/* Distinguish "no data" from "load failed": fetch errors render a persistent
+ * error state with retry instead of the transient toast + empty text. */
+function setRunsError(msg) {
+  const el = $('#runs-error');
+  if (!el) return;
+  if (msg == null) { el.classList.add('hidden'); return; }
+  $('#runs-error-msg').textContent = msg;
+  el.classList.remove('hidden');
+  $('#runs-empty').classList.add('hidden');
 }
 
 export async function refreshRuns() {
@@ -175,6 +202,7 @@ export function initRuns() {
     window.dispatchEvent(new CustomEvent('ra:compare-picked', { detail: { ids: [...cmpSel] } }));
   });
   $('#cmp-bar-go').addEventListener('click', () => { location.hash = '#compare'; });
+  $('#runs-retry').addEventListener('click', () => { void loadRuns(); });
   $('#cmp-bar-clear').addEventListener('click', () => {
     runsCache.forEach(r => cmpSel.delete(r.id));
     renderRuns();

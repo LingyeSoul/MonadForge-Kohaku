@@ -92,11 +92,16 @@
 .epoch-table td:first-child { text-align: left; }
 .epoch-table tbody tr { cursor: pointer; transition: background var(--dur) var(--ease); }
 .epoch-table tbody tr:hover { background: var(--g1); }
-.epoch-table tbody tr:focus-visible { outline: 1px solid var(--volt); outline-offset: -1px; }
+.epoch-table tbody tr:focus-visible { outline: 2px solid var(--ink); outline-offset: -1px; }
 
 /* ── 参数视图 ── */
 .param-tools { display: flex; align-items: center; gap: 18px; padding-bottom: 18px; border-bottom: var(--line); }
-.param-tools .parse-err { font-size: var(--ts-micro); color: var(--volt); font-weight: 700; }
+.param-tools .parse-err {
+  font-size: var(--ts-micro); font-weight: 700;
+  /* Inverted chip: volt text on ink ground — volt-on-paper fails contrast. */
+  background: var(--ink); color: var(--volt);
+  padding: 2px 8px;
+}
 /* C10：关键参数微标行 */
 .param-keyline {
   display: flex; flex-wrap: wrap; gap: 0;
@@ -197,7 +202,7 @@
 .ev-step { color: var(--g5); white-space: nowrap; }
 .ev-level { flex: 0 0 44px; font-size: var(--ts-micro); letter-spacing: 0.08em; }
 .ev-level.WARNING { color: var(--g7); }
-.ev-level.ERROR { color: var(--volt); font-weight: 700; }
+.ev-level.ERROR { background: var(--ink); color: var(--volt); font-weight: 700; }
 .ev-msg { color: var(--ink); word-break: break-all; }
 .ev-row.err .ev-msg { font-weight: 600; }
 

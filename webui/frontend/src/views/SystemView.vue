@@ -185,7 +185,7 @@
         :subtitle="`${task.task_id.slice(0, 8)} | ${t('taskState')}: ${task.state} | PID: ${task.pid ?? '—'}`"
       >
         <template #append>
-          <v-chip size="small" :color="stateColor(task.state)" variant="tonal">{{ task.state }}</v-chip>
+          <v-chip size="small" :color="taskStateColor(task.state)" variant="tonal">{{ task.state }}</v-chip>
           <v-btn v-if="isTaskStoppable(task.state)" icon="mdi-stop" size="small" variant="text" color="error" :aria-label="t('taskCancel')" @click="pendingCancel = task.task_id" />
         </template>
       </v-list-item>
@@ -292,7 +292,7 @@
 </template>
 
 <script setup lang="ts">
-import { isTaskActive, isTaskStoppable } from '../utils/taskState.ts'
+import { isTaskActive, isTaskStoppable, taskStateColor } from '../utils/taskState.ts'
 import { onMounted, onBeforeUnmount, ref, computed } from 'vue'
 import { onBeforeRouteLeave } from 'vue-router'
 import { useTaskStore } from '../stores/task'
@@ -549,14 +549,6 @@ function isRunning(command: string) {
   return submitting.value.has(command) || taskStore.tasks.some(tp => tp.command === command && isTaskActive(tp.state))
 }
 
-function stateColor(state: string) {
-  if (state === 'paused') return 'warning'
-  if (state === 'running' || state === 'stopping') return 'info'
-  if (state === 'success') return 'success'
-  if (state === 'failed') return 'error'
-  return undefined
-}
-
 async function runTask(command: string, args: string[] = []) {
   if (isRunning(command)) return
   submitting.value.add(command)
@@ -583,7 +575,7 @@ onBeforeUnmount(() => { Object.values(validateTimers).forEach(clearTimeout); bro
 /* Environment info: mono font for paths/values */
 :deep(.v-list-item-subtitle) {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--fs-caption);
   color: var(--text-secondary);
 }
 
@@ -594,7 +586,7 @@ onBeforeUnmount(() => { Object.values(validateTimers).forEach(clearTimeout); bro
 
 /* System cards: subtle brand border on hover */
 :deep(.v-card) {
-  transition: border-color 0.2s;
+  transition: border-color var(--dur-slow) ease;
 }
 
 :deep(.v-card:hover) {

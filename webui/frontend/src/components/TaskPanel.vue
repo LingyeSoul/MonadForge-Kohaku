@@ -7,6 +7,7 @@
         icon="mdi-refresh"
         variant="text"
         size="small"
+        :aria-label="t('ppRefresh')"
         @click="taskStore.fetchTasks()"
       />
     </v-toolbar>
@@ -162,7 +163,7 @@
 </template>
 
 <script setup lang="ts">
-import { canResumeTask, isTaskActive, isTaskStoppable, isTaskTerminal } from '../utils/taskState.ts'
+import { canResumeTask, isTaskActive, isTaskStoppable, isTaskTerminal, taskStateColor as stateColor, taskStateIcon as stateIcon } from '../utils/taskState.ts'
 import { ref } from 'vue'
 import { useTaskStore } from '../stores/task'
 import { useI18n } from '../composables/useI18n'
@@ -172,23 +173,6 @@ import TaskAttemptHistory from './TaskAttemptHistory.vue'
 const taskStore = useTaskStore()
 const { t } = useI18n()
 const selectedTask = ref('')
-
-function stateColor(state: string) {
-  if (state === 'paused') return 'warning'
-  if (state === 'running' || state === 'stopping') return 'primary'
-  if (state === 'success') return 'success'
-  if (state === 'failed') return 'error'
-  return undefined
-}
-
-function stateIcon(state: string) {
-  if (state === 'paused') return 'mdi-pause-circle'
-  if (state === 'running' || state === 'stopping') return 'mdi-progress-clock'
-  if (state === 'success') return 'mdi-check-circle'
-  if (state === 'failed') return 'mdi-alert-circle'
-  if (state === 'cancelled') return 'mdi-cancel'
-  return 'mdi-clock-outline'
-}
 </script>
 
 <style scoped>

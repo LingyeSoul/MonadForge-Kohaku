@@ -38,11 +38,11 @@ defineEmits<{ select: [value: string]; create: [] }>()
 <style scoped>
 .method-library { padding-top: 4px; }
 .method-library__heading { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
-.config-field-count { color: var(--text-muted); font-size: 12px; white-space: nowrap; }
+.config-field-count { color: var(--text-muted); font-size: var(--fs-caption); white-space: nowrap; }
 .method-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 240px), 1fr)); gap: 12px; }
 .method-option { display: flex; align-items: center; gap: 14px; min-height: 84px; padding: 20px; border: 1px solid var(--border-subtle); border-radius: 6px; background: var(--bg-surface); color: var(--text-primary); text-align: left; transition: border-color 160ms ease, background 160ms ease; }
 .method-option > .v-icon:first-child { color: var(--forge-amber); flex-shrink: 0; }
-.method-option span { flex: 1; font-size: 14px; font-weight: 500; overflow-wrap: anywhere; }
+.method-option span { flex: 1; font-size: var(--fs-body); font-weight: 500; overflow-wrap: anywhere; }
 .method-option__arrow { color: var(--text-muted); transition: transform 160ms ease; }
 .method-option:hover:not(:disabled) { background: var(--bg-hover); border-color: var(--border-strong); }
 .method-option:hover:not(:disabled) .method-option__arrow { transform: translate(2px, -2px); }

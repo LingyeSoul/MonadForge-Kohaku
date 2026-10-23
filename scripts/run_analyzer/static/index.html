@@ -5,13 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>run-analyzer — 训练档案</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23191919'/%3E%3Crect x='4' y='4' width='8' height='8' fill='%23FFFA00'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="/css/tokens.css">
-<link rel="stylesheet" href="/css/base.css?v=20260811-lineage-3">
-<link rel="stylesheet" href="/css/components.css">
-<link rel="stylesheet" href="/css/view-runs.css?v=20260811-lineage-3">
-<link rel="stylesheet" href="/css/view-detail.css?v=20260811-lineage-3">
-<link rel="stylesheet" href="/css/view-monitor.css?v=20260811-lineage-3">
-<link rel="stylesheet" href="/css/view-compare.css">
+<link rel="stylesheet" href="/css/tokens.css?v=20261023-uxpass-1">
+<link rel="stylesheet" href="/css/base.css?v=20261023-uxpass-1">
+<link rel="stylesheet" href="/css/components.css?v=20261023-uxpass-1">
+<link rel="stylesheet" href="/css/view-runs.css?v=20261023-uxpass-1">
+<link rel="stylesheet" href="/css/view-detail.css?v=20261023-uxpass-1">
+<link rel="stylesheet" href="/css/view-monitor.css?v=20261023-uxpass-1">
+<link rel="stylesheet" href="/css/view-compare.css?v=20261023-uxpass-1">
 </head>
 <body>
 
@@ -33,6 +33,7 @@
     <div class="rail-foot">
       <span class="rf-line" id="rail-status">IDLE</span>
       <span class="rf-line rf-port">PORT <b id="rail-port">8320</b></span>
+      <button class="rf-line rf-help" id="help-open" aria-label="快捷键面板">KEYS ?</button>
     </div>
   </div>
 </aside>
@@ -68,16 +69,16 @@
       <table class="runs-table" id="runs-table">
         <thead>
           <tr>
-            <th class="ta-pick"><input type="checkbox" id="pick-all" aria-label="全选" tabindex="-1"></th>
+            <th class="ta-pick"><input type="checkbox" id="pick-all" aria-label="全选"></th>
             <th class="ta-num" data-sort="submitted_at">序<span class="th-arrow"></span></th>
-            <th class="ta-run" data-sort="run_name">运行</th>
+            <th class="ta-run" data-sort="run_name">运行<span class="th-arrow"></span></th>
             <th class="ta-st">状态</th>
-            <th class="ta-meth" data-sort="method">方法·预设</th>
-            <th class="ta-num" data-sort="steps">轮数</th>
-            <th class="ta-num" data-sort="steps">步数</th>
-            <th class="ta-num" data-sort="final_avr_loss">最终 avg loss</th>
-            <th class="ta-num" data-sort="min_loss">最低 loss</th>
-            <th class="ta-num" data-sort="duration_s">时长</th>
+            <th class="ta-meth" data-sort="method">方法·预设<span class="th-arrow"></span></th>
+            <th class="ta-num" data-sort="actual_epochs">轮数<span class="th-arrow"></span></th>
+            <th class="ta-num" data-sort="steps">步数<span class="th-arrow"></span></th>
+            <th class="ta-num" data-sort="final_avr_loss">最终 avg loss<span class="th-arrow"></span></th>
+            <th class="ta-num" data-sort="min_loss">最低 loss<span class="th-arrow"></span></th>
+            <th class="ta-num" data-sort="duration_s">时长<span class="th-arrow"></span></th>
             <th class="ta-src">来源</th>
             <th class="ta-spark">曲线</th>
           </tr>
@@ -85,6 +86,10 @@
         <tbody id="runs-body"></tbody>
       </table>
       <div id="runs-empty" class="empty-state mono">NO RECORDS — 无匹配记录</div>
+      <div id="runs-error" class="empty-state hidden">
+        <span class="mono">LOAD FAILED — <span id="runs-error-msg">档案加载失败</span></span>
+        <div style="margin-top: 14px;"><button class="block-btn" id="runs-retry">重试</button></div>
+      </div>
     </div>
 
     <div id="cmp-bar" class="cmp-bar hidden">
@@ -128,9 +133,10 @@
         </div>
       </div>
       <div id="cmp-chart" class="chart chart-h-lg"></div>
+      <div id="cmp-empty" class="cmp-empty mono hidden"></div>
       <div class="cmp-table-wrap" tabindex="0" role="region" aria-label="运行对比结果，可横向滚动">
         <table class="cmp-table" id="cmp-table">
-          <thead><tr><th>运行</th><th>最终 avg loss</th><th>步数</th><th>轮数</th><th>状态</th></tr></thead>
+          <thead><tr><th aria-label="曲线颜色"></th><th>运行</th><th>最终 avg loss</th><th>步数</th><th>轮数</th><th>状态</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
@@ -189,7 +195,7 @@
             <div class="chart-pad"><div id="mon-chart-loss" class="chart chart-h-md"></div></div>
           </div>
           <div class="mon-subrow">
-            <div class="stage" style="flex:2">
+            <div class="stage">
               <div class="stage-head"><span class="stage-title mono" id="mon-lr-title">LR // STEP</span></div>
               <div class="chart-pad"><div id="mon-chart-lr" class="chart chart-h-xs"></div></div>
             </div>
@@ -261,7 +267,7 @@
   </div>
 </div>
 
-<div id="toast" class="toast hidden"></div>
+<div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
 <script src="/echarts.min.js"></script>
 <script type="module" src="/js/main.js"></script>

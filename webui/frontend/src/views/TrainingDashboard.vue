@@ -402,12 +402,12 @@ onUnmounted(() => {
 .progress-overview, .metrics-overview { height: 100%; padding: 0 16px; }
 .progress-overview { border-right: 1px solid var(--border-subtle); padding-left: 0; }
 .progress-overview__body { display: flex; align-items: center; gap: 20px; margin-top: 20px; flex-wrap: wrap; }
-.progress-value { font: 500 26px var(--font-mono); }
+.progress-value { font: 500 26px var(--font-mono); font-variant-numeric: tabular-nums; }
 .progress-details { min-width: 0; color: var(--text-secondary); line-height: 1.7; }
 .metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr)); grid-auto-flow: dense; margin-top: 12px; }
 .training-metric { min-width: 0; padding: 12px 12px 12px 0; }
-.metric-label { color: var(--text-secondary); font-size: 12px; margin-bottom: 8px; }
-.metric-value { font: 500 20px/1.6 var(--font-mono); overflow-wrap: anywhere; }
+.metric-label { color: var(--text-secondary); font-size: var(--fs-caption); margin-bottom: 8px; }
+.metric-value { font: 500 20px/1.6 var(--font-mono); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .system-overview { padding: 20px 0; border-bottom: 1px solid var(--border-subtle); }
 .system-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 155px), 1fr)); grid-auto-flow: dense; gap: 24px; margin-top: 20px; }
 .system-metric { min-width: 0; }

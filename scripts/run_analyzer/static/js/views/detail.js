@@ -14,6 +14,9 @@ let detail = null;
 let detailTimer = null;
 let detailObserver = null;
 let detailGeneration = 0;
+/* Live re-render carries the user's interaction state across the DOM rebuild:
+ * param collapse set, search box text, stdout filter, and input focus. */
+let uiPreserve = null;
 
 export function getDetail() { return detail; }
 
@@ -64,9 +67,31 @@ function renderDetailHead() {
   setupSecNav();
   renderOverview();
   renderCurves(detail);
-  renderParams(detail);
+  renderParams(detail, uiPreserve);
   renderSamples(detail);
-  renderEvents(detail);
+  renderEvents(detail, uiPreserve);
+  uiPreserve = null;
+}
+
+/* Snapshot interaction state before a live re-render wipes the DOM. */
+function snapshotDetailUI() {
+  const active = document.activeElement;
+  const segBtn = $('#seg-stdout button.active');
+  return {
+    collapsed: new Set($$('#param-sections .param-sec.collapsed').map(s => s.dataset.i)),
+    paramQ: ($('#param-search') || { value: '' }).value,
+    stdoutQ: ($('#stdout-search') || { value: '' }).value,
+    stdoutFilter: segBtn ? segBtn.dataset.f : 'all',
+    focusedId: active && active.id ? active.id : '',
+  };
+}
+
+function restoreDetailFocus(snap) {
+  if (!snap || !snap.focusedId) return;
+  const el = document.getElementById(snap.focusedId);
+  if (!el) return;
+  el.focus({ preventScroll: true });
+  el.setSelectionRange(el.value.length, el.value.length);
 }
 
 function setupSecNav() {
@@ -84,7 +109,8 @@ function setupSecNav() {
   targets.forEach(t => detailObserver.observe(t));
   links.forEach(a => a.addEventListener('click', e => {
     e.preventDefault();
-    $(a.getAttribute('href')).scrollIntoView({ behavior: 'smooth' });
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    $(a.getAttribute('href')).scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth' });
   }));
 }
 
@@ -191,9 +217,12 @@ export async function loadDetail(id) {
           run_end: fresh.run_end,
         });
         if (current !== previous) {
+          const snap = snapshotDetailUI();
           const scrollTop = document.documentElement.scrollTop;
+          uiPreserve = snap;
           renderDetailHead();
           window.scrollTo(0, scrollTop);
+          restoreDetailFocus(snap);
         }
         if (fresh.state !== 'running' && fresh.state !== 'queued') {
           stopDetailPolling();

@@ -2,7 +2,7 @@
    键位：g+r / g+m / g+c 视图切换（800ms 序列窗口）、/ 聚焦档案搜索、
    ? 键位面板、Esc 关闭面板。输入框聚焦时不触发。 */
 
-import { $ } from './dom.js';
+import { $, $$ } from './dom.js';
 import { focusRunSearch } from '../views/runs.js';
 
 let pendingG = null;
@@ -18,6 +18,18 @@ export function closeHelp() {
 
 export function initShortcuts() {
   $('#help-close').addEventListener('click', closeHelp);
+  $('#help-open').addEventListener('click', openHelp);
+
+  /* The panel is aria-modal: keep Tab cycling inside it while open. */
+  document.addEventListener('keydown', e => {
+    if (e.key !== 'Tab' || $('#help-panel').classList.contains('hidden')) return;
+    const items = $$('#help-panel button, #help-panel a[href], #help-panel input, #help-panel [tabindex]:not([tabindex="-1"])')
+      .filter(el => el.offsetParent !== null);
+    if (!items.length) return;
+    const first = items[0], last = items[items.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  });
   $('#help-panel').addEventListener('click', e => {
     if (e.target.id === 'help-panel') closeHelp();
   });

@@ -64,6 +64,15 @@ body.rail-open .rail { width: var(--rail-w-open); }
   white-space: nowrap;
 }
 .rf-port b { color: var(--ink); font-weight: 500; }
+.rf-help {
+  cursor: pointer;
+  text-align: left;
+  padding: 0;
+  background: none;
+  border: none;
+  transition: color var(--dur) var(--ease);
+}
+.rf-help:hover, .rf-help:focus-visible { color: var(--ink); }
 
 /* ── 主区 ── */
 .main {

@@ -366,7 +366,7 @@ onMounted(async () => {
 
 /* Adapter cards: hover lift */
 :deep(.v-card) {
-  transition: border-color 0.2s, box-shadow 0.2s, transform 0.15s;
+  transition: border-color var(--dur-slow) ease, box-shadow var(--dur-slow) ease, transform var(--dur-base) ease;
 }
 :deep(.v-card:hover) {
   border-color: var(--border-default);

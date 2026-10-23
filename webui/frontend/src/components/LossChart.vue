@@ -67,7 +67,7 @@ const props = withDefaults(defineProps<{
   height?: number
   emptyLabel?: string
 }>(), {
-  color: '#C75B1A',
+  color: 'var(--v-theme-primary)',
   label: '',
   height: 200,
   emptyLabel: 'Waiting for data...',

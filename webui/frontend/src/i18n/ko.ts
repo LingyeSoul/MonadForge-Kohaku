@@ -439,6 +439,8 @@ export default {
 
   // Merge View extras
   tgAutoTag: '자동 태깅',
+  tgSettings: '태그 설정',
+  dsTabsAria: '데이터셋 워크스페이스',
   tgTagging: '태깅 중...',
   tgTagComplete: '{count}장 태깅 완료',
   tgTagSkipped: '{count}장 건너뜀',

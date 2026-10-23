@@ -439,6 +439,8 @@ export default {
 
   // Merge View extras
   tgAutoTag: 'Auto Tag',
+  tgSettings: 'Tagger settings',
+  dsTabsAria: 'Dataset workspace',
   tgTagging: 'Tagging...',
   tgTagComplete: 'Tagged {count} images',
   tgTagSkipped: '{count} skipped',

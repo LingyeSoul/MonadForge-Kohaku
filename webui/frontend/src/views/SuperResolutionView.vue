@@ -588,7 +588,7 @@ onBeforeUnmount(() => {
 }
 
 .section-heading h2 {
-  font-size: 15px;
+  font-size: var(--fs-md);
   font-weight: 600;
   line-height: 1.4;
 }

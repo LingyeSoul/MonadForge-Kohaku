@@ -14,7 +14,12 @@ function route() {
   const r = parseHash();
   if (r.view !== 'run') stopDetailPolling();
   Object.entries(views).forEach(([k, sel]) => $(sel).classList.toggle('hidden', k !== r.view));
-  $$('.rail-item').forEach(a => a.classList.toggle('active', a.dataset.view === r.view));
+  $$('.rail-item').forEach(a => {
+    const active = a.dataset.view === r.view;
+    a.classList.toggle('active', active);
+    if (active) a.setAttribute('aria-current', 'page');
+    else a.removeAttribute('aria-current');
+  });
   if (r.view === 'runs') loadRuns();
   if (r.view === 'run') loadDetail(r.id);
   if (r.view === 'compare') loadCompare();

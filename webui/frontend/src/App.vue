@@ -136,6 +136,15 @@
       @update:model-value="onSnackbarUpdate"
     >
       {{ notifyStore.current?.message }}
+      <template #actions>
+        <v-btn
+          icon="mdi-close"
+          variant="text"
+          size="x-small"
+          :aria-label="t('dsClose')"
+          @click="closeAndAdvance"
+        />
+      </template>
     </v-snackbar>
   </v-app>
 </template>
@@ -230,7 +239,7 @@ function closeAndAdvance() {
 watch(() => notifyStore.current, (item) => {
   if (item) {
     snackbarOpen.value = true
-    scheduleClose(item.timeout)
+    if (item.timeout > 0) scheduleClose(item.timeout)
   }
 })
 

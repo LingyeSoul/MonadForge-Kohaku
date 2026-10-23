@@ -12,6 +12,13 @@ export interface WallpaperSettings {
 
 const DEFAULT_WALLPAPER: WallpaperSettings = { enabled: false, src: '', blur: 0 }
 
+/** App language codes → BCP 47 tags for <html lang> (screen readers, fonts). */
+const LANG_TAGS: Record<string, string> = { en: 'en', cn: 'zh-CN', ja: 'ja', ko: 'ko' }
+
+function syncDocumentLang(lang: string) {
+  document.documentElement.lang = LANG_TAGS[lang] ?? 'en'
+}
+
 /** Parse and clamp a stored number; anything unusable falls back to `fallback`. */
 function readNumber(raw: number | string | null | undefined, min: number, max: number, fallback: number) {
   if (raw === null || raw === undefined || raw === '') return fallback
@@ -60,6 +67,7 @@ export const useAppStore = defineStore('app', () => {
   function init() {
     const saved = localStorage.getItem('monadforge-lang')
     if (saved) language.value = saved
+    syncDocumentLang(language.value)
     const savedTheme = localStorage.getItem('monadforge-theme')
     if (savedTheme === 'dark' || savedTheme === 'light') theme.value = savedTheme
     glass.value = localStorage.getItem('monadforge-glass') === 'true'
@@ -84,6 +92,7 @@ export const useAppStore = defineStore('app', () => {
   function setLanguage(lang: string) {
     language.value = lang
     localStorage.setItem('monadforge-lang', lang)
+    syncDocumentLang(lang)
   }
 
   function setTheme(name: ThemeName) {

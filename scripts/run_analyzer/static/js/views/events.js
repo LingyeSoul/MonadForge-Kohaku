@@ -2,7 +2,7 @@
 
 import { $, $$, api, esc, fmtNum } from '../core/dom.js';
 
-export function renderEvents(d) {
+export function renderEvents(d, preserve) {
   const logs = d.logs || [];
   const ckpts = d.ckpts || [];
   const vals = d.vals || [];
@@ -48,7 +48,12 @@ export function renderEvents(d) {
       </div>
     </div>`;
   let stdoutAll = [];
-  const stdoutState = { q: '', f: 'all' };
+  const stdoutState = { q: preserve ? preserve.stdoutQ || '' : '', f: preserve ? preserve.stdoutFilter || 'all' : 'all' };
+  if (preserve) {
+    const si = $('#stdout-search');
+    if (si) si.value = stdoutState.q;
+    $$('#seg-stdout button').forEach(b => b.classList.toggle('active', b.dataset.f === stdoutState.f));
+  }
   const renderStdout = () => {
     const lines = stdoutAll.filter(l => {
       if (stdoutState.f === 'WARNING' && !l.includes('WARNING')) return false;

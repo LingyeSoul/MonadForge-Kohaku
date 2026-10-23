@@ -1,9 +1,4 @@
-/* components/kpi.js — KPI 数字墙渲染 + 圆弧进度（C7） */
-
-export function kpiGridHtml(cells) {
-  return cells.map(([l, v, cls]) => `
-    <div class="kpi-cell"><div class="kpi-label">${l}</div><div class="kpi-value ${cls || ''}">${v}</div></div>`).join('');
-}
+/* components/kpi.js — 圆弧进度（C7） */
 
 /* C7：step 进度圆弧（黑图版 + volt 弧 + 中心数字） */
 export function arcHtml({ step, total, epoch, totalEpochs }) {

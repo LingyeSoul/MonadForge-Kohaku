@@ -341,7 +341,7 @@ function confirmSelection() {
 :deep(.v-field__input) { min-width: 0; }
 
 :deep(.v-field--focused) {
-  box-shadow: 0 0 0 2px rgba(199, 91, 26, 0.15);
+  box-shadow: 0 0 0 2px rgb(var(--v-theme-primary) / 0.15);
   border-radius: var(--radius-md);
 }
 :deep(.v-field--focused .v-field__outline) {

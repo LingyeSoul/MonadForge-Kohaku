@@ -1,5 +1,5 @@
 <template>
-  <div ref="logContainer" class="log-stream pa-2" tabindex="0" :aria-label="t('dashLiveLog')" @scroll="trackScroll" style="flex: 1 1 0; min-height: 0; overflow-y: auto; font-family: var(--font-mono); font-size: 12px; background: var(--bg-deep); border: 1px solid var(--border-subtle); border-radius: var(--radius-md);">
+  <div ref="logContainer" class="log-stream pa-2" tabindex="0" :aria-label="t('dashLiveLog')" @scroll="trackScroll" style="flex: 1 1 0; min-height: 0; overflow-y: auto; font-family: var(--font-mono); font-size: var(--fs-caption); background: var(--bg-deep); border: 1px solid var(--border-subtle); border-radius: var(--radius-md);">
     <div v-if="truncatedNote" class="log-truncate-note">
       {{ t('taskLogTruncated', { total: historyTotal, kept: lines.length }) }}
     </div>
@@ -68,7 +68,7 @@ onUnmounted(() => own?.disconnect())
   word-break: break-all;
   line-height: 1.5;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: var(--fs-caption);
   padding: 1px 0;
   animation: logEntry 0.2s ease-out both;
 }
@@ -81,7 +81,7 @@ onUnmounted(() => own?.disconnect())
 .log-truncate-note {
   padding: 4px 6px;
   margin-bottom: 4px;
-  font-size: 11px;
+  font-size: var(--fs-micro);
   color: var(--text-muted);
   border-bottom: 1px dashed var(--border-subtle);
 }

@@ -31,7 +31,7 @@ const { t } = useI18n()
 
 <style scoped>
 .config-filterbar { display: flex; align-items: center; gap: 12px; padding-bottom: 18px; }
-.config-field-count { color: var(--text-muted); font-size: 12px; white-space: nowrap; }
+.config-field-count { color: var(--text-muted); font-size: var(--fs-caption); white-space: nowrap; }
 .config-search { max-width: 320px; margin-left: auto; }
 .config-body { margin-top: 0; }
 .config-reference { border-left: 1px solid var(--border-subtle); }
