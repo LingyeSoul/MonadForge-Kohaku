@@ -21,6 +21,7 @@ branch) when any of these holds:
 | Variable | Default | Effect |
 |---|---|---|
 | `MONADFORGE_MOSS_KERNELS` | `1` | `0` forces the reference branch |
+| `MONADFORGE_MOSS_TEXT_KERNELS` | `1` | `0` keeps HF's Qwen3.5 text forward instead of the packed varlen ops |
 | `KOHAKUMOSS_KERNEL_CACHE` | `~/.cache/kohakumoss_kernels` | where the per-shape tuning decisions are stored |
 | `KOHAKUMOSS_LOG_LEVEL` | `INFO` | the vendored stack's own logger |
 
@@ -68,18 +69,29 @@ the fused branch's 1.33×). The fused branch still pays for itself because it is
 the vendored stack has a TileLang backend instead — `pip install tilelang` makes
 `registry.DEFAULT_PRIORITY` bind it, exactly as upstream measured it.
 
+## What is wired
+
+The op surface is one thing; what the trainer and the pipeline reach is another:
+
+| capability | entry point | what it buys |
+|---|---|---|
+| `gated_delta_rule_varlen`, `causal_conv_varlen`, `rms_norm_gated`, `attention_varlen_causal`, `rms_norm` | `library/moss/text_kernels.py`, used by `loader.encode_prompt` | the Qwen3.5 text encode runs packed; `MONADFORGE_MOSS_TEXT_KERNELS=0` keeps HF's forward |
+| `quant_linear` (int8 / e4m3 weights, per-row scales) | `library/moss/quant.py`, `moss-generate --quant {int8,fp8}` | the frozen 5B DiT base at half the VRAM; a LoRA (not LoKr) still applies on top |
+| `AdamW16`, `MuonHybrid` | `library/moss/optim/`, `moss-train --optimizer {adamw16,muon}` | 16-bit optimizer state with fp32 math, or Muon on the LoRA matrices |
+| VAE decode in bf16 / fp16, optionally compiled in channels_last | `loader.load_vae(compile=...)`, `moss-generate --vae_dtype`, `--vae_compile` | ~1.5× decode and ~60% of the fp32 VAE's VRAM upstream |
+| TileLang backend | vendored source; `pip install tilelang` | sm70 / sm75, where Inductor and SDPA are weak |
+
 ## What is vendored but not wired
 
-`library/moss/vendor/kohakumoss_kernels` carries the whole op surface; only the four
-block ops above are connected. The rest, with what stands between it and this model:
+`library/moss/vendor/kohakumoss_kernels` carries the whole op surface; the rows below
+are not connected, with what stands between each and this model:
 
 | capability | state | what it needs |
 |---|---|---|
-| `gated_delta_rule_varlen`, `causal_conv_varlen`, `rms_norm_gated`, `attention_varlen_causal` | available through `library.moss.ops`, 2.2× the transformers text encode upstream | transformers' `Qwen3_5GatedDeltaNet.forward` precomputes `g = -exp(A_log)·softplus(a + dt_bias)` and `beta = sigmoid(b)`, while the op takes the raw `a`/`b` and the layer's `a_log`/`dt_bias`. Wiring it means reimplementing that module's forward (projections, conv, norm, `out_proj`) and pinning it to a transformers version |
-| `attention_varlen` | available | this model runs one sample per forward with a key mask; the op needs packed `cu_seqlens` batches. It is the right kernel for `forward_batched` only after the joint sequence is packed |
-| `fp8_linear`, `fp8_linear_train`, MXFP8 | available | scaling recipe + a custom autograd line placement; not a drop-in for `nn.Linear` in a training run |
-| `quant_linear`, `quant_linear_rotated` | available | this repository already ships its own ConvRot (`library/runtime/convrot`, `library/moss/int8.py`); two rotation families on one checkpoint would be a footgun, so the vendored one is left for experiments |
-| `adamw_step*`, Muon, the fused optimizer bundle | available | the trainer's optimizer surface (`library/training/`) |
+| `attention_varlen` (non-causal) | available | `forward_batched` still pads text to `s_max`; batch 1 (the trainer) and cond+uncond (`--batched`) do not pay enough to justify the packed `ref_span` / modulation rewrite |
+| `fp8_linear`, `fp8_linear_train`, MXFP8 | available | fp8 compute needs a scaling recipe, fp8 master weights and a scaler; the trainer is bf16 with fp32 masters |
+| `quant_linear_rotated` | available | this repository already ships its own ConvRot (`library/runtime/convrot`, `library/moss/int8.py`); two rotation families on one checkpoint would be a footgun |
+| fused optimizer bundle (`FusedStep`, `HostAccumulator`, streaming AdamW) | available | the trainer's optimizer surface (`library/training/`) owns grad hooks and the offload engines |
 | TileLang backend | source only | `tilelang` is not a dependency of this project; sm70 / sm75 would need the extra |
 
 ## Layout

@@ -149,6 +149,10 @@ def encode_prompt(tok, te, text: str, device="cuda", max_length=MAX_SEQUENCE_LEN
     ``add_generation_prompt=True, enable_thinking=True``, one prompt per forward
     (no padding: the GDN layers misbehave on it)."""
     inputs = prompt_ids(tok, text, max_length).to(device)
+    from library.moss import text_kernels
+
+    if text_kernels.usable(te, device):
+        return text_kernels.encode(te, inputs["input_ids"])
     return te(**inputs, use_cache=False, return_dict=True).last_hidden_state[0]
 
 
@@ -190,11 +194,17 @@ def pad_embeds(rows, device=None):
     return embeds, mask
 
 
-def load_transformer(model_dir, variant="base", dtype=torch.bfloat16, device=None):
+def load_transformer(model_dir, variant="base", dtype=torch.bfloat16, device=None, quant=""):
     tr = MOSSImageTransformer.from_pretrained(
         variant_dir(model_dir, variant) / "transformer", torch_dtype=dtype
     ).eval()
-    return tr.to(device) if device is not None else tr
+    if device is not None:
+        tr = tr.to(device)
+    if quant:
+        from library.moss.quant import quantize_transformer
+
+        quantize_transformer(tr, quant)
+    return tr
 
 
 def compile_blocks(blocks) -> None:
@@ -211,10 +221,13 @@ def compile_blocks(blocks) -> None:
         block.forward = torch.compile(block.forward, dynamic=True)
 
 
-def load_vae(model_dir, dtype=torch.float32, device=None):
+def load_vae(model_dir, dtype=torch.float32, device=None, compile=False):
     from diffusers import AutoencoderKLFlux2
 
     vae = AutoencoderKLFlux2.from_pretrained(
         variant_dir(model_dir, "base") / "vae", torch_dtype=dtype
     ).eval()
+    if compile:
+        vae.to(memory_format=torch.channels_last)
+        vae.decode = torch.compile(vae.decode, dynamic=True)
     return vae.to(device) if device is not None else vae

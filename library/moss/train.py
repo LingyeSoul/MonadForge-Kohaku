@@ -487,7 +487,18 @@ def train(
     print(f"free VRAM before training: {free_vram_gb():.2f} GB", flush=True)
 
     params = list(network.parameters())
-    optimizer = torch.optim.AdamW(params, lr=req.lr)
+    if req.optimizer == "adamw16":
+        from library.moss.optim import AdamW16
+
+        optimizer = AdamW16(params, lr=req.lr)
+    elif req.optimizer == "muon":
+        from library.moss.optim import MuonHybrid
+
+        optimizer = MuonHybrid(
+            [{"params": params, "use_muon": True}], lr=req.lr
+        )
+    else:
+        optimizer = torch.optim.AdamW(params, lr=req.lr)
     total = req.epochs * len(samples)
     if req.max_steps:
         total = min(total, req.max_steps) if req.epochs else req.max_steps
@@ -512,6 +523,7 @@ def train(
     meta = {
         "base_variant": req.model,
         "lr": req.lr,
+        "optimizer": req.optimizer,
         "samples": len(samples),
         "steps": total,
         "image_tokens": f"{img[0]}-{img[-1]}",

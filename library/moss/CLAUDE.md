@@ -14,7 +14,7 @@ LoHa). `spectrum.py` re-implements Anima's forecaster rather than importing `net
 |---|---|
 | `model.py` | vendored `MOSSImageTransformer` / `MOSSImageScheduler` (attribution kept, state-dict names unchanged); per-sample `forward` must stay op-for-op with the pipeline, `forward_batched` masks text. i2i: `ref=` latents on RoPE's `r = 1` axis, `ref_timestep` / `ref_isolate` are transformer attributes |
 | `requests.py` | **torch-free** `CacheRequest` / `ColorizeCacheRequest` / `GenerateRequest` / `TrainRequest` / `TuneSwapRequest`; every flag and default is defined here once. `I2I_CACHE` maps each i2i task to its cache request; its recipes are `configs/moss/i2i/<task>/{cache,train,generate}.toml` (`i2i_config`) |
-| `loader.py` | phase split TE → encode → free → DiT; TE paged by decoder layer (`offload_by_layer`, `te_reserve_gb`) |
+| `loader.py` | phase split TE → encode → free → DiT; TE paged by decoder layer (`offload_by_layer`, `te_reserve_gb`); `load_vae` takes a decode dtype and an optional channels_last `torch.compile` |
 | `fp8.py` | fp8 TE export (`quantize_te`, ComfyUI `comfy_quant` format) and `load_fp8_text_encoder`; `text_encoder=` picks catalog row `moss_te_{precision}`, and TE caches stamp `encoder_id(precision)` so a switch re-encodes |
 | `int8.py` | INT8 ConvRot TE (`Int8ConvRotLinear`, W8A8 or weight-only with `int8_act=False`). **The default TE** (`DEFAULT_TEXT_ENCODER = "int8"`, row `moss_te_int8`); SmoothQuant scales are folded into its RMSNorm weights, so its norms differ from Base's. Regenerate with `project/moss_lora/src/te_gptq.py --grid int8_convrot --smooth 0.5 --act_aware` |
 | `cache.py` | TE cache at natural length (never padded) + packed, BN-normalised latent cache; caption variants `embeds_v{k}` survive a re-encode while the caption is unchanged |
@@ -30,6 +30,9 @@ LoHa). `spectrum.py` re-implements Anima's forecaster rather than importing `net
 | `tune.py` | `run_tune(req)`: recommends `--blocks_to_swap` / `--activation_memory_budget` |
 | `scan.py` | **torch-free** cache layout + GUI counts; its stale check (`source_sha256` vs `.txt`) can disagree with `cache.py`'s (`_te_current`) |
 | `ops.py` | the façade over `vendor/`: `fuse(model)` flips the blocks to the fused kernels (`rms_norm_mod`, `qk_norm_rope`, `situ_glu`, `gated_residual`) and the text-encoder ops are exposed for callers that build `cu_seqlens` themselves. `MONADFORGE_MOSS_KERNELS=0` keeps the reference branch |
+| `text_kernels.py` | the Qwen3.5 text encode on the vendored varlen ops (`causal_conv_varlen`, `gated_delta_rule_varlen`, `rms_norm_gated`, `attention_varlen_causal`); `loader.encode_prompt` uses it when `usable` and `MONADFORGE_MOSS_TEXT_KERNELS` allows, else HF's forward |
+| `quant.py` | int8 / e4m3 per-row DiT base for inference (`QuantLinear`, `quantize_transformer`), read by `quant_linear`; `load_transformer(quant=...)`, `moss-generate --quant` |
+| `optim/` | `AdamW16` (16-bit parameter and moments, fp32 math) and `MuonHybrid` (Muon + AdamW), extracted from KohakuMossTrainer; `moss-train --optimizer` |
 | `vendor/` | KohakuMossTrainer's kernel stack, verbatim (provenance + licence in `vendor/__init__.py`): op registry with per-arch fallback, the per-shape kernel-vs-`compile` tuner, Triton/TileLang kernels. **Nothing outside `library/moss/` imports it**; user doc `docs/moss/kernels.md`, bench `bench/moss_kernels/` |
 
 Sidecars `scripts/moss/{cache,colorize_cache,generate,train,tune_swap}.py` are thin argparse over the

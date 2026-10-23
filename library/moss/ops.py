@@ -208,3 +208,13 @@ def attention_causal(
     return bind("attention_varlen_causal", q.device, q.dtype)(
         q, k, v, cu_seqlens, max_seqlen, scale
     )
+
+
+# ---------------------------------------------------------------- quantized base
+
+
+def quant_linear(
+    x: Tensor, q: Tensor, scale: Tensor, bias: Tensor | None, fmt: str
+) -> Tensor:
+    """``x @ (q * scale[:, None])^T + bias`` with ``q`` int8 / e4m3fn and fp32 rows."""
+    return bind("quant_linear", x.device, x.dtype, fmt=fmt)(x, q, scale, bias, fmt)

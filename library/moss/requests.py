@@ -216,6 +216,12 @@ class GenerateRequest(Request):
         choices=("text", "layout_json"),
     )
     model: str = _f("base", "which DiT", choices=VARIANTS)
+    quant: str = _f(
+        "",
+        "quantized frozen DiT base: empty = bf16, int8 or fp8 (e4m3, sm89+). Halves "
+        "the base's VRAM; LoRAs still apply on top",
+        choices=("", "int8", "fp8"),
+    )
     lora: str = _f(
         "",
         "LoRA from scripts/moss/train.py (empty = none); a Base LoRA also loads on SFT",
@@ -273,6 +279,19 @@ class GenerateRequest(Request):
         "cond + uncond in one masked forward instead of two: ~25%% slower at "
         "1024² (the key mask takes SDPA off flash) and matches the reference only "
         "within bf16 noise",
+        advanced=True,
+    )
+    vae_dtype: str = _f(
+        "fp32",
+        "decode VAE dtype: fp32 (the reference), bf16, fp16, or auto (bf16 on a "
+        "bf16 card, else fp16). Latents stay fp32 either way",
+        choices=("fp32", "bf16", "fp16", "auto"),
+        advanced=True,
+    )
+    vae_compile: bool = _f(
+        False,
+        "torch.compile the VAE decode in channels_last; faster on CUDA, needs a "
+        "C++ toolchain on Windows",
         advanced=True,
     )
     shift: float = _f(
@@ -425,8 +444,14 @@ class TrainRequest(Request):
     )
     lr: float = _f(
         5e-5,
-        "AdamW learning rate (5e-5 for rank 32 / alpha 128 with channel scaling + "
+        "optimizer learning rate (5e-5 for rank 32 / alpha 128 with channel scaling + "
         "dc_isolate; 1e-4 over-fits with dc_isolate and suits training without it)",
+    )
+    optimizer: str = _f(
+        "adamw",
+        "adamw (torch), adamw16 (16-bit parameter and moments, fp32 math, "
+        "KohakuMoss's AdamW16) or muon (Muon on the LoRA matrices, AdamW elsewhere)",
+        choices=("adamw", "adamw16", "muon"),
     )
     warmup_ratio: float = _f(0.05, "linear warmup, as a fraction of all steps")
     grad_accum: int = _f(

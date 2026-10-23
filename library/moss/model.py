@@ -174,6 +174,13 @@ def _gated(y, gate, ref_span):
     )
 
 
+def _linear_dtype(module):
+    """The dtype activations take before this linear; a quantized base keeps its
+    compute dtype apart from the int8 / fp8 code dtype."""
+    compute = getattr(module, "compute_dtype", None)
+    return module.weight.dtype if compute is None else compute
+
+
 class _Block(nn.Module):
     def __init__(self, dim, ffn_dim, heads):
         super().__init__()
@@ -214,7 +221,7 @@ class _Block(nn.Module):
             )
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
         y = _affine(self.norm1(x), scale_a, shift_a, ref_span)
-        dtype = self.proj["q"].weight.dtype
+        dtype = _linear_dtype(self.proj["q"])
         y = y.to(dtype)
         q = self.q_norm(self.proj["q"](y).unflatten(-1, (self.heads, -1))).flatten(2)
         k = self.k_norm(self.proj["k"](y).unflatten(-1, (self.heads, -1))).flatten(2)
@@ -232,7 +239,7 @@ class _Block(nn.Module):
         memory round trips; ``ref_span`` keeps the same tokens in the same places.
         """
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
-        dtype = self.proj["q"].weight.dtype
+        dtype = _linear_dtype(self.proj["q"])
         batch, tokens, dim = x.shape
         head_dim = dim // self.heads
         seg = ctx.seg.reshape(-1)

@@ -191,8 +191,9 @@ REPA, parked, `_archive/moss_lora/repa.md`); `--ref_timestep` / `--ref_isolate` 
 ## More
 
 - Channel scaling and `--dc_isolate`: `docs/moss/channel_scaling.md`. DAVE: `docs/moss/dave.md`.
-- Fused block kernels (`MONADFORGE_MOSS_KERNELS`, measured numbers, what is ported but
-  not wired): `docs/moss/kernels.md`.
+- Fused block kernels (`MONADFORGE_MOSS_KERNELS`, measured numbers, the text-encoder
+  varlen ops, `--quant` and `--optimizer`, what is ported but not wired):
+  `docs/moss/kernels.md`.
 - Findings (attention sink, vision-tower reference, σ staircase, Spectrum schedule):
   `docs/moss/findings/`.
 - Proposals: `docs/proposal/moss_i2i.md`, `docs/proposal/moss_anima_negatives_revisit.md`.

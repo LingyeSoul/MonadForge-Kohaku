@@ -544,7 +544,7 @@ def _denoise_pending(req, model_dir, out_dir, pending, device) -> None:
     refs = ref_latents(model_dir, refs, device) if refs else {}
 
     t0 = time.time()
-    transformer = load_transformer(model_dir, req.model, device=device)
+    transformer = load_transformer(model_dir, req.model, device=device, quant=req.quant)
     print(
         f"[dit] {req.model} loaded in {time.time() - t0:.1f}s, "
         f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB",
@@ -615,7 +615,18 @@ def _denoise_pending(req, model_dir, out_dir, pending, device) -> None:
     empty_cache()
 
 
-def _decode_all(model_dir, out_dir, records, device) -> None:
+def _vae_dtype(name: str) -> torch.dtype:
+    """The decode VAE's dtype; ``auto`` is bf16 on a bf16 card, fp16 elsewhere."""
+    if name == "auto":
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    return {
+        "fp32": torch.float32,
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+    }[name]
+
+
+def _decode_all(model_dir, out_dir, records, device, vae_dtype, vae_compile) -> None:
     """Decode each record's latent from disk; an existing PNG is kept."""
     todo = [r for r in records if not _image_path(out_dir, r).is_file()]
     for r in records:
@@ -624,7 +635,9 @@ def _decode_all(model_dir, out_dir, records, device) -> None:
         return
     from diffusers.image_processor import VaeImageProcessor
 
-    vae = load_vae(model_dir, device=device)
+    vae = load_vae(
+        model_dir, dtype=_vae_dtype(vae_dtype), device=device, compile=vae_compile
+    )
     processor = VaeImageProcessor(vae_scale_factor=16)
     for rec in todo:
         torch.cuda.reset_peak_memory_stats()
@@ -689,7 +702,7 @@ def run_generate(req: GenerateRequest) -> Path:
         if pending:
             _denoise_pending(req, model_dir, out_dir, pending, device)
 
-    _decode_all(model_dir, out_dir, records, device)
+    _decode_all(model_dir, out_dir, records, device, req.vae_dtype, req.vae_compile)
     manifest = _write_manifest(out_dir, req, records)
     print(f"manifest -> {manifest}", flush=True)
     return out_dir
