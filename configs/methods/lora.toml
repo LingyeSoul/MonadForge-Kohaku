@@ -1,0 +1,189 @@
+network_alpha = 128
+network_dim = 32
+
+learning_rate = 2e-5
+max_train_epochs = 8
+save_every_n_epochs = 8
+checkpointing_epochs = 8
+
+use_shuffled_caption_variants = true
+use_randomized_caption_variants = true
+cache_llm_adapter_outputs = true
+caption_dropout_rate = 0.1
+
+# lora_down init: "kaiming" | "weight_svd" (W0's top-r right singular vectors,
+# the default) | "grad_svd" (sketch THIS run's task gradient before the adapter
+# exists — costs one frozen-DiT backward pass per image, blocks_to_swap must be
+# 0) | "basis_file" (read a precomputed gradient basis; needs
+# network_args grad_basis_file=<path>). The gradient modes are seeded from where
+# the task pushes rather than where W is big; output is an ordinary LoRA either
+# way. docs/proposal/grad_basis_init.md, networks/grad_basis.py.
+
+output_name = "anima_sincos2"
+# sigmoid_bias = 0.5
+path_pattern = "sincos/*"
+
+# vr_loss_weight = 1.0
+# vr_fei_sigma_low_div = 4.0
+
+# compile_inductor_mode = "max-autotune"
+
+# -------------
+# Ortho-lora
+down_init = "weight_svd"
+# Upstream orthogonal SVD windows and interleaved shards.
+svd_slice = 0
+svd_slice_count = 0
+# use_ortho_init = true
+
+use_timestep_mask = true
+min_rank = 1
+alpha_rank_scale = 1.0
+
+# -------------
+# Timestep mask (configured above)
+
+
+# ---
+# sample_every_n_epochs = 1
+# sample_prompts= "masterpiece, best quality, score_7, safe. An anime girl wearing a black tank-top and denim shorts is standing outdoors. She's holding a rectangular sign out in front of her that reads \"ANIMA\". She 's looking at the viewer with a smile. The background features some trees and blue sky with clouds."
+# -------------
+# "shared_A" and route_per_layer=false -> hydralora
+
+# use_moe_style = "shared_A"
+# route_per_layer = true
+# router_source = "input"
+# network_router_lr_scale = 10
+# router_source = "crossattn_emb"
+
+# fei_feature_dim = 2          # raw simplex (e_low, e_high)
+# fei_sigma_low_div = 4.0      # σ_low = min(H_lat, W_lat) / 4 — 2026-05-13 dataset sweep
+# fera_num_bands = 2
+# fera_fecl_weight = 0.0
+
+# sigma_feature_dim = 16
+# per_bucket_balance_weight = 0.3   # × balance_loss_weight, per-bucket term
+# num_sigma_buckets = 3
+# specialize_experts_by_sigma_buckets = true
+# sigma_bucket_boundaries = [0.0, 0.5, 0.8, 1.0]
+# router_targets = ".*(cross_attn\\.output_proj|mlp\\.layer[12])$"
+
+# num_experts = 4
+# balance_loss_weight = 1e-7 # seems lr * 1/100 is proper
+# balance_loss_warmup_ratio = 0.4
+
+# OrthoHydra centered-gate init (function-preserving step-0 router gradient).
+# Recenters the gate to (g_e - 1/E), zero-inits the router (exactly uniform at
+# step 0), and starts λ at ortho_lambda_init. ΔW=0 at init yet router logits
+# get gradient from step 0 (disjoint P_e survive the mean subtraction).
+# Watch ortho/router_grad_norm (>0 from step 0), ortho/grad_coupling (cross-
+# expert loss-geometry coupling), ortho/subspace_overlap (structural guardrail).
+# NOTE: distilled _moe checkpoints drop the -(1/E)Σ_e P_e bias → train/research
+# only until the router-live node subtracts the mean expert (see ortho.py).
+# ortho_centered_gate = true
+# ortho_lambda_init = 1e-2     # auto-bumped from 0 when centered_gate is on
+
+
+# -------------
+# "independent_A" and route_per_layer=true -> fera
+
+# use_moe_style = "independent_A"
+# route_per_layer = false 
+# router_source = "fei"
+# ortho_init_std = 0.05
+
+# fei_feature_dim = 2          # raw simplex (e_low, e_high)
+# fei_sigma_low_div = 4.0      # σ_low = min(H_lat, W_lat) / 4 — 2026-05-13 dataset sweep
+# fera_num_bands = 2
+# fera_fecl_weight = 0.0
+
+# output_name = "anima_fera"
+
+# num_experts = 6
+# balance_loss_weight = 2e-7 # seems lr * 1/100 is proper
+
+# balance_loss_warmup_ratio = 0.4
+# router_targets = ".*\\.(qkv_proj|q_proj|kv_proj|output_proj|layer[12])$"
+
+# -------------
+# Text-routed pool (route_per_layer=false + router_source="crossattn_emb")
+#
+# One network-level GlobalRouter routes the whole pool by PROMPT CONTENT —
+# it reads the pooled post-LLM-adapter cross-attn text vector (the DiT's
+# K/V), not σ / noise-frequency. Works with shared_A (Hydra) or
+# independent_A (FeRA-style) layouts. The router pools (B,L,D)→(B,D) over the
+# sequence axis and LayerNorms before the MLP; gates fire per cond/uncond
+# branch at inference. Caveat: experts specialize by caption regime, a
+# different inductive bias from FEI/σ routing — bench before adopting.
+
+# use_moe_style = "shared_A"
+# route_per_layer = false
+# router_source = "crossattn_emb"
+# num_experts = 6
+# balance_loss_weight = 2e-7
+# balance_loss_warmup_ratio = 0.4
+# router_targets = ".*\\.(qkv_proj|q_proj|kv_proj|output_proj|layer[12])$"
+# output_name = "anima_crossattn_routed"
+
+# -------------
+# Variance-reduced FM loss (AsymFlow §5.2, arXiv:2605.12964). One extra
+# no-grad forward per step on the FEI-low-passed latent, with an online
+# control-variate λ. The control-variate forward reuses the trainable DiT
+# with adapter multiplier=0 (equivalent to a frozen base DiT for LoRA-family
+# runs), so there is no extra model copy in VRAM — only ~+40% step compute.
+# See bench/fm_vr_headroom/proposal.md.
+# vr_loss_weight = 1.0
+# vr_fei_sigma_low_div = 4.0
+
+# -------------
+# REPA v2 — encoder-alignment aux loss (docs/experimental/repa.md).
+#
+# Aligns a mid-block DiT feature to cached PE-Spatial patch tokens — a training-
+# time regularizer, orthogonal to the routing axes above (composes with the
+# default stack). PREREQ: `make preprocess-pe-spatial` to cache
+# {stem}_anima_pe_spatial.safetensors sidecars first.
+#
+#   repa_mode = "relational"  → Gram / relational-KD form (no head, domain-offset
+#                               cancelled). Phase-0 WINNER (2026-06-12, ~6:4–7:3
+#                               over absolute on eyeballed grids; corroborated by
+#                               iREPA arXiv:2512.10794) — the default.
+#             = "absolute"     → paper-faithful per-token cosine + MLP head.
+#                               Reference only; don't spend runs on it.
+#
+# Phase-1 operating-point levers (anneal/cutoff, spatial norm, token-subset Gram):
+# docs/experimental/repa.md §"Annealing plan". spatial_norm is validated + ON
+# below; anneal stays off pending its A/B (candidate 0.25); lever 3 closed.
+use_repa       = true
+repa_mode      = "relational"
+repa_weight    = 0.05
+repa_layer     = 8
+repa_encoder   = "pe_spatial"
+repa_lr_scale  = 1.0          # head LR multiplier (absolute mode only)
+repa_spatial_norm = false
+# repa_anneal_steps = 0.5
+
+# Lever 1 — hard cutoff (HASTE): (0,1] = fraction of the run, >1 = absolute
+# optimizer steps, 0 = off. Candidate: 0.25 — the quarter-run align_loss curve
+# plateaus by ~18% of the run (anima_repa_normed_quarter, 2026-06-12).
+# repa_anneal_steps = 0.25
+
+# REPA-DoG (_archive/proposals/repa_dog_target.md) — band-pass the alignment TARGET
+# before the Gram match, generalizing spatial_norm's DC removal to a broader
+# low-band strip (arXiv:2603.14645v1 §3.5). When on it REPLACES the spatial_norm
+# block (DoG at σ₁→0 *is* DC removal — same family, mutually exclusive). Pure
+# target-side preprocessing: byte-identical no-op when off, can't regress non-DoG
+# runs. Phase 0 PASSED (bench/repa/probe_dog_target.py, 2026-06-13): broad low-
+# band strip beats spatial_norm on all 3 content axes, character peaks at σ₁=min/16.
+# A/B (vs spatial_norm) still open — flip true with σ₂ off, HOLD norm_std=0 so the
+# only change vs baseline is the band-pass (the paper's std confound, Table 6).
+repa_target_dog     = true   # true ⇒ DoG band-pass the target (replaces spatial_norm)
+repa_dog_sigma1_div = 16      # σ₁ = min(gh,gw)/div; Phase-0 character winner = 16
+repa_dog_sigma2_div = 0       # 0 ⇒ σ₂ off (low-band strip only, +1a); >sigma1_div ⇒ band-pass
+repa_dog_norm_std   = 0       # 0 ⇒ empirical std (matches spatial_norm); >0 ⇒ fixed const
+
+# --- Alternative adapters (use separate method TOMLs) ---
+# VeRA:  --method vera   (configs/methods/vera.toml)
+# DyLoRA: --method dylora (configs/methods/dylora.toml)
+# LoKR:  set use_lokr = true in network_args
+# LoHa:  --method loha   (configs/methods/loha.toml)
+

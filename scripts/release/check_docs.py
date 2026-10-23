@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""Doc-reference linter — catch docs that drift from the implementation.
+
+Scans tracked Markdown (excluding ``_archive/``) and verifies three classes of
+machine-checkable reference against the live tree:
+
+  * file paths   — ``library/config/io.py``, ``configs/methods/lora.toml``,
+                   ``scripts/preprocess/`` … must exist on disk.        (ERROR)
+  * make targets — ``make test-hydra``, ``python tasks.py turbo`` … must be
+                   a real ``tasks.py`` COMMANDS key or a Makefile target. (ERROR)
+  * CLI flags    — ``--infer_steps``, ``--dave_tau`` … should be a flag the code
+                   actually declares.                  (WARN — see caveat below)
+
+Source of truth, never hard-coded here:
+  * make targets : the ``COMMANDS`` dict in ``tasks.py`` (AST-parsed) + Makefile
+                   targets / ``.PHONY`` names.
+  * cli flags    : every ``--flag`` literal appearing in any tracked ``.py``.
+  * file paths   : the working tree itself.
+
+Skipped references:
+  * Paths are only checked when their first segment is a git-tracked top-level
+    entry, so URLs (``claude.ai/code``), repo slugs (``sorryhyun/anima_lora``)
+    and runtime/data dirs (``output/…``, ``post_image_dataset/…``) are skipped,
+    not flagged.
+  * ``make <x>`` and flags are read only from inline-code spans and fenced
+    blocks, so English prose ("make sure", "we make use of") never trips the
+    target check.
+  * Gitignored paths (``configs/gui-methods/custom/…``, ``output/…``) are
+    machine-local, so a doc citing one is never flagged.
+
+CLI-flag caveat: the "known flags" set is every ``--x`` mentioned anywhere in
+the ``.py`` sources, so it catches a *fully removed* flag but not one that
+lingers only in a comment. Suppressed mentions:
+  * foreign tool flags in shell snippets (uv / gh / ruff …) → ``FOREIGN_FLAGS``;
+  * bare placeholders in example payloads (``--some_flag``) → ``PLACEHOLDER_FLAGS``;
+  * truncated glob/prefix families (``--region-*`` → ``--region-``, ``--ddp_*``
+    → ``--ddp_``) — any token ending in ``-`` or ``_`` is skipped;
+  * a flag named on a line that *documents its removal* ("``--fp8`` was removed",
+    "no ``--smc_cfg_k`` … retired") → ``_REMOVAL_RE``;
+  * a doc that is a historical record of archived/shelved work, opted out with a
+    ``<!-- check-docs: ignore-flags -->`` marker anywhere in the file.
+Promote with ``--strict`` once the docs are clean.
+
+Usage:
+    python scripts/release/check_docs.py            # human report, exit 1 on any ERROR
+    python scripts/release/check_docs.py --strict   # WARNs count as failures too
+    python scripts/release/check_docs.py --json     # machine-readable
+
+``collect_issues()`` returns the structured list for ``tests/test_doc_refs.py``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import re
+import subprocess
+import sys
+from collections import namedtuple
+from functools import lru_cache
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# File extensions we treat as "a reference to a tracked file".
+_EXTS = (
+    "py",
+    "toml",
+    "md",
+    "json",
+    "yaml",
+    "yml",
+    "sh",
+    "ps1",
+    "cfg",
+    "txt",
+    "safetensors",
+    "npz",
+)
+
+# External-tool long-options that legitimately appear in doc shell snippets;
+# suppressed from the flag WARN pass so they don't read as drift. Extend as needed.
+FOREIGN_FLAGS = {
+    "--no-project",
+    "--fix",
+    "--clobber",
+    "--generate-notes",
+    "--title",
+    "--token",
+    "--name-only",
+}
+
+# Bare placeholders in example payloads, never meant to resolve to a real flag.
+PLACEHOLDER_FLAGS = {
+    "--some_flag",
+}
+
+# A flag named on a line whose prose documents its *removal* isn't drift — skip
+# flag WARNs on any line matching this.
+_REMOVAL_RE = re.compile(
+    r"\b(removed|retired|gone|deprecated|no longer)\b", re.IGNORECASE
+)
+
+# Historical-record docs opt out of the flag check via this marker — their
+# commands reference flags that only ever existed in now-removed/archived code.
+_IGNORE_FLAGS_MARKER = "check-docs: ignore-flags"
+
+# A path token: multi-segment (has a slash) or a bare file with a known
+# extension. The char class excludes ':' '#' '(' ')' so line/symbol anchors
+# (`models.py:1435`, `weights.py::foo`) and trailing punctuation fall off.
+_MULTI_RE = re.compile(r"[\w.\-]+(?:/[\w.\-]+)+/?")
+_SINGLE_RE = re.compile(r"\b[\w-]+\.(?:%s)\b" % "|".join(_EXTS))
+_INLINE_CODE_RE = re.compile(r"`([^`]+)`")
+_FLAG_RE = re.compile(r"--[A-Za-z][A-Za-z0-9_-]+")
+# `make <target>` / `python tasks.py <target>` inside a code span.
+_MAKE_RE = re.compile(r"\b(?:make|tasks\.py)\s+([a-z][a-z0-9-]*)")
+
+Issue = namedtuple("Issue", "level path line kind token message")
+
+
+def _git(*args: str) -> str:
+    # ``core.quotepath=false`` keeps non-ASCII paths (translated guidebooks)
+    # as raw UTF-8, not C-style escapes — else they're unopenable + skipped.
+    # Decoding is pinned to UTF-8 for the same reason: `text=True` alone uses the
+    # locale encoding, so on a non-UTF-8 Windows box (cp949, cp932 …) those very
+    # paths raise UnicodeDecodeError inside the reader thread — which surfaces
+    # only as a `None` stdout here, i.e. an AttributeError far from the cause.
+    return subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "-c", "core.quotepath=false", *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    ).stdout
+
+
+def _tracked(*pathspec: str) -> list[Path]:
+    out = _git("ls-files", *pathspec)
+    return [REPO_ROOT / line for line in out.splitlines() if line]
+
+
+def doc_files(include_scratch: bool = False) -> list[Path]:
+    # _archive/ always skipped; bench/ + docs/proposal/ are forward-looking
+    # scratchpads (reference to-be-built paths) — opt in with --include-scratch.
+    exclude = [":!:_archive/*"]
+    if not include_scratch:
+        exclude += [":!:bench/*", ":!:docs/proposal/*"]
+    return _tracked("*.md", *exclude)
+
+
+def tracked_top_level() -> set[str]:
+    return set(_git("ls-tree", "HEAD", "--name-only").split())
+
+
+def known_flags() -> set[str]:
+    flags: set[str] = set()
+    for path in _tracked("*.py"):
+        try:
+            flags.update(
+                _FLAG_RE.findall(path.read_text(encoding="utf-8", errors="ignore"))
+            )
+        except OSError:
+            continue
+    return flags
+
+
+def known_make_targets() -> set[str]:
+    targets: set[str] = set()
+
+    # tasks.py COMMANDS dict keys — the canonical target list.
+    tree = ast.parse((REPO_ROOT / "tasks.py").read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(t, ast.Name) and t.id == "COMMANDS" for t in node.targets
+        ):
+            continue
+        if isinstance(node.value, ast.Dict):
+            for key in node.value.keys:
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    targets.add(key.value)
+
+    # Makefile explicit targets + .PHONY names (e.g. `help`, which forwards to
+    # `tasks.py --help` and isn't a COMMANDS key).
+    for line in (REPO_ROOT / "Makefile").read_text(encoding="utf-8").splitlines():
+        if line.startswith(".PHONY:"):
+            targets.update(line.split(":", 1)[1].split())
+        m = re.match(r"([A-Za-z][\w-]*)\s*:", line)
+        if m:
+            targets.add(m.group(1))
+    targets.discard("Makefile")
+    return targets
+
+
+@lru_cache(maxsize=None)
+def _is_ignored(rel: str) -> bool:
+    """True when git ignores ``rel`` (repo-relative), tracked files excluded.
+
+    Pattern-based, so it answers for paths that don't exist — which is exactly
+    the case that matters: a doc citing a user-local artifact
+    (``configs/gui-methods/custom/x.toml``) must not read as drift just because
+    this checkout never generated it.
+    """
+    return (
+        subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "check-ignore", "-q", "--", rel],
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+def _check_path(
+    tok: str, top: set[str], base: Path | None = None, line_root: Path | None = None
+) -> str | None:
+    """Return the token if it's a broken path reference, else None.
+
+    Resolved against the repo root first, then — when ``base`` is given — the
+    referencing doc's own directory. Self-contained doc trees cite their
+    siblings relatively: every ``project/<line>/`` digest says
+    ``bench/report.md`` / ``bench/run_*.py`` meaning *that line's* bench dir
+    (see ``project/README.md``), which is a correct reference that a
+    root-only resolver reads as broken because ``bench/`` is also a real
+    top-level dir. Root-first ordering keeps repo-rooted refs authoritative.
+    ``line_root`` covers the same convention one level down: a report under
+    ``project/<line>/reports/`` citing ``configs/x.toml`` means
+    ``project/<line>/configs/x.toml`` (see ``_line_root``).
+    """
+    tok = tok.strip().rstrip(".")
+    if not tok or tok.startswith(("http", "..", "/", "~", "mailto")):
+        return None
+    # `<lang>` placeholders / truncated glob prefixes (`docs/structure_images_`,
+    # `--region-`) — never a real path. Mirrors the flag-truncation skip policy
+    # below in collect_issues; ``_MULTI_RE`` matches the stub before the ``<``.
+    if tok.endswith(("-", "_")):
+        return None
+    if "/" not in tok and "." not in tok:
+        return None
+    first = tok.split("/", 1)[0]
+    if first == "_archive":  # historical pointers — files were deleted/renamed;
+        return None  # the doc is the record, the path never resolves
+    # Experiment run-output dirs (`bench/<exp>/results/<run>/…`) only exist
+    # after someone ran the experiment; they never resolve on a clean checkout.
+    if first == "bench" and "/results" in tok:
+        return None
+    if first not in top:  # not rooted in the repo (URL / data dir / bare name)
+        return None
+    roots = [REPO_ROOT] + [r for r in (base, line_root) if r is not None]
+    for root in roots:
+        if (root / tok).exists():
+            return None
+        # Docs often cite a module without its extension (`bench/_common`).
+        if (root / f"{tok}.py").exists():
+            return None
+    # Missing *and* gitignored → machine-local, not drift (see ``_is_ignored``).
+    for root in roots:
+        try:
+            rel = (root / tok).resolve().relative_to(REPO_ROOT)
+        except ValueError:
+            continue  # base outside the repo (tests' tmp_path)
+        # Path normalization removes a directory token's trailing slash. Git
+        # needs that marker to match directory-only ignore rules when the
+        # generated directory does not exist in this checkout yet.
+        ignored_path = str(rel) + ("/" if tok.endswith("/") else "")
+        if _is_ignored(ignored_path):
+            return None
+    return tok
+
+
+def _line_root(doc: Path) -> Path | None:
+    """``project/<line>/`` (or ``project/finished/<line>/``) holding ``doc``."""
+    try:
+        parts = doc.relative_to(REPO_ROOT).parts
+    except ValueError:
+        return None
+    if parts[:1] != ("project",):
+        return None
+    depth = 3 if parts[1:2] == ("finished",) else 2
+    if len(parts) <= depth:
+        return None  # a file directly under project/ or project/finished/
+    return REPO_ROOT.joinpath(*parts[:depth])
+
+
+def _anchor_family_ref(tok: str, next_char: str) -> str | None:
+    """The path token to verify, or ``None`` when there is nothing to verify.
+
+    A glob prefix (``results/20260607-*``) or a brace expansion
+    (``results/20260816-16{18,34}-2c-*``) is a *family* reference, not a literal
+    path claim — and :data:`_MULTI_RE` truncates it at the ``*`` / ``{``, so the
+    partial stem would read as a broken path. Anchor on the parent directory
+    instead: the family ref still verifies its root, while the stem is left
+    alone. A family with no parent (``foo*``) has nothing to anchor on and is
+    skipped. (The make-target check does the same for
+    ``make preprocess-{resize,vae,…}``.)
+    """
+    if next_char not in ("*", "{"):
+        return tok
+    head, sep, _ = tok.rpartition("/")
+    return head + "/" if sep else None
+
+
+def _code_fragments(line: str, in_fence: bool) -> list[str]:
+    """Code fragments on a line: the whole line inside a fence, else each inline
+    `code` span separately. Kept separate (not joined) so adjacent spans can't
+    fabricate a `make <next-span>` adjacency."""
+    if in_fence:
+        return [line]
+    return _INLINE_CODE_RE.findall(line)
+
+
+def collect_issues(include_bench: bool = False) -> list[Issue]:
+    top = tracked_top_level()
+    flags = known_flags()
+    targets = known_make_targets()
+    issues: list[Issue] = []
+
+    for doc in doc_files(include_bench):
+        rel = str(doc.relative_to(REPO_ROOT))
+        line_root = _line_root(doc)
+        in_fence = False
+        try:
+            text = doc.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        lines = text.splitlines()
+        skip_flags_doc = _IGNORE_FLAGS_MARKER in text
+
+        for lineno, line in enumerate(lines, 1):
+            if line.lstrip().startswith(("```", "~~~")):
+                in_fence = not in_fence
+                continue
+            fragments = _code_fragments(line, in_fence)
+
+            # paths — checked across the whole line (prose + code)
+            seen: set[str] = set()
+            for rx in (_MULTI_RE, _SINGLE_RE):
+                for m in rx.finditer(line):
+                    # The tail of an absolute or home path (``~/anima_lora/output``)
+                    # names another machine's tree, not this checkout.
+                    if line[m.start() - 1 : m.start()] in ("/", "~"):
+                        continue
+                    tok = _anchor_family_ref(m.group(0), line[m.end() : m.end() + 1])
+                    if tok is None:
+                        continue
+                    bad = _check_path(tok, top, base=doc.parent, line_root=line_root)
+                    if bad and bad not in seen:
+                        seen.add(bad)
+                        issues.append(
+                            Issue(
+                                "ERROR",
+                                rel,
+                                lineno,
+                                "path",
+                                bad,
+                                f"path does not exist: {bad}",
+                            )
+                        )
+
+            # make targets — code fragments only
+            for frag in fragments:
+                for m in _MAKE_RE.finditer(frag):
+                    tgt = m.group(1)
+                    # a trailing '-' is brace-expansion shorthand truncated at
+                    # '{' (`make preprocess-{resize,vae,…}`), not a real target.
+                    if tgt.endswith("-") or tgt in targets:
+                        continue
+                    issues.append(
+                        Issue(
+                            "ERROR",
+                            rel,
+                            lineno,
+                            "make-target",
+                            tgt,
+                            f"unknown make target: make {tgt}",
+                        )
+                    )
+
+            # cli flags — code fragments only, WARN level
+            if skip_flags_doc or _REMOVAL_RE.search(line):
+                continue
+            low = line.lower()
+            flagged: set[str] = set()
+            for frag in fragments:
+                for flag in _FLAG_RE.findall(frag):
+                    if (
+                        flag in flags
+                        or flag in FOREIGN_FLAGS
+                        or flag in PLACEHOLDER_FLAGS
+                    ):
+                        continue
+                    # truncated glob / prefix family (`--region-*`, `--ddp_*`)
+                    if flag.endswith(("-", "_")) or flag in flagged:
+                        continue
+                    # negated mention ("No `--vr_frozen_ref_dit` flag") — the doc
+                    # is telling readers it doesn't exist, not using it.
+                    fl = flag.lower()
+                    if f"no {fl}" in low or f"no `{fl}" in low:
+                        continue
+                    flagged.add(flag)
+                    issues.append(
+                        Issue(
+                            "WARN",
+                            rel,
+                            lineno,
+                            "cli-flag",
+                            flag,
+                            f"flag not declared in any .py: {flag}",
+                        )
+                    )
+
+    return issues
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        description="Lint doc references against the live tree."
+    )
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--strict", action="store_true", help="WARN-level issues also fail")
+    ap.add_argument(
+        "--include-bench", action="store_true", help="also scan bench/ scratch docs"
+    )
+    args = ap.parse_args(argv)
+
+    issues = collect_issues(include_bench=args.include_bench)
+    errors = [x for x in issues if x.level == "ERROR"]
+    warns = [x for x in issues if x.level == "WARN"]
+
+    if args.json:
+        print(json.dumps([x._asdict() for x in issues], indent=2))
+    elif not issues:
+        print("✓ doc references OK — no broken paths/targets, no unknown flags")
+    else:
+        by_file: dict[str, list[Issue]] = {}
+        for x in issues:
+            by_file.setdefault(x.path, []).append(x)
+        for path in sorted(by_file):
+            print(f"\n{path}")
+            for x in sorted(by_file[path], key=lambda y: (y.line, y.kind)):
+                tag = "✗" if x.level == "ERROR" else "•"
+                print(f"  {tag} {x.path}:{x.line}: [{x.kind}] {x.message}")
+        print(f"\n{len(errors)} error(s), {len(warns)} warning(s)")
+
+    return 1 if (errors or (warns and args.strict)) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,5 @@
+# Windows command scripts require CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+# Research material is versioned, but excluded from release archives.
+project/ export-ignore

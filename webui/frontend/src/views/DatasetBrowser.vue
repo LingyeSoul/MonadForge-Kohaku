@@ -1,0 +1,2079 @@
+<template>
+  <v-container fluid class="dataset-page pa-4">
+    <!-- Header row -->
+    <WorkspaceHeading class="ds-header" :title="t('dsTitle')" :subtitle="t('dsSubtitle')">
+      <span class="text-caption text-medium-emphasis">{{ totalLabel }}</span>
+    </WorkspaceHeading>
+
+    <v-tabs v-model="datasetTab" class="mb-4 flex-shrink-0" aria-label="Dataset workspace">
+      <v-tab value="browse">{{ t('dsTitle') }}</v-tab>
+      <v-tab value="curation">{{ curationTitle }}</v-tab>
+    </v-tabs>
+    <CurationWorkspace v-if="datasetTab === 'curation' || curationVisited" v-show="datasetTab === 'curation'" class="dataset-curation-pane" :input-dir="directory" @vue:mounted="curationVisited = true" />
+    <template v-if="datasetTab === 'browse'">
+    <!-- Toolbar: directory, search, sort, view toggle -->
+    <v-card variant="flat" class="mb-4 ds-header dataset-toolbar">
+      <v-row align="center" density="comfortable">
+        <v-col cols="12" sm="4" md="3" class="toolbar-dir">
+          <v-select
+            v-model="directory"
+            :items="directories"
+            item-title="name"
+            item-value="name"
+            :label="t('dsDirectory')"
+            variant="outlined"
+            density="compact"
+            hide-details
+            prepend-inner-icon="mdi-folder-outline"
+            :loading="loadingDirs"
+            @update:model-value="onDirectoryChange"
+          >
+            <template #item="{ props }">
+              <v-list-item v-bind="props">
+                <template #append>
+                  <v-icon
+                    v-if="isCustomDir(String(props.value))"
+                    icon="mdi-close-circle-outline"
+                    size="small"
+                    color="medium-emphasis"
+                    class="remove-dir-btn"
+                    :title="t('dsRemovePath')"
+                    @mousedown.stop.prevent
+                    @click.stop.prevent="removeDirectory(String(props.value))"
+                  />
+                </template>
+              </v-list-item>
+            </template>
+          </v-select>
+        </v-col>
+        <v-col cols="12" sm="4" md="4">
+          <v-text-field
+            :model-value="search"
+            prepend-inner-icon="mdi-magnify"
+            :label="t('dsSearch')"
+            variant="outlined"
+            density="compact"
+            hide-details
+            clearable
+            @update:model-value="search = $event ?? ''; onSearchChange()"
+          />
+        </v-col>
+        <v-col cols="auto">
+          <v-btn
+            :icon="sortDesc ? 'mdi-sort-descending' : 'mdi-sort-ascending'"
+            variant="text"
+            density="compact"
+            :title="sortDesc ? t('dsSortAsc') : t('dsSortDesc')"
+            @click="toggleSort"
+          />
+        </v-col>
+        <v-col cols="auto">
+          <v-btn
+            icon="mdi-refresh"
+            variant="text"
+            density="compact"
+            :title="t('dsReload')"
+            :loading="loadingImages"
+            @click="loadImages"
+          />
+        </v-col>
+        <v-col cols="auto">
+          <v-btn-toggle v-model="viewMode" mandatory density="compact" variant="outlined">
+            <v-btn value="grid" icon="mdi-view-grid" :aria-label="t('dsGridView')">
+              <v-icon icon="mdi-view-grid" /><v-tooltip activator="parent">{{ t('dsGridView') }}</v-tooltip>
+            </v-btn>
+            <v-btn value="list" icon="mdi-view-list" :aria-label="t('dsListView')">
+              <v-icon icon="mdi-view-list" /><v-tooltip activator="parent">{{ t('dsListView') }}</v-tooltip>
+            </v-btn>
+            <v-btn value="tree" icon="mdi-file-tree" :aria-label="t('dsTreeView')">
+              <v-icon icon="mdi-file-tree" /><v-tooltip activator="parent">{{ t('dsTreeView') }}</v-tooltip>
+            </v-btn>
+          </v-btn-toggle>
+        </v-col>
+        <v-col cols="auto">
+          <v-btn :color="selectionMode ? 'primary' : undefined" :variant="selectionMode ? 'flat' : 'text'" density="compact" @click="selectionMode = !selectionMode; if (!selectionMode) deselectAll()">
+            <v-icon icon="mdi-checkbox-multiple-marked-outline" class="mr-1" />
+            {{ t('dsSelect') }}
+          </v-btn>
+        </v-col>
+        <v-col cols="auto">
+          <v-btn variant="tonal" density="compact" @click="openUploadDialog">
+            <v-icon icon="mdi-upload" class="mr-1" />
+            {{ t('dsUpload') }}
+          </v-btn>
+        </v-col>
+        <v-col cols="auto">
+          <v-btn
+            color="primary"
+            variant="tonal"
+            density="compact"
+            :loading="tagging"
+            :disabled="tagging || !total || loadingImages"
+            @click="startTagging"
+          >
+            <v-icon icon="mdi-tag-outline" class="mr-1" />
+            {{ t('tgAutoTag') }}
+          </v-btn>
+        </v-col>
+        <v-col cols="auto">
+          <v-btn
+            icon="mdi-cog-outline"
+            variant="text"
+            density="compact"
+            :active="showTaggerSettings"
+            @click="showTaggerSettings = !showTaggerSettings"
+          />
+        </v-col>
+        <v-spacer />
+        <v-col cols="auto">
+          <span class="text-caption text-medium-emphasis">
+            {{ totalLabel }}
+          </span>
+        </v-col>
+      </v-row>
+      <!-- Custom path row -->
+      <v-row align="center" density="comfortable" class="mt-1">
+        <v-col>
+          <v-text-field
+            :model-value="customPath"
+            prepend-inner-icon="mdi-folder-plus-outline"
+            :label="t('dsCustomPath')"
+            :placeholder="t('dsCustomPathHint')"
+            variant="outlined"
+            density="compact"
+            hide-details
+            clearable
+            @update:model-value="customPath = $event ?? ''"
+            @keyup.enter="addCustomPath"
+          />
+        </v-col>
+        <v-col cols="auto">
+          <v-btn
+            color="primary"
+            variant="tonal"
+            density="compact"
+            :disabled="!customPath.trim()"
+            @click="addCustomPath"
+          >
+            {{ t('dsAddPath') }}
+          </v-btn>
+        </v-col>
+      </v-row>
+      <!-- Tagger settings row -->
+      <v-expand-transition>
+        <v-row v-if="showTaggerSettings" align="center" density="comfortable" class="mt-1">
+          <v-col cols="12" sm="4">
+            <v-select
+              v-model="taggerSettings.model_name"
+              :items="[
+                { title: t('tgEva02'), value: 'wd-eva02-large-tagger-v3' },
+                { title: t('tgSwinV2'), value: 'wd-swinv2-tagger-v3' },
+              ]"
+              :label="t('tgModel')"
+              variant="outlined"
+              density="compact"
+              hide-details
+              @update:model-value="saveTaggerSettings"
+            />
+          </v-col>
+          <v-col cols="12" sm="3">
+            <v-text-field
+              :model-value="taggerSettings.trigger_word"
+              :label="t('tgTriggerWord')"
+              :placeholder="t('tgTriggerWordHint')"
+              variant="outlined"
+              density="compact"
+              hide-details
+              clearable
+              @update:model-value="taggerSettings.trigger_word = $event ?? ''; saveTaggerSettings()"
+            />
+          </v-col>
+          <v-col cols="12" sm="3">
+            <v-slider
+              v-model="taggerSettings.threshold"
+              :label="t('tgThreshold')"
+              :min="0.05"
+              :max="0.95"
+              :step="0.05"
+              thumb-label
+              density="compact"
+              hide-details
+              @update:model-value="saveTaggerSettings"
+            />
+          </v-col>
+          <v-col cols="auto">
+            <v-checkbox
+              v-model="skipExisting"
+              :label="t('tgSkipExisting')"
+              density="compact"
+              hide-details
+            />
+          </v-col>
+        </v-row>
+      </v-expand-transition>
+      <!-- Tagger progress -->
+      <v-progress-linear
+        v-if="tagging"
+        :model-value="tagProgress.total > 0 ? (tagProgress.current / tagProgress.total) * 100 : 0"
+        color="primary"
+        height="22"
+        class="mt-2"
+        rounded
+      >
+        <template #default>
+          <span class="text-caption">{{ tagProgress.current }} / {{ tagProgress.total }}</span>
+        </template>
+      </v-progress-linear>
+    </v-card>
+
+    <!-- Batch operations toolbar -->
+    <v-expand-transition>
+      <v-card v-if="selectionMode" variant="tonal" class="mb-4 pa-4">
+        <v-row align="center" density="comfortable">
+          <v-col cols="auto">
+            <span class="text-body-2">{{ t('dsSelected', { n: selectedCount }) }}</span>
+          </v-col>
+          <v-col cols="auto">
+            <v-btn size="small" variant="text" @click="selectAll">{{ t('dsSelectAll') }}</v-btn>
+          </v-col>
+          <v-col cols="auto">
+            <v-btn size="small" variant="text" @click="deselectAll">{{ t('dsDeselectAll') }}</v-btn>
+          </v-col>
+          <v-spacer />
+          <v-col cols="auto">
+            <v-btn size="small" color="primary" variant="tonal" :disabled="!selectedCount" @click="openBatchDialog('append')">
+              <v-icon icon="mdi-plus" class="mr-1" />{{ t('dsAppendTag') }}
+            </v-btn>
+          </v-col>
+          <v-col cols="auto">
+            <v-btn size="small" color="warning" variant="tonal" :disabled="!selectedCount" @click="openBatchDialog('remove')">
+              <v-icon icon="mdi-minus" class="mr-1" />{{ t('dsRemoveTag') }}
+            </v-btn>
+          </v-col>
+          <v-col cols="auto">
+            <v-btn size="small" variant="tonal" :disabled="!selectedCount" @click="openBatchDialog('replace')">
+              <v-icon icon="mdi-find-replace" class="mr-1" />{{ t('dsFindReplace') }}
+            </v-btn>
+          </v-col>
+        </v-row>
+      </v-card>
+    </v-expand-transition>
+
+    <!-- Scrollable content area -->
+    <v-alert v-if="imagesError" type="error" variant="tonal" class="mb-3">{{ imagesError }}</v-alert>
+    <v-progress-linear v-if="loadingImages" indeterminate class="mb-3" />
+    <div class="content-scroll">
+      <!-- Grid view -->
+      <v-row v-if="viewMode === 'grid' && images.length > 0">
+        <v-col
+          v-for="img in images"
+          :key="img.path"
+          cols="6"
+          sm="4"
+          md="3"
+          lg="2"
+        >
+          <v-card
+            class="mx-auto dataset-card"
+            variant="tonal"
+            :class="{ 'border-primary': selectedImage?.path === img.path }"
+            @click="activateImage(img)"
+          >
+            <div v-if="selectionMode" class="selection-checkbox" @click.stop="toggleSelection(img.path)">
+              <v-checkbox-btn :model-value="selectedPaths.has(img.path)" density="compact" color="primary" />
+            </div>
+            <v-img
+              :src="imageUrl(img)"
+              :alt="img.filename"
+              aspect-ratio="1"
+              cover
+              class="bg-grey-darken-3"
+            >
+              <template #placeholder>
+                <div class="d-flex align-center justify-center fill-height">
+                  <v-progress-circular indeterminate color="primary" size="24" />
+                </div>
+              </template>
+              <template #error>
+                <div class="d-flex align-center justify-center fill-height">
+                  <v-icon icon="mdi-image-broken" size="32" color="grey" />
+                </div>
+              </template>
+              <div v-if="img.has_mask" class="mask-badge">
+                <v-icon icon="mdi-checkerboard" size="14" />
+              </div>
+            </v-img>
+            <v-card-subtitle class="text-caption text-truncate pa-2">
+              {{ img.stem }}
+            </v-card-subtitle>
+          </v-card>
+        </v-col>
+      </v-row>
+
+      <!-- List view -->
+      <v-data-table
+        v-if="viewMode === 'list' && images.length > 0"
+        :items="images"
+        :headers="listHeaders"
+        item-key="path"
+        :items-per-page="-1"
+        hide-default-footer
+        hover
+        density="compact"
+        @click:row="onRowClick"
+      >
+        <template #item.preview="{ item }">
+          <v-img
+            :src="imageUrl(item)"
+            width="48"
+            height="48"
+            cover
+            class="rounded my-1"
+          >
+            <template #error>
+              <v-icon icon="mdi-image-broken" size="20" color="grey" />
+            </template>
+          </v-img>
+        </template>
+        <template #item.caption="{ item }">
+          <span class="text-truncate d-inline-block" style="max-width: 500px">
+            {{ item.caption ? item.caption.slice(0, 120) : '—' }}
+          </span>
+        </template>
+        <template #item.select="{ item }">
+          <v-checkbox-btn :model-value="selectedPaths.has(item.path)" density="compact" color="primary" @click.stop="toggleSelection(item.path)" />
+        </template>
+        <template #item.has_mask="{ item }">
+          <v-icon
+            v-if="item.has_mask"
+            icon="mdi-checkerboard"
+            size="small"
+            color="warning"
+          />
+        </template>
+      </v-data-table>
+
+      <!-- Tree view -->
+      <div v-if="viewMode === 'tree' && images.length > 0" class="tree-view">
+        <v-list density="compact" open-strategy="multiple">
+          <template v-for="node in treeNodes" :key="node.name">
+            <!-- Folder node with children -->
+            <v-list-group v-if="node.children && node.children.length > 0" :value="node.name">
+              <template #activator="{ props }">
+                <v-list-item v-bind="props" prepend-icon="mdi-folder">
+                  <v-list-item-title>{{ node.name }}</v-list-item-title>
+                  <template #append>
+                    <v-chip size="x-small" variant="outlined">{{ node.children.length }}</v-chip>
+                  </template>
+                </v-list-item>
+              </template>
+              <v-list-item
+                v-for="img in node.children"
+                :key="img.path"
+                :title="img.filename"
+                :active="selectedImage?.path === img.path"
+                @click="activateImage(img)"
+              >
+                <template #prepend>
+                  <v-checkbox-btn v-if="selectionMode" :model-value="selectedPaths.has(img.path)" :aria-label="img.filename" density="compact" color="primary" @click.stop="toggleSelection(img.path)" />
+                  <v-img
+                    :src="imageUrl(img)"
+                    width="32"
+                    height="32"
+                    cover
+                    class="rounded mr-2"
+                  >
+                    <template #error>
+                      <v-icon icon="mdi-image-broken" size="16" color="grey" />
+                    </template>
+                  </v-img>
+                </template>
+                <template #append>
+                  <v-icon
+                    v-if="img.has_mask"
+                    icon="mdi-checkerboard"
+                    size="x-small"
+                    color="warning"
+                  />
+                </template>
+              </v-list-item>
+            </v-list-group>
+            <!-- Flat file (no folder) -->
+            <v-list-item
+              v-else
+              :title="node.name"
+              :active="selectedImage?.path === node.image?.path"
+              @click="node.image && activateImage(node.image)"
+            >
+              <template #prepend>
+                <v-checkbox-btn v-if="selectionMode && node.image" :model-value="selectedPaths.has(node.image.path)" :aria-label="node.name" density="compact" color="primary" @click.stop="toggleSelection(node.image.path)" />
+                <v-img
+                  v-if="node.image"
+                  :src="imageUrl(node.image)"
+                  width="32"
+                  height="32"
+                  cover
+                  class="rounded mr-2"
+                >
+                  <template #error>
+                    <v-icon icon="mdi-image-broken" size="16" color="grey" />
+                  </template>
+                </v-img>
+              </template>
+            </v-list-item>
+          </template>
+        </v-list>
+      </div>
+
+      <!-- Pagination -->
+      <div v-if="totalPages > 1" class="d-flex justify-center mt-4">
+        <v-pagination
+          v-model="page"
+          :length="totalPages"
+          :total-visible="7"
+          density="compact"
+          rounded="circle"
+          @update:model-value="onPageChange"
+        />
+      </div>
+
+      <!-- Empty state -->
+      <div v-if="!loadingImages && !imagesError && images.length === 0" class="text-center pa-12">
+        <v-icon icon="mdi-image-off-outline" size="64" color="grey" class="mb-4" />
+        <div class="text-h6 text-medium-emphasis">{{ t('dsNoImages') }}</div>
+        <div class="text-body-2 text-medium-emphasis" v-html="t('dsNoImagesHint')" />
+      </div>
+    </div>
+
+    <!-- Caption editor dialog -->
+    <v-dialog v-model="editorDialog" max-width="900" :persistent="isDirty || saving" scrollable>
+      <v-card v-if="selectedImage">
+        <v-card-title class="d-flex align-center ga-2">
+          <v-icon icon="mdi-image" />
+          <span class="text-truncate">{{ selectedImage.filename }}</span>
+          <v-chip v-if="selectedImage.has_mask" size="small" color="warning" variant="tonal">
+            {{ t('dsHasMask') }}
+          </v-chip>
+          <v-spacer />
+          <v-btn
+            v-if="selectedImage.has_mask"
+            :icon="showMask ? 'mdi-eye' : 'mdi-eye-off'"
+            variant="text"
+            size="small"
+            :title="t('dsToggleMask')"
+            @click="showMask = !showMask"
+          />
+          <v-btn :icon="showTagPanel ? 'mdi-tag' : 'mdi-tag-outline'" variant="text" size="small" :title="t('dsToggleTagPanel')" @click="showTagPanel = !showTagPanel" />
+        </v-card-title>
+        <v-card-text>
+          <v-row>
+            <v-col cols="12" md="6">
+              <div class="image-preview-container">
+                <v-img
+                  :src="showMask && selectedImage.has_mask ? maskUrl(selectedImage) : imageUrl(selectedImage)"
+                  class="rounded"
+                  contain
+                  style="max-height: 400px"
+                >
+                  <template #error>
+                    <div class="d-flex align-center justify-center fill-height pa-4">
+                      <v-icon icon="mdi-image-broken" size="48" color="grey" />
+                    </div>
+                  </template>
+                </v-img>
+              </div>
+            </v-col>
+            <v-col cols="12" md="6">
+              <div class="caption-editor-wrapper">
+                <v-textarea
+                  v-model="editCaption"
+                  :label="t('dsCaption')"
+                  variant="outlined"
+                  rows="10"
+                  auto-grow
+                  :loading="saving"
+                  :disabled="saving"
+                  :hint="captionHint"
+                  persistent-hint
+                  class="caption-editor"
+                  @input="onCaptionInput"
+                  @keydown="onAutocompleteKeydown"
+                />
+                <v-card v-if="autocompleteVisible" class="autocomplete-dropdown" elevation="8" density="compact">
+                  <v-list density="compact" class="autocomplete-list">
+                    <v-list-item v-for="(suggestion, si) in autocompleteSuggestions" :key="suggestion" :active="si === autocompleteSelected" @click="applyAutocomplete(suggestion)" @mouseenter="autocompleteSelected = si">
+                      <v-list-item-title class="text-caption">{{ suggestion }}</v-list-item-title>
+                      <template #append>
+                        <span class="text-caption text-medium-emphasis">{{ tagIndex.get(suggestion) || 0 }}</span>
+                      </template>
+                    </v-list-item>
+                  </v-list>
+                </v-card>
+              </div>
+              <!-- Tag preview -->
+              <div v-if="editCaption" class="tag-preview mt-2">
+                <div class="text-caption text-medium-emphasis mb-1">{{ t('dsTagPreview') }}</div>
+                <div class="tag-preview-content">
+                  <span
+                    v-for="(tag, ti) in parsedTags"
+                    :key="ti"
+                    class="tag-chip"
+                    :class="tagClass(tag)"
+                  >{{ tag }}</span>
+                </div>
+              </div>
+              <v-expand-transition>
+                <div v-if="showTagPanel" class="tag-panel mt-2">
+                  <v-text-field :model-value="tagPanelSearch" prepend-inner-icon="mdi-magnify" :label="t('dsSearchTags')" variant="outlined" density="compact" hide-details clearable class="mb-2" @update:model-value="tagPanelSearch = $event ?? ''" />
+                  <div class="tag-panel-content">
+                    <v-chip v-for="[tag, count] in topTags" :key="tag" size="small" variant="outlined" class="tag-freq-chip" @click="insertTag(tag)">
+                      {{ tag }}
+                      <span class="text-caption text-medium-emphasis ml-1">{{ count }}</span>
+                    </v-chip>
+                  </div>
+                  <div v-if="tagIndex.size === 0" class="text-caption text-medium-emphasis pa-2">{{ t('dsNoTags') }}</div>
+                </div>
+              </v-expand-transition>
+              <!-- Inline diff display -->
+              <div v-if="isDirty && inlineDiffSpans.length" class="inline-diff mt-1">
+                <span
+                  v-for="(span, si) in inlineDiffSpans"
+                  :key="si"
+                  :class="{ 'diff-inline-add': span.type === 'add', 'diff-inline-del': span.type === 'del' }"
+                >{{ span.text }}</span>
+              </div>
+              <!-- Grammar guide -->
+              <div v-if="grammarGuideText" class="grammar-guide mt-2" v-html="grammarGuideText" />
+            </v-col>
+          </v-row>
+        </v-card-text>
+        <v-divider />
+        <v-card-actions class="pa-3 flex-wrap">
+          <v-btn
+            variant="text"
+            :disabled="saving"
+            @click="openVersions"
+          >
+            <v-icon icon="mdi-history" class="mr-1" />
+            {{ t('dsVersions') }}
+          </v-btn>
+          <v-btn
+            variant="text"
+            :disabled="!isDirty || saving"
+            @click="revertCaption"
+          >
+            {{ t('dsRevert') }}
+          </v-btn>
+          <v-spacer />
+          <span class="text-caption text-medium-emphasis mr-2">{{ currentPosition }}</span>
+          <v-checkbox v-model="autoAdvance" :label="t('dsAutoNext')" density="compact" hide-details class="mr-2" style="max-width: 120px" />
+          <v-btn variant="text" :disabled="saving" @click="tryCloseEditor">
+            {{ t('dsClose') }}
+          </v-btn>
+          <v-btn
+            color="primary"
+            :disabled="!isDirty"
+            :loading="saving"
+            @click="saveCaptionAndMaybeAdvance"
+          >
+            <v-icon icon="mdi-content-save" class="mr-1" />
+            {{ t('dsSaveCaption') }}
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <!-- Unsaved changes confirmation -->
+    <v-dialog v-model="discardDialog" max-width="400" :persistent="saving" @update:model-value="value => { if (!value) cancelDiscard() }">
+      <v-card>
+        <v-card-title>{{ t('dsUnsavedTitle') }}</v-card-title>
+        <v-card-text>{{ t('dsUnsavedBody') }}</v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" :disabled="saving" @click="cancelDiscard">{{ t('dsCancel') }}</v-btn>
+          <v-btn color="warning" variant="text" :disabled="saving" @click="discardAndClose">{{ t('dsDiscard') }}</v-btn>
+          <v-btn color="primary" :loading="saving" @click="saveAndClose">{{ t('dsSaveCaption') }}</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <!-- Version history dialog -->
+    <v-dialog v-model="versionsDialog" max-width="1000">
+      <v-card v-if="selectedImage">
+        <v-card-title class="d-flex align-center">
+          <v-icon icon="mdi-history" class="mr-2" />
+          {{ t('dsVersionHistory') }} — {{ selectedImage.filename }}
+        </v-card-title>
+        <v-card-text>
+          <div v-if="versions.length === 0" class="text-center text-medium-emphasis pa-8">
+            {{ t('dsNoVersions') }}
+          </div>
+          <v-row v-else>
+            <!-- Version list -->
+            <v-col cols="12" md="4" style="max-height: 500px; overflow-y: auto">
+              <v-list density="compact">
+                <v-list-item
+                  v-for="(v, i) in versions"
+                  :key="i"
+                  :active="selectedVersion === i"
+                  @click="selectedVersion = i"
+                >
+                  <template #prepend>
+                    <v-icon icon="mdi-clock-outline" size="small" />
+                  </template>
+                  <v-list-item-title class="text-caption">{{ v.ts }}</v-list-item-title>
+                  <v-list-item-subtitle class="text-truncate">{{ v.text.slice(0, 80) }}</v-list-item-subtitle>
+                  <template #append>
+                    <v-btn size="x-small" variant="text" color="primary" @click.stop="restoreVersion(v.text)">
+                      {{ t('dsRestore') }}
+                    </v-btn>
+                  </template>
+                </v-list-item>
+              </v-list>
+            </v-col>
+
+            <!-- Diff display -->
+            <v-col cols="12" md="8">
+              <div v-if="selectedVersion >= 0 && selectedVersion < versions.length">
+                <div class="text-subtitle-2 mb-2 d-flex align-center ga-2">
+                  <v-chip size="small" color="success" variant="tonal">
+                    +{{ diffStats.added }} {{ t('dsDiffInsertions') }}
+                  </v-chip>
+                  <v-chip size="small" color="error" variant="tonal">
+                    -{{ diffStats.removed }} {{ t('dsDiffDeletions') }}
+                  </v-chip>
+                </div>
+                <pre class="diff-output"><template v-for="(line, li) in diffLines" :key="li"><span :class="diffLineClass(line)">{{ line }}</span>
+</template></pre>
+              </div>
+              <div v-else class="text-center text-medium-emphasis pa-8">
+                {{ t('dsDiffSelectVersion') }}
+              </div>
+            </v-col>
+          </v-row>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" @click="versionsDialog = false">{{ t('dsClose') }}</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <!-- Batch operation dialog -->
+    <v-dialog v-model="batchDialog" max-width="500" :persistent="batchProcessing">
+      <v-card>
+        <v-card-title>{{ t('dsBatch') }} — {{ t(batchAction === 'append' ? 'dsAppendTag' : batchAction === 'remove' ? 'dsRemoveTag' : 'dsFindReplace') }}</v-card-title>
+        <v-card-text>
+          <v-text-field v-if="batchAction === 'append' || batchAction === 'remove'" v-model="batchTag" :disabled="batchProcessing" :label="batchAction === 'append' ? t('dsTagsToAppend') : t('dsTagsToRemove')" :placeholder="t('dsTagPlaceholder')" variant="outlined" density="compact" :hint="t('dsCommaSeparated')" persistent-hint />
+          <template v-if="batchAction === 'replace'">
+            <v-text-field v-model="batchFind" :disabled="batchProcessing" :label="t('dsFind')" variant="outlined" density="compact" class="mb-2" />
+            <v-text-field v-model="batchReplace" :disabled="batchProcessing" :label="t('dsReplaceWith')" variant="outlined" density="compact" />
+            <v-checkbox v-model="batchUseRegex" :disabled="batchProcessing" :label="t('dsRegex')" density="compact" hide-details />
+          </template>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" :disabled="batchProcessing" @click="batchDialog = false">{{ t('dsCancel') }}</v-btn>
+          <v-btn color="primary" :loading="batchProcessing" :disabled="batchProcessing || (batchAction === 'append' && !batchTag) || (batchAction === 'remove' && !batchTag) || (batchAction === 'replace' && !batchFind)" @click="executeBatch">{{ t('dsExecute') }}</v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <!-- Upload dataset dialog -->
+    <v-dialog v-model="uploadDialog" max-width="560" :persistent="uploading">
+      <v-card>
+        <v-card-title class="d-flex align-center ga-2">
+          <v-icon icon="mdi-upload" />
+          {{ t('dsUploadTitle') }}
+        </v-card-title>
+        <v-card-text>
+          <v-file-input
+            :model-value="uploadFile"
+            :label="t('dsUploadArchive')"
+            :accept="ARCHIVE_ACCEPT"
+            prepend-icon="mdi-folder-zip-outline"
+            variant="outlined"
+            density="compact"
+            show-size
+            :disabled="uploading"
+            @update:model-value="onUploadFileChange"
+          />
+          <v-text-field
+            v-model="uploadTarget"
+            :label="t('dsUploadTarget')"
+            prepend-inner-icon="mdi-folder-outline"
+            variant="outlined"
+            density="compact"
+            :disabled="uploading"
+          />
+          <div class="text-caption text-medium-emphasis">{{ t('dsUploadTargetHint') }}</div>
+          <v-progress-linear
+            v-if="uploading"
+            :model-value="uploadPhase === 'uploading' ? uploadProgress : undefined"
+            :indeterminate="uploadPhase === 'extracting'"
+            color="primary"
+            height="20"
+            rounded
+            class="mt-4"
+          >
+            <template #default>
+              <span class="text-caption">
+                {{ uploadPhase === 'uploading' ? t('dsUploadUploading') : extractStatusText }}
+              </span>
+            </template>
+          </v-progress-linear>
+        </v-card-text>
+        <v-card-actions class="pa-3">
+          <v-spacer />
+          <v-btn variant="text" :disabled="uploading" @click="uploadDialog = false">{{ t('dsCancel') }}</v-btn>
+          <v-btn
+            color="primary"
+            :loading="uploading"
+            :disabled="uploading || !uploadFile || !uploadTarget.trim()"
+            @click="uploadArchive"
+          >
+            <v-icon icon="mdi-cloud-upload-outline" class="mr-1" />
+            {{ t('dsUploadBtn') }}
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+    </template>
+  </v-container>
+</template>
+
+<script setup lang="ts">
+import CurationWorkspace from '../components/curation/CurationWorkspace.vue'
+import WorkspaceHeading from '../components/WorkspaceHeading.vue'
+import { curationText } from '../i18n/curation'
+import { useAppStore } from '../stores/app'
+const appStore = useAppStore()
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { onBeforeRouteLeave } from 'vue-router'
+import { useI18n } from '../composables/useI18n'
+import { useNotifyStore } from '../stores/notify'
+
+interface ImageItem {
+  path: string
+  filename: string
+  stem: string
+  caption: string | null
+  has_mask: boolean
+}
+
+interface Directory {
+  name: string
+  path: string
+}
+
+interface VersionEntry {
+  ts: string
+  text: string
+}
+
+const { t } = useI18n()
+const notify = useNotifyStore()
+
+// ── state ─────────────────────────────────────────────────────
+
+const directories = ref<Directory[]>([])
+const datasetTab = ref('browse')
+const curationVisited = ref(false)
+const curationTitle = computed(() => curationText(appStore.language, 'title'))
+const directory = ref('image_dataset')
+const customPath = ref('')
+const images = ref<ImageItem[]>([])
+const search = ref('')
+const sortDesc = ref(false)
+const viewMode = ref<'grid' | 'list' | 'tree'>('grid')
+const page = ref(1)
+const pageSize = ref(50)
+const total = ref(0)
+const totalPages = ref(0)
+
+const loadingDirs = ref(false)
+const loadingImages = ref(false)
+const imagesError = ref('')
+let imagesRequest = 0
+
+// Selection mode
+const selectionMode = ref(false)
+const selectedPaths = ref<Set<string>>(new Set())
+
+function toggleSelection(path: string) {
+  const s = new Set(selectedPaths.value)
+  if (s.has(path)) s.delete(path)
+  else s.add(path)
+  selectedPaths.value = s
+}
+
+function selectAll() {
+  selectedPaths.value = new Set(images.value.map(i => i.path))
+}
+
+function deselectAll() {
+  selectedPaths.value = new Set()
+}
+
+const selectedCount = computed(() => selectedPaths.value.size)
+
+// Batch operations
+const batchDialog = ref(false)
+const batchAction = ref<'append' | 'remove' | 'replace'>('append')
+const batchTag = ref('')
+const batchFind = ref('')
+const batchReplace = ref('')
+const batchUseRegex = ref(false)
+const batchProcessing = ref(false)
+
+function openBatchDialog(action: 'append' | 'remove' | 'replace') {
+  batchAction.value = action
+  batchTag.value = ''
+  batchFind.value = ''
+  batchReplace.value = ''
+  batchUseRegex.value = false
+  batchDialog.value = true
+}
+
+async function executeBatch() {
+  if (batchProcessing.value || !selectedCount.value) return
+  batchProcessing.value = true
+  try {
+    const res = await fetch('/api/images/batch-caption', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        directory: directory.value,
+        paths: [...selectedPaths.value],
+        action: batchAction.value,
+        tag: batchTag.value || undefined,
+        find: batchFind.value || undefined,
+        replace: batchReplace.value || undefined,
+        use_regex: batchUseRegex.value,
+      }),
+    })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+    if (data.failed > 0) {
+      notify.show(t('dsBatchPartial', { updated: data.updated, failed: data.failed }), 'warning')
+    } else {
+      notify.show(t('dsBatchUpdated', { count: data.updated }), 'success')
+    }
+    batchDialog.value = false
+    deselectAll()
+    selectionMode.value = false
+    loadImages()
+    loadTagIndex()
+  } catch (err: any) {
+    notify.show(t('cfgErrSave', { error: err.message || String(err) }), 'error')
+  } finally {
+    batchProcessing.value = false
+  }
+}
+
+// Upload dataset
+const ARCHIVE_ACCEPT = '.zip,.tar,.tar.gz,.tgz,.tar.bz2,.tbz2,.tar.xz,.txz'
+const POLL_INTERVAL_MS = 700
+
+interface ExtractTask {
+  task_id: string
+  status: 'extracting' | 'done' | 'error'
+  target: string
+  extracted: number
+  skipped: number
+  error: string | null
+}
+
+const uploadDialog = ref(false)
+const uploadFile = ref<File | null>(null)
+const uploadTarget = ref('')
+const uploading = ref(false)
+const uploadProgress = ref(0)
+const uploadPhase = ref<'uploading' | 'extracting'>('uploading')
+const extractCount = ref(0)
+
+const extractStatusText = computed(() =>
+  extractCount.value > 0
+    ? t('dsUploadExtractCount', { count: extractCount.value })
+    : t('dsUploadExtracting'),
+)
+
+function openUploadDialog() {
+  uploadFile.value = null
+  uploadTarget.value = ''
+  uploadProgress.value = 0
+  uploading.value = false
+  uploadDialog.value = true
+}
+
+function onUploadFileChange(value: File | File[] | null | undefined) {
+  uploadFile.value = Array.isArray(value) ? value[0] || null : value || null
+  if (!uploadTarget.value.trim() && uploadFile.value) {
+    const stem = uploadFile.value.name.replace(/\.(zip|tar(\.gz|\.bz2|\.xz)?|t?g?z|tbz2|txz)$/i, '')
+    if (stem) uploadTarget.value = `datasets/${stem}`
+  }
+}
+
+function uploadArchiveFile(file: File, target: string): Promise<ExtractTask> {
+  return new Promise((resolve, reject) => {
+    const form = new FormData()
+    form.append('file', file)
+    form.append('target', target)
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', '/api/images/upload-archive')
+    xhr.upload.onprogress = (e) => {
+      // Headroom below 100% while the server still has to acknowledge the upload.
+      if (e.lengthComputable) uploadProgress.value = Math.min(95, (e.loaded / e.total) * 95)
+    }
+    xhr.onload = () => {
+      uploadProgress.value = 100
+      let parsed: any = null
+      try { parsed = JSON.parse(xhr.responseText) } catch { /* non-JSON error page */ }
+      if (xhr.status >= 200 && xhr.status < 300 && parsed) resolve(parsed)
+      else reject(new Error(parsed?.detail || `HTTP ${xhr.status}`))
+    }
+    xhr.onerror = () => reject(new Error('Network error'))
+    xhr.send(form)
+  })
+}
+
+async function pollExtractTask(taskId: string): Promise<ExtractTask> {
+  let networkFailures = 0
+  while (true) {
+    await new Promise(r => setTimeout(r, POLL_INTERVAL_MS))
+    try {
+      const res = await fetch(`/api/images/upload-archive/${taskId}`)
+      if (res.status === 404) {
+        // Task lost — usually the server restarted mid-extraction.
+        return {
+          task_id: taskId,
+          status: 'error',
+          target: '',
+          extracted: 0,
+          skipped: 0,
+          error: t('dsUploadTaskLost'),
+        }
+      }
+      if (!res.ok) {
+        return {
+          task_id: taskId,
+          status: 'error',
+          target: '',
+          extracted: 0,
+          skipped: 0,
+          error: `HTTP ${res.status}`,
+        }
+      }
+      networkFailures = 0
+      const data: ExtractTask = await res.json()
+      extractCount.value = data.extracted
+      if (data.status !== 'extracting') return data
+    } catch {
+      // Tolerate transient network blips; give up after several in a row.
+      if (++networkFailures >= 5) {
+        return {
+          task_id: taskId,
+          status: 'error',
+          target: '',
+          extracted: 0,
+          skipped: 0,
+          error: t('dsUploadTaskLost'),
+        }
+      }
+    }
+  }
+}
+
+async function uploadArchive() {
+  const file = uploadFile.value
+  if (uploading.value || !file || !uploadTarget.value.trim()) return
+  uploading.value = true
+  uploadPhase.value = 'uploading'
+  uploadProgress.value = 0
+  extractCount.value = 0
+
+  try {
+    const task = await uploadArchiveFile(file, uploadTarget.value.trim())
+    uploadPhase.value = 'extracting'
+    const result = await pollExtractTask(task.task_id)
+    if (result.status === 'error') {
+      throw new Error(result.error || t('dsUploadFailed'))
+    }
+
+    notify.show(
+      t('dsUploadSuccess', { count: result.extracted, path: result.target }) +
+        (result.skipped > 0 ? ` (${t('dsUploadSkipped', { count: result.skipped })})` : ''),
+      result.skipped > 0 ? 'warning' : 'success',
+    )
+    uploadDialog.value = false
+
+    // Add the extraction dir to the list and browse it, mirroring addCustomPath
+    const raw = result.target
+    if (!directories.value.some(d => d.name === raw)) {
+      const entry: Directory = { name: raw, path: raw }
+      directories.value.push(entry)
+      const saved = _loadCustomPaths()
+      if (!saved.some(d => d.name === raw)) {
+        saved.push(entry)
+        _saveCustomPaths(saved)
+        customDirNames.value = new Set(saved.map(d => d.name))
+      }
+    }
+    directory.value = raw
+    page.value = 1
+    loadImages()
+    loadTagIndex()
+  } catch (err: any) {
+    notify.show(err.message || t('dsUploadFailed'), 'error')
+  } finally {
+    uploading.value = false
+  }
+}
+
+// Editor
+const editorDialog = ref(false)
+const selectedImage = ref<ImageItem | null>(null)
+const editCaption = ref('')
+const diskCaption = ref('') // last known on-disk value
+const saving = ref(false)
+const showMask = ref(false)
+const autoAdvance = ref(true)
+
+const currentPosition = computed(() => {
+  if (!selectedImage.value || !images.value.length) return ''
+  const idx = images.value.findIndex(i => i.path === selectedImage.value!.path)
+  return `${idx + 1} / ${images.value.length}`
+})
+
+// Unsaved
+const discardDialog = ref(false)
+let _pendingClose = false
+let routeLeaveResolve: ((value: boolean) => void) | undefined
+
+function requestEditorLeave(): boolean | Promise<boolean> {
+  if (saving.value || uploading.value || batchProcessing.value) return false
+  if (!editorDialog.value || !isDirty.value) return true
+  routeLeaveResolve?.(false)
+  tryCloseEditor()
+  return new Promise(resolve => { routeLeaveResolve = resolve })
+}
+onBeforeRouteLeave(requestEditorLeave)
+function beforeUnload(event: BeforeUnloadEvent) {
+  if (editorDialog.value && isDirty.value) { event.preventDefault(); event.returnValue = '' }
+}
+
+// Version history
+const versionsDialog = ref(false)
+const versions = ref<VersionEntry[]>([])
+const selectedVersion = ref(-1)
+
+// Tagger
+const taggerSettings = ref({ model_name: 'wd-eva02-large-tagger-v3', threshold: 0.35, trigger_word: '' })
+const skipExisting = ref(true)
+const tagging = ref(false)
+const tagProgress = ref({ current: 0, total: 0 })
+const showTaggerSettings = ref(false)
+
+// Tag index for autocomplete
+const tagIndex = ref<Map<string, number>>(new Map())
+const loadingTagIndex = ref(false)
+
+async function loadTagIndex() {
+  loadingTagIndex.value = true
+  try {
+    const res = await fetch(`/api/images/tag-index?directory=${encodeURIComponent(directory.value)}`)
+    const data = await res.json()
+    tagIndex.value = new Map(Object.entries(data.tags || {}))
+  } catch {
+    tagIndex.value = new Map()
+  } finally {
+    loadingTagIndex.value = false
+  }
+}
+
+// Autocomplete state
+const autocompleteVisible = ref(false)
+const autocompleteSuggestions = ref<string[]>([])
+const autocompleteSelected = ref(0)
+
+const showTagPanel = ref(false)
+const tagPanelSearch = ref('')
+const topTags = computed(() => {
+  const search = tagPanelSearch.value.toLowerCase()
+  return [...tagIndex.value.entries()]
+    .filter(([tag]) => !search || tag.toLowerCase().includes(search))
+    .slice(0, 100)
+})
+
+function insertTag(tag: string) {
+  const current = editCaption.value.trim()
+  if (!current) {
+    editCaption.value = tag
+  } else {
+    editCaption.value = current + ', ' + tag
+  }
+}
+
+function onCaptionInput(e: Event) {
+  const textarea = e.target as HTMLTextAreaElement
+  const value = textarea.value
+  const cursorPos = textarea.selectionStart
+  const beforeCursor = value.slice(0, cursorPos)
+  const lastComma = beforeCursor.lastIndexOf(',')
+  const currentTag = beforeCursor.slice(lastComma + 1).trimStart()
+  if (currentTag.length < 1 || tagIndex.value.size === 0) {
+    autocompleteVisible.value = false
+    return
+  }
+  const filter = currentTag.toLowerCase()
+  const matches: string[] = []
+  for (const [tag] of tagIndex.value) {
+    if (tag.toLowerCase().includes(filter) && tag.toLowerCase() !== filter) {
+      matches.push(tag)
+    }
+    if (matches.length >= 20) break
+  }
+  if (matches.length === 0) {
+    autocompleteVisible.value = false
+    return
+  }
+  autocompleteSuggestions.value = matches
+  autocompleteSelected.value = 0
+  autocompleteVisible.value = true
+}
+
+function applyAutocomplete(tag: string) {
+  const textarea = document.querySelector('.caption-editor textarea') as HTMLTextAreaElement
+  if (!textarea) return
+  const value = textarea.value
+  const cursorPos = textarea.selectionStart
+  const beforeCursor = value.slice(0, cursorPos)
+  const lastComma = beforeCursor.lastIndexOf(',')
+  const prefix = value.slice(0, lastComma + 1) + ' '
+  const suffix = value.slice(cursorPos)
+  editCaption.value = prefix + tag + suffix
+  autocompleteVisible.value = false
+  nextTick(() => {
+    textarea.focus()
+    const newPos = prefix.length + tag.length
+    textarea.setSelectionRange(newPos, newPos)
+  })
+}
+
+function onAutocompleteKeydown(e: KeyboardEvent) {
+  if (!autocompleteVisible.value) return
+  if (e.key === 'ArrowDown') {
+    e.preventDefault()
+    autocompleteSelected.value = Math.min(autocompleteSelected.value + 1, autocompleteSuggestions.value.length - 1)
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault()
+    autocompleteSelected.value = Math.max(autocompleteSelected.value - 1, 0)
+  } else if (e.key === 'Enter' || e.key === 'Tab') {
+    e.preventDefault()
+    applyAutocomplete(autocompleteSuggestions.value[autocompleteSelected.value])
+  } else if (e.key === 'Escape') {
+    autocompleteVisible.value = false
+  }
+}
+
+// ── computed ──────────────────────────────────────────────────
+
+const isDirty = computed(() => editCaption.value !== diskCaption.value)
+
+const captionHint = computed(() => {
+  if (!isDirty.value) return ''
+  const diff = computeCharDiff(diskCaption.value, editCaption.value)
+  if (diff.added === 0 && diff.removed === 0) return ''
+  const parts: string[] = []
+  if (diff.added > 0) parts.push(`+${diff.added}`)
+  if (diff.removed > 0) parts.push(`-${diff.removed}`)
+  return parts.join(' / ') + ' ' + t('dsChars')
+})
+
+const totalLabel = computed(() => {
+  if (total.value === 0) return t('dsNoImages')
+  if (totalPages.value <= 1) return t('dsImageCount', { n: total.value })
+  return t('dsImageCountPaged', { n: total.value, p: page.value, total: totalPages.value })
+})
+
+const listHeaders = computed(() => {
+  const headers: { title: string; key: string; width?: string; sortable?: boolean }[] = []
+  if (selectionMode.value) {
+    headers.push({ title: '', key: 'select', width: '48px', sortable: false })
+  }
+  headers.push(
+    { title: '', key: 'preview', width: '60px', sortable: false },
+    { title: t('dsFilename'), key: 'filename' },
+    { title: t('dsCaption'), key: 'caption', sortable: false },
+    { title: t('dsMask'), key: 'has_mask', width: '60px', sortable: false },
+  )
+  return headers
+})
+
+// ── URL helpers ───────────────────────────────────────────────
+
+function imageUrl(img: ImageItem): string {
+  return `/api/images/file/${encodeURIComponent(img.path)}?directory=${encodeURIComponent(directory.value)}`
+}
+
+function maskUrl(img: ImageItem): string {
+  return `/api/images/mask-file/${encodeURIComponent(img.path)}?directory=${encodeURIComponent(directory.value)}`
+}
+
+// ── data loading ──────────────────────────────────────────────
+
+const _CUSTOM_PATHS_KEY = 'ds_custom_paths'
+
+function _loadCustomPaths(): Directory[] {
+  try {
+    const raw = localStorage.getItem(_CUSTOM_PATHS_KEY)
+    if (!raw) return []
+    return JSON.parse(raw) as Directory[]
+  } catch {
+    return []
+  }
+}
+
+function _saveCustomPaths(dirs: Directory[]) {
+  localStorage.setItem(_CUSTOM_PATHS_KEY, JSON.stringify(dirs))
+}
+
+const customDirNames = ref(new Set(_loadCustomPaths().map(d => d.name)))
+
+function isCustomDir(name: string): boolean {
+  return customDirNames.value.has(name)
+}
+
+function removeDirectory(name: string) {
+  const saved = _loadCustomPaths().filter(d => d.name !== name)
+  _saveCustomPaths(saved)
+  customDirNames.value = new Set(saved.map(d => d.name))
+  directories.value = directories.value.filter(d => d.name !== name)
+  if (directory.value === name) {
+    directory.value = directories.value.length > 0 ? directories.value[0].name : ''
+    onDirectoryChange()
+  }
+}
+
+async function loadDirectories() {
+  loadingDirs.value = true
+  try {
+    const res = await fetch('/api/images/directories')
+    const serverDirs: Directory[] = await res.json()
+    // Merge in saved custom paths (dedup by name)
+    const serverNames = new Set(serverDirs.map(d => d.name))
+    const customDirs = _loadCustomPaths().filter(d => !serverNames.has(d.name))
+    directories.value = [...serverDirs, ...customDirs]
+    if (directories.value.length > 0 && !directories.value.find(d => d.name === directory.value)) {
+      directory.value = directories.value[0].name
+    }
+  } catch {
+    const customDirs = _loadCustomPaths()
+    directories.value = [{ name: 'image_dataset', path: '' }, ...customDirs]
+  } finally {
+    loadingDirs.value = false
+  }
+}
+
+async function loadImages() {
+  const request = ++imagesRequest
+  loadingImages.value = true
+  imagesError.value = ''
+  try {
+    const params = new URLSearchParams({
+      directory: directory.value,
+      search: search.value,
+      sort_desc: String(sortDesc.value),
+      page: String(page.value),
+      page_size: String(pageSize.value),
+    })
+    const res = await fetch(`/api/images?${params}`)
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+    if (request !== imagesRequest) return
+    images.value = data.items || []
+    total.value = data.total || 0
+    totalPages.value = data.pages || 0
+  } catch (cause) {
+    if (request !== imagesRequest) return
+    images.value = []
+    total.value = 0
+    totalPages.value = 0
+    imagesError.value = t('dsLoadFailed', { error: cause instanceof Error ? cause.message : String(cause) })
+  } finally {
+    if (request === imagesRequest) loadingImages.value = false
+  }
+}
+
+function onDirectoryChange() {
+  deselectAll()
+  page.value = 1
+  loadImages()
+  loadTagIndex()
+}
+
+async function addCustomPath() {
+  const raw = customPath.value.trim()
+  if (!raw) return
+  // Check if already in the list
+  if (directories.value.some(d => d.name === raw)) {
+    directory.value = raw
+    onDirectoryChange()
+    customPath.value = ''
+    return
+  }
+  // Validate by attempting to list images
+  try {
+    const params = new URLSearchParams({ directory: raw, page_size: '1' })
+    const res = await fetch(`/api/images?${params}`)
+    if (!res.ok) throw new Error()
+    // Add to local list and select
+    const entry: Directory = { name: raw, path: raw }
+    directories.value.push(entry)
+    directory.value = raw
+    // Persist to localStorage
+    const saved = _loadCustomPaths()
+    saved.push(entry)
+    _saveCustomPaths(saved)
+    customDirNames.value = new Set(saved.map(d => d.name))
+    customPath.value = ''
+    onDirectoryChange()
+    notify.show(t('dsPathAdded', { path: raw }), 'success')
+  } catch {
+    notify.show(t('dsPathNotFound', { path: raw }), 'error')
+  }
+}
+
+function onSearchChange() {
+  page.value = 1
+  loadImages()
+}
+
+function toggleSort() {
+  sortDesc.value = !sortDesc.value
+  page.value = 1
+  loadImages()
+}
+
+function onPageChange(p: number) {
+  page.value = p
+  loadImages()
+}
+
+// ── Tagger ────────────────────────────────────────────────────
+
+async function fetchTaggerSettings() {
+  try {
+    const res = await fetch('/api/tagger/settings')
+    if (res.ok) taggerSettings.value = await res.json()
+  } catch { /* ignore */ }
+}
+
+async function saveTaggerSettings() {
+  try {
+    const res = await fetch('/api/tagger/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(taggerSettings.value),
+    })
+    if (!res.ok) {
+      const data = await res.json().catch(() => null)
+      throw new Error(typeof data?.detail === 'string' ? data.detail : `HTTP ${res.status}`)
+    }
+  } catch (cause) {
+    notify.show(t('cfgErrSave', { error: cause instanceof Error ? cause.message : String(cause) }), 'error')
+  }
+}
+
+async function startTagging() {
+  tagging.value = true
+  tagProgress.value = { current: 0, total: 0 }
+
+  try {
+    const res = await fetch('/api/tagger/tag', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        directory: directory.value,
+        threshold: taggerSettings.value.threshold,
+        skip_existing: skipExisting.value,
+        model_name: taggerSettings.value.model_name,
+        trigger_word: taggerSettings.value.trigger_word,
+      }),
+    })
+    if (!res.ok) {
+      const data = await res.json().catch(() => null)
+      throw new Error(data?.detail || `HTTP ${res.status}`)
+    }
+
+    const reader = res.body!.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop()!
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        try {
+          const data = JSON.parse(line.slice(6))
+          if (data.current && data.total) {
+            tagProgress.value = { current: data.current, total: data.total }
+          }
+          if (data.error) {
+            notify.show(`Error: ${data.file}: ${data.error}`, 'error')
+          }
+          if (data.done) {
+            notify.show(
+              t('tgTagComplete', { count: data.tagged }) +
+                (data.skipped > 0 ? ` (${t('tgTagSkipped', { count: data.skipped })})` : ''),
+              'success'
+            )
+          }
+        } catch { /* skip malformed lines */ }
+      }
+    }
+  } catch (err: any) {
+    notify.show(err.message || 'Tagging failed', 'error')
+  } finally {
+    tagging.value = false
+    loadImages()
+  }
+}
+
+// ── image selection + caption editor ──────────────────────────
+
+function selectImage(img: ImageItem) {
+  selectedImage.value = img
+  editCaption.value = img.caption || ''
+  diskCaption.value = img.caption || ''
+  showMask.value = false
+  editorDialog.value = true
+}
+
+function activateImage(img: ImageItem) {
+  if (selectionMode.value) toggleSelection(img.path)
+  else selectImage(img)
+}
+
+function onRowClick(_event: unknown, { item }: { item: ImageItem }) {
+  activateImage(item)
+}
+
+function revertCaption() {
+  editCaption.value = diskCaption.value
+}
+
+async function saveCaption(): Promise<boolean> {
+  if (saving.value || !selectedImage.value) return false
+  if (!isDirty.value) return true
+  saving.value = true
+  try {
+    const res = await fetch(
+      `/api/images/caption/${encodeURIComponent(selectedImage.value.path)}?directory=${encodeURIComponent(directory.value)}`,
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: editCaption.value }),
+      },
+    )
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
+    if (typeof data.content !== 'string') throw new Error(t('cfgErrSaveDetail'))
+    diskCaption.value = data.content
+    // Update the in-memory image list too
+    const idx = images.value.findIndex(i => i.path === selectedImage.value!.path)
+    if (idx >= 0) images.value[idx].caption = data.content
+    return true
+  } catch (cause) {
+    notify.show(t('cfgErrSave', { error: cause instanceof Error ? cause.message : String(cause) }), 'error')
+    return false
+  } finally {
+    saving.value = false
+  }
+}
+
+async function saveCaptionAndMaybeAdvance() {
+  if (!await saveCaption()) return
+  if (autoAdvance.value) {
+    navigateImage(1)
+  }
+}
+
+function tryCloseEditor() {
+  if (isDirty.value) {
+    _pendingClose = true
+    discardDialog.value = true
+  } else {
+    editorDialog.value = false
+  }
+}
+
+async function saveAndClose() {
+  if (!await saveCaption()) return
+  discardDialog.value = false
+  if (_pendingClose) {
+    editorDialog.value = false
+    _pendingClose = false
+  }
+  routeLeaveResolve?.(true)
+  routeLeaveResolve = undefined
+}
+
+function cancelDiscard() {
+  discardDialog.value = false
+  _pendingClose = false
+  routeLeaveResolve?.(false)
+  routeLeaveResolve = undefined
+}
+
+function discardAndClose() {
+  discardDialog.value = false
+  editorDialog.value = false
+  _pendingClose = false
+  routeLeaveResolve?.(true)
+  routeLeaveResolve = undefined
+}
+
+// ── version history ───────────────────────────────────────────
+
+async function openVersions() {
+  if (!selectedImage.value) return
+  try {
+    const res = await fetch(
+      `/api/images/versions/${encodeURIComponent(selectedImage.value.path)}?directory=${encodeURIComponent(directory.value)}`,
+    )
+    versions.value = await res.json()
+    selectedVersion.value = -1
+    versionsDialog.value = true
+  } catch {
+    versions.value = []
+    versionsDialog.value = true
+  }
+}
+
+function restoreVersion(text: string) {
+  editCaption.value = text
+  versionsDialog.value = false
+}
+
+// ── Tree view ────────────────────────────────────────────────
+
+interface TreeNode {
+  name: string
+  children?: ImageItem[]
+  image?: ImageItem
+}
+
+const treeNodes = computed<TreeNode[]>(() => {
+  const folders = new Map<string, ImageItem[]>()
+  const rootItems: ImageItem[] = []
+
+  for (const img of images.value) {
+    const parts = img.path.replace(/\\/g, '/').split('/')
+    if (parts.length <= 1) {
+      rootItems.push(img)
+    } else {
+      const folder = parts.slice(0, -1).join('/')
+      if (!folders.has(folder)) folders.set(folder, [])
+      folders.get(folder)!.push(img)
+    }
+  }
+
+  const nodes: TreeNode[] = []
+  for (const [folder, imgs] of [...folders.entries()].sort()) {
+    nodes.push({ name: folder, children: imgs })
+  }
+  for (const img of rootItems) {
+    nodes.push({ name: img.filename, image: img })
+  }
+  return nodes
+})
+
+// ── Inline character diff ─────────────────────────────────────
+
+interface CharDiffResult { added: number; removed: number; spans: { text: string; type: 'eq' | 'add' | 'del' }[] }
+
+function computeCharDiff(oldText: string, newText: string): CharDiffResult {
+  // Simple LCS-based character diff
+  const m = oldText.length
+  const n = newText.length
+  // For very long texts, skip detailed diff
+  if (m * n > 500000) {
+    const delta = newText.length - oldText.length
+    return { added: Math.max(0, delta), removed: Math.max(0, -delta), spans: [] }
+  }
+
+  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0))
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = oldText[i - 1] === newText[j - 1]
+        ? dp[i - 1][j - 1] + 1
+        : Math.max(dp[i - 1][j], dp[i][j - 1])
+    }
+  }
+
+  // Backtrack
+  const ops: { type: 'eq' | 'add' | 'del'; ch: string }[] = []
+  let i = m, j = n
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && oldText[i - 1] === newText[j - 1]) {
+      ops.unshift({ type: 'eq', ch: oldText[i - 1] })
+      i--; j--
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      ops.unshift({ type: 'add', ch: newText[j - 1] })
+      j--
+    } else {
+      ops.unshift({ type: 'del', ch: oldText[i - 1] })
+      i--
+    }
+  }
+
+  // Merge consecutive same-type ops into spans
+  let added = 0, removed = 0
+  const spans: CharDiffResult['spans'] = []
+  let curType: 'eq' | 'add' | 'del' | null = null
+  let curText = ''
+  for (const op of ops) {
+    if (op.type === 'add') added++
+    if (op.type === 'del') removed++
+    if (op.type !== curType) {
+      if (curText) spans.push({ text: curText, type: curType! })
+      curType = op.type
+      curText = op.ch
+    } else {
+      curText += op.ch
+    }
+  }
+  if (curText) spans.push({ text: curText, type: curType! })
+
+  return { added, removed, spans }
+}
+
+const inlineDiffSpans = computed(() => {
+  if (!isDirty.value) return []
+  return computeCharDiff(diskCaption.value, editCaption.value).spans
+})
+
+// ── Tag preview ───────────────────────────────────────────────
+
+const parsedTags = computed(() => {
+  if (!editCaption.value) return []
+  return editCaption.value.split(',').map(s => s.trim()).filter(Boolean)
+})
+
+function tagClass(tag: string): string {
+  if (/^by\s/i.test(tag)) return 'tag-artist'
+  if (/^(on the|in the)\s/i.test(tag)) return 'tag-section'
+  return 'tag-plain'
+}
+
+// ── Diff computation ──────────────────────────────────────────
+
+const diffLines = computed(() => {
+  if (selectedVersion.value < 0 || selectedVersion.value >= versions.value.length) return []
+  const oldText = versions.value[selectedVersion.value].text
+  const newText = diskCaption.value
+  return computeUnifiedDiff(oldText, newText)
+})
+
+const diffStats = computed(() => {
+  let added = 0
+  let removed = 0
+  for (const line of diffLines.value) {
+    if (line.startsWith('+')) added++
+    else if (line.startsWith('-')) removed++
+  }
+  return { added, removed }
+})
+
+function diffLineClass(line: string): string {
+  if (line.startsWith('@@')) return 'diff-hunk'
+  if (line.startsWith('+')) return 'diff-add'
+  if (line.startsWith('-')) return 'diff-del'
+  return 'diff-ctx'
+}
+
+function computeUnifiedDiff(oldText: string, newText: string): string[] {
+  const oldLines = oldText.split('\n')
+  const newLines = newText.split('\n')
+  const result: string[] = []
+
+  // Simple LCS-based diff
+  const m = oldLines.length
+  const n = newLines.length
+  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0))
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = oldLines[i - 1] === newLines[j - 1]
+        ? dp[i - 1][j - 1] + 1
+        : Math.max(dp[i - 1][j], dp[i][j - 1])
+    }
+  }
+
+  // Backtrack to build diff
+  const ops: { type: string; line: string }[] = []
+  let i = m
+  let j = n
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
+      ops.unshift({ type: ' ', line: oldLines[i - 1] })
+      i--
+      j--
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      ops.unshift({ type: '+', line: newLines[j - 1] })
+      j--
+    } else {
+      ops.unshift({ type: '-', line: oldLines[i - 1] })
+      i--
+    }
+  }
+
+  // Format as unified diff with context
+  const contextLines = 3
+  let opIdx = 0
+  while (opIdx < ops.length) {
+    // Find next change
+    if (ops[opIdx].type === ' ') {
+      // Check if this is near a change (within contextLines)
+      let nearChange = false
+      for (let k = Math.max(0, opIdx - contextLines); k <= Math.min(ops.length - 1, opIdx + contextLines); k++) {
+        if (ops[k].type !== ' ') { nearChange = true; break }
+      }
+      if (nearChange) {
+        result.push(` ${ops[opIdx].line}`)
+      } else if (opIdx === 0 || (opIdx > 0 && ops[opIdx - 1].type !== ' ')) {
+        result.push(` ${ops[opIdx].line}`)
+      }
+    } else {
+      result.push(`${ops[opIdx].type}${ops[opIdx].line}`)
+    }
+    opIdx++
+  }
+
+  return result
+}
+
+// ── Keyboard shortcuts ────────────────────────────────────────
+
+function navigateImage(delta: number) {
+  if (!images.value.length) return
+  const currentIdx = selectedImage.value
+    ? images.value.findIndex(i => i.path === selectedImage.value!.path)
+    : -1
+  const newIdx = Math.max(0, Math.min(images.value.length - 1, currentIdx + delta))
+  if (newIdx !== currentIdx && newIdx >= 0) {
+    selectImage(images.value[newIdx])
+  }
+}
+
+async function _onKeyDown(e: KeyboardEvent) {
+  if (datasetTab.value !== 'browse' || saving.value || discardDialog.value || versionsDialog.value || batchDialog.value || uploadDialog.value) return
+  // Don't intercept when typing in an input/textarea
+  const tag = (e.target as HTMLElement)?.tagName?.toLowerCase()
+  const isInput = tag === 'input' || tag === 'textarea'
+
+  if (editorDialog.value) {
+    // Editor-specific shortcuts
+    if (e.ctrlKey && !e.shiftKey && e.key === 's') {
+      e.preventDefault()
+      if (isDirty.value) saveCaptionAndMaybeAdvance()
+      return
+    }
+    if (e.ctrlKey && e.shiftKey && e.key === 'S') {
+      e.preventDefault()
+      if (isDirty.value) saveCaption()
+      return
+    }
+    if (e.key === 'Escape' && !isDirty.value) {
+      editorDialog.value = false
+      return
+    }
+    // Arrow navigation when dialog is open but not in textarea
+    if (!isInput) {
+      if (e.key === 'ArrowRight') {
+        e.preventDefault()
+        if (isDirty.value && !await saveCaption()) return
+        navigateImage(1)
+        return
+      }
+      if (e.key === 'ArrowLeft') {
+        e.preventDefault()
+        if (isDirty.value && !await saveCaption()) return
+        navigateImage(-1)
+        return
+      }
+    }
+  }
+
+  // Global navigation (only when not typing)
+  if (!isInput && !editorDialog.value) {
+    if (e.key === 'ArrowRight') {
+      e.preventDefault()
+      navigateImage(1)
+    } else if (e.key === 'ArrowLeft') {
+      e.preventDefault()
+      navigateImage(-1)
+    }
+  }
+}
+
+// ── Grammar guide ─────────────────────────────────────────────
+
+const grammarGuideText = computed(() => {
+  // Try to get localized version, fall back to English
+  const key = 'dsGrammarGuide'
+  const text = t(key)
+  return text === key ? undefined : text
+})
+
+// ── lifecycle ─────────────────────────────────────────────────
+
+onMounted(async () => {
+  window.addEventListener('beforeunload', beforeUnload)
+  await loadDirectories()
+  await loadImages()
+  loadTagIndex()
+  fetchTaggerSettings()
+  document.addEventListener('keydown', _onKeyDown)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('beforeunload', beforeUnload)
+  routeLeaveResolve?.(false)
+  document.removeEventListener('keydown', _onKeyDown)
+})
+</script>
+
+<style scoped>
+.dataset-curation-pane { flex: 1 1 0; min-height: 0; overflow-y: auto; }
+.dataset-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.ds-header {
+  flex-shrink: 0;
+}
+
+.content-scroll {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.toolbar-dir {
+  min-width: 0;
+}
+
+.toolbar-dir :deep(.v-select__selection-text) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mask-badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  background: rgba(0, 0, 0, 0.6);
+  border-radius: 4px;
+  padding: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.caption-editor-wrapper { position: relative; }
+.autocomplete-dropdown { position: absolute; bottom: 100%; left: 0; right: 0; z-index: 10; max-height: 200px; overflow-y: auto; }
+.autocomplete-list { padding: 0; }
+/* This popup is a bare floating card (no v-overlay), so it misses the
+ * html.forge-glass .v-overlay rule — clamp it to the overlay token too. */
+:global(html.forge-glass) .autocomplete-dropdown {
+  background: var(--bg-overlay);
+}
+
+.caption-editor :deep(.v-field) {
+  font-family: monospace;
+  font-size: 13px;
+}
+
+/* Tag preview */
+.tag-preview-content {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.tag-panel { border: 1px solid rgba(var(--v-border-color), 0.2); border-radius: 8px; padding: 8px; max-height: 200px; overflow-y: auto; }
+.tag-panel-content { display: flex; flex-wrap: wrap; gap: 4px; }
+.tag-freq-chip { cursor: pointer; transition: background 0.15s; }
+.tag-freq-chip:hover { background: rgba(var(--v-theme-primary), 0.1); }
+
+.tag-chip {
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid;
+  font-size: 11px;
+}
+
+.tag-plain {
+  border-color: var(--border-strong);
+  color: var(--text-secondary);
+}
+
+.tag-artist {
+  border-color: rgb(var(--v-theme-warning));
+  color: rgb(var(--v-theme-warning));
+}
+
+.tag-section {
+  border-color: rgb(var(--v-theme-info));
+  color: rgb(var(--v-theme-info));
+}
+
+/* Diff display */
+.diff-output {
+  font-family: monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 4px;
+  padding: 8px 12px;
+  max-height: 450px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.diff-add {
+  background: rgba(72, 199, 142, 0.15);
+  color: rgb(var(--v-theme-success));
+}
+
+.diff-del {
+  background: rgba(224, 122, 122, 0.15);
+  color: rgb(var(--v-theme-error));
+}
+
+.diff-hunk {
+  color: rgb(var(--v-theme-info));
+}
+
+.diff-ctx {
+  color: var(--text-secondary);
+}
+
+/* Grammar guide */
+.grammar-guide {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: rgba(var(--v-theme-on-surface), 0.03);
+}
+
+.grammar-guide :deep(.tag-artist-hint) {
+  color: rgb(var(--v-theme-warning));
+  font-weight: 500;
+}
+
+.grammar-guide :deep(.tag-section-hint) {
+  color: rgb(var(--v-theme-info));
+  font-weight: 500;
+}
+
+/* Inline diff */
+.inline-diff {
+  font-family: monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.15);
+  max-height: 80px;
+  overflow-y: auto;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+.diff-inline-add {
+  background: rgba(72, 199, 142, 0.25);
+  color: rgb(var(--v-theme-success));
+  text-decoration: none;
+}
+
+.diff-inline-del {
+  background: rgba(224, 122, 122, 0.25);
+  color: rgb(var(--v-theme-error));
+  text-decoration: line-through;
+}
+
+/* Tree view */
+.tree-view {
+  max-height: calc(100vh - 300px);
+  overflow-y: auto;
+}
+
+.remove-dir-btn {
+  cursor: pointer;
+  opacity: 0.5;
+  transition: opacity 0.2s, color 0.2s;
+}
+
+.remove-dir-btn:hover {
+  opacity: 1;
+  color: rgb(var(--v-theme-error)) !important;
+}
+
+.selection-checkbox {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  z-index: 2;
+  background: rgba(0, 0, 0, 0.4);
+  border-radius: 4px;
+  padding: 2px;
+}
+
+/* Image card hover effect */
+.dataset-card {
+  transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.dataset-card:hover {
+  border-color: var(--border-strong);
+  box-shadow: 0 2px 8px rgb(0 0 0 / 10%);
+}
+
+/* Selected image: amber border */
+.dataset-card.selected {
+  border-color: var(--forge-amber) !important;
+  box-shadow: 0 0 0 1px var(--forge-amber);
+}
+
+/* View toggle brand styling */
+:deep(.v-btn-toggle) {
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+}
+:deep(.v-btn-toggle .v-btn--selected) {
+  background: var(--glow-ember) !important;
+  color: var(--forge-amber) !important;
+}
+.dataset-toolbar {
+  background: transparent;
+  border-radius: 0 !important;
+  border-block: 1px solid var(--border-subtle);
+  padding: 18px 24px !important;
+  overflow: visible;
+}
+</style>

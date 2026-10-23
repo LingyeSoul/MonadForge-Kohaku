@@ -1,0 +1,712 @@
+import os
+import re
+from typing import Dict, List, Optional, Union
+import torch
+from safetensors.torch import load_file, save_file
+from safetensors import safe_open
+from accelerate import init_empty_weights
+
+from networks.lora_utils import get_split_weight_filenames, load_safetensors_with_lora
+from library.anima import models as anima_models
+from library.anima.checkpoint import AnimaCheckpointLayout, inspect_anima_checkpoint
+from library.env import resolve_under_home
+from library.io.safetensors import WeightTransformHooks
+from library.log import setup_logging
+
+setup_logging()
+import logging  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+
+# Official Anima releases ship the same 685-key DiT under two different
+# state-dict prefixes: "net." (base-v1.0) and "model.diffusion_model."
+# (aesthetic-v1.0/1.0b/1.1, turbo-v1.0, preview*). Strip either.
+_DIT_PREFIXES = ("net.", "model.diffusion_model.")
+
+
+def _strip_net_prefix(key: str) -> str:
+    for prefix in _DIT_PREFIXES:
+        if key.startswith(prefix):
+            return key[len(prefix) :]
+    return key
+
+
+# Match DiT blocks (blocks.N.) only, NOT LLM adapter blocks (llm_adapter.blocks.N.)
+_SELF_ATTN_QKV_RE = re.compile(
+    r"(blocks\.\d+\.self_attn)\.(q_proj|k_proj|v_proj)(\.weight)"
+)
+_CROSS_ATTN_KV_RE = re.compile(r"(blocks\.\d+\.cross_attn)\.(k_proj|v_proj)(\.weight)")
+_ADALN_DOWN_RE = re.compile(
+    r"(blocks\.\d+)\.adaln_modulation_(self_attn|cross_attn|mlp)\.1(\.weight)"
+)
+_ADALN_UP_RE = re.compile(
+    r"(blocks\.\d+)\.adaln_modulation_(self_attn|cross_attn|mlp)\.2\."
+)
+_SELF_ATTN_QKV_FUSED_RE = re.compile(r"(blocks\.\d+\.self_attn)\.qkv_proj(\.weight)")
+_CROSS_ATTN_KV_FUSED_RE = re.compile(r"(blocks\.\d+\.cross_attn)\.kv_proj(\.weight)")
+_ADALN_FUSED_DOWN_RE = re.compile(r"(blocks\.\d+)\.adaln_fused_down\.1(\.weight)")
+_ADALN_UP_FUSED_RE = re.compile(
+    r"(blocks\.\d+)\.adaln_up_(self_attn|cross_attn|mlp)(\.weight)"
+)
+
+_SELF_ATTN_QKV_ORDER = ("q_proj", "k_proj", "v_proj")
+_CROSS_ATTN_KV_ORDER = ("k_proj", "v_proj")
+_ADALN_BRANCH_ORDER = ("self_attn", "cross_attn", "mlp")
+
+# Top-level DiT block index, after prefix strip. Anchored so llm_adapter.blocks.N.
+# (a separate 6-layer stack) never contributes to the DiT depth count.
+_DIT_BLOCK_IDX_RE = re.compile(r"^blocks\.(\d+)\.")
+
+# model_channels -> num_heads, keyed by the released Cosmos-Predict2 / Anima widths.
+# Depth is NOT in this table: it is counted from the checkpoint, so a
+# depth-expanded derivative (Anima-2.9B = 40 blocks at 2048ch) loads as-is.
+_MODEL_CHANNELS_TO_HEADS = {1280: 20, 2048: 16, 5120: 40}
+
+
+def probe_dit_arch(dit_path: str) -> Dict[str, int]:
+    """Read DiT depth/width off a checkpoint's safetensors header.
+
+    Only the header is parsed — no tensor data is materialized — so this is
+    cheap enough to run before every model build. Sharded checkpoints are
+    expanded the same way ``load_safetensors_with_lora`` expands them, so a
+    path naming shard 1 of N does not undercount the depth.
+    """
+    resolved = str(resolve_under_home(dit_path))
+    files = get_split_weight_filenames(resolved) or [resolved]
+
+    max_idx = -1
+    width: Optional[int] = None
+    for file in files:
+        with safe_open(file, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                clean = _strip_net_prefix(key)
+                m = _DIT_BLOCK_IDX_RE.match(clean)
+                if m:
+                    max_idx = max(max_idx, int(m.group(1)))
+                elif width is None and clean == "x_embedder.proj.1.weight":
+                    width = f.get_slice(key).get_shape()[0]
+
+    if max_idx < 0:
+        raise RuntimeError(
+            f"No DiT blocks found in {resolved} — not an Anima DiT checkpoint? "
+            f"(expected keys like 'net.blocks.0....')"
+        )
+
+    arch: Dict[str, int] = {"num_blocks": max_idx + 1}
+    if width is not None:
+        if width not in _MODEL_CHANNELS_TO_HEADS:
+            raise RuntimeError(
+                f"Unsupported DiT width model_channels={width} in {resolved}; "
+                f"known widths: {sorted(_MODEL_CHANNELS_TO_HEADS)}"
+            )
+        arch["model_channels"] = width
+        arch["num_heads"] = _MODEL_CHANNELS_TO_HEADS[width]
+    return arch
+
+
+def _dit_rename_hook(key: str) -> str:
+    """1:1 key renames: strip net. prefix and remap AdaLN up-projection keys."""
+    k = _strip_net_prefix(key)
+    # blocks.N.adaln_modulation_{branch}.2.weight -> blocks.N.adaln_up_{branch}.weight
+    k = _ADALN_UP_RE.sub(lambda m: f"{m.group(1)}.adaln_up_{m.group(2)}.", k)
+    return k
+
+
+def _dit_concat_hook(
+    key: str, tensors: "dict[str, torch.Tensor] | None"
+) -> "tuple[str | None, torch.Tensor | None]":
+    """Many-to-one key fusions for fused projections.
+
+    Phase 1 (tensors=None): return the fused target key.
+    Phase 2 (tensors=dict): concatenate tensors in correct order and return.
+    """
+    clean = _strip_net_prefix(key)
+
+    # Self-attention QKV: q_proj + k_proj + v_proj -> qkv_proj
+    m = _SELF_ATTN_QKV_RE.match(clean)
+    if m:
+        fused_key = f"{m.group(1)}.qkv_proj{m.group(3)}"
+        if tensors is None:
+            return fused_key, None
+        prefix = m.group(1)
+        ordered = []
+        for proj in _SELF_ATTN_QKV_ORDER:
+            for orig_key, t in tensors.items():
+                if _strip_net_prefix(orig_key) == f"{prefix}.{proj}{m.group(3)}":
+                    ordered.append(t)
+                    break
+        return fused_key, torch.cat(ordered, dim=0)
+
+    # Cross-attention KV: k_proj + v_proj -> kv_proj
+    m = _CROSS_ATTN_KV_RE.match(clean)
+    if m:
+        fused_key = f"{m.group(1)}.kv_proj{m.group(3)}"
+        if tensors is None:
+            return fused_key, None
+        prefix = m.group(1)
+        ordered = []
+        for proj in _CROSS_ATTN_KV_ORDER:
+            for orig_key, t in tensors.items():
+                if _strip_net_prefix(orig_key) == f"{prefix}.{proj}{m.group(3)}":
+                    ordered.append(t)
+                    break
+        return fused_key, torch.cat(ordered, dim=0)
+
+    # AdaLN fused down: 3 separate down-projections -> one fused
+    m = _ADALN_DOWN_RE.match(clean)
+    if m:
+        fused_key = f"{m.group(1)}.adaln_fused_down.1{m.group(3)}"
+        if tensors is None:
+            return fused_key, None
+        block_prefix = m.group(1)
+        ordered = []
+        for branch in _ADALN_BRANCH_ORDER:
+            for orig_key, t in tensors.items():
+                if (
+                    _strip_net_prefix(orig_key)
+                    == f"{block_prefix}.adaln_modulation_{branch}.1{m.group(3)}"
+                ):
+                    ordered.append(t)
+                    break
+        return fused_key, torch.cat(ordered, dim=0)
+
+    return None, None
+
+
+def _dit_export_tensors(
+    key: str, tensor: torch.Tensor
+) -> "list[tuple[str, torch.Tensor]]":
+    """Restore runtime-fused DiT tensors to the public checkpoint layout."""
+
+    clean = _strip_net_prefix(key)
+    match = _SELF_ATTN_QKV_FUSED_RE.fullmatch(clean)
+    if match:
+        if tensor.shape[0] % len(_SELF_ATTN_QKV_ORDER):
+            raise ValueError(f"Invalid fused self-attention QKV tensor: {key}")
+        chunks = tensor.chunk(len(_SELF_ATTN_QKV_ORDER), dim=0)
+        return [
+            (f"{match.group(1)}.{projection}{match.group(2)}", chunk)
+            for projection, chunk in zip(_SELF_ATTN_QKV_ORDER, chunks, strict=True)
+        ]
+
+    match = _CROSS_ATTN_KV_FUSED_RE.fullmatch(clean)
+    if match:
+        if tensor.shape[0] % len(_CROSS_ATTN_KV_ORDER):
+            raise ValueError(f"Invalid fused cross-attention KV tensor: {key}")
+        chunks = tensor.chunk(len(_CROSS_ATTN_KV_ORDER), dim=0)
+        return [
+            (f"{match.group(1)}.{projection}{match.group(2)}", chunk)
+            for projection, chunk in zip(_CROSS_ATTN_KV_ORDER, chunks, strict=True)
+        ]
+
+    match = _ADALN_FUSED_DOWN_RE.fullmatch(clean)
+    if match:
+        if tensor.shape[0] % len(_ADALN_BRANCH_ORDER):
+            raise ValueError(f"Invalid fused AdaLN down tensor: {key}")
+        chunks = tensor.chunk(len(_ADALN_BRANCH_ORDER), dim=0)
+        return [
+            (
+                f"{match.group(1)}.adaln_modulation_{branch}.1{match.group(2)}",
+                chunk,
+            )
+            for branch, chunk in zip(_ADALN_BRANCH_ORDER, chunks, strict=True)
+        ]
+
+    match = _ADALN_UP_FUSED_RE.fullmatch(clean)
+    if match:
+        return [
+            (
+                f"{match.group(1)}.adaln_modulation_{match.group(2)}.2{match.group(3)}",
+                tensor,
+            )
+        ]
+
+    return [(clean, tensor)]
+
+
+def load_anima_model(
+    device: Union[str, torch.device],
+    dit_path: str,
+    attn_mode: str,
+    loading_device: Union[str, torch.device],
+    dit_weight_dtype: Optional[torch.dtype],
+    lora_weights_list: Optional[List[Dict[str, torch.Tensor]]] = None,
+    lora_multipliers: Optional[list[float]] = None,
+    attn_softmax_scale: Optional[float] = None,
+    v100_flash_stability: str = "off",
+    debug_finite_checks: bool = False,
+    checkpoint_layout: Optional[AnimaCheckpointLayout] = None,
+    vocab_pack=None,
+) -> anima_models.Anima:
+    """
+    Load Anima model from the specified checkpoint.
+
+    This is the explicit-argument primitive. For the inference CLI path, see
+    ``library.inference.models.load_dit_model`` — a thin Namespace adapter that
+    reads these arguments off an argparse ``args`` and additionally handles
+    LoRA attach / merge, P-GRAFT hooks, and torch.compile.
+
+    Args:
+        device (Union[str, torch.device]): Device for optimization or merging
+        dit_path (str): Path to the DiT model checkpoint.
+        attn_mode (str): Attention mode to use, e.g., "torch", "flash", etc.
+        loading_device (Union[str, torch.device]): Device to load the model weights on.
+        dit_weight_dtype (Optional[torch.dtype]): Data type of the DiT weights.
+            If None, weights are loaded as-is from the state_dict; otherwise they are cast to this dtype.
+        lora_weights_list (Optional[List[Dict[str, torch.Tensor]]]): LoRA weights to apply, if any.
+        lora_multipliers (Optional[List[float]]): LoRA multipliers for the weights, if any.
+        vocab_pack: CJK vocab pack to hook onto ``llm_adapter.embed`` — a path
+            prefix, a loaded ``VocabPack``, or ``None``/``""`` for off. The
+            hook pair leaves the state dict at the stock 32128 rows
+            (``library.anima.vocab_pack.attach_vocab_pack``).
+    """
+    if dit_weight_dtype is None:
+        dit_weight_dtype = torch.bfloat16
+
+    dit_path = str(resolve_under_home(dit_path))
+    if checkpoint_layout is None:
+        checkpoint_layout = inspect_anima_checkpoint(dit_path)
+    device = torch.device(device)
+    loading_device = torch.device(loading_device)
+
+    # Everything but depth/width is fixed across Anima releases; those two are
+    # read off the checkpoint so depth-expanded derivatives (Anima-2.9B: 40
+    # blocks vs base's 28) build the matching module list.
+    dit_config = {
+        "max_img_h": 512,
+        "max_img_w": 512,
+        "max_frames": 128,
+        "in_channels": 16,
+        "out_channels": 16,
+        "patch_spatial": 2,
+        "patch_temporal": 1,
+        "attn_mode": attn_mode,
+        "attn_softmax_scale": attn_softmax_scale,
+        "v100_flash_stability": v100_flash_stability,
+        "debug_finite_checks": debug_finite_checks,
+        "model_channels": checkpoint_layout.model_channels,
+        "num_blocks": checkpoint_layout.num_blocks,
+        "num_heads": checkpoint_layout.num_heads,
+    }
+
+    with init_empty_weights():
+        model = anima_models.Anima(**dit_config)
+        if dit_weight_dtype is not None:
+            model.to(dit_weight_dtype)
+
+    logger.info(
+        "Loading DiT model from %s, device=%s, variant=%s, blocks=%s",
+        dit_path,
+        loading_device,
+        checkpoint_layout.variant,
+        checkpoint_layout.num_blocks,
+    )
+    rename_hooks = WeightTransformHooks(
+        rename_hook=_dit_rename_hook,
+        concat_hook=_dit_concat_hook,
+    )
+    sd = load_safetensors_with_lora(
+        model_files=dit_path,
+        lora_weights_list=lora_weights_list,
+        lora_multipliers=lora_multipliers,
+        calc_device=device,
+        move_to_device=(loading_device == device),
+        dit_weight_dtype=dit_weight_dtype,
+        weight_transform_hooks=rename_hooks,
+    )
+
+    # A merged checkpoint (vocab_pack.merge_pack_into_dit) carries pack rows for
+    # the ComfyUI loader; here the pack comes from `vocab_pack`, so drop them.
+    ext_keys = [k for k in sd if k.endswith("llm_adapter.ext_embed.weight")]
+    for k in ext_keys:
+        del sd[k]
+    if ext_keys:
+        logger.warning(
+            "%s carries vocab pack rows (a merged checkpoint); they are ignored "
+            "here — set `vocab_pack` to the pack itself to use them",
+            dit_path,
+        )
+
+    missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
+    if missing:
+        # Filter out expected missing buffers (initialized in __init__, not saved in checkpoint)
+        unexpected_missing = [
+            k
+            for k in missing
+            if not any(
+                buf_name in k
+                for buf_name in (
+                    "seq",
+                    "dim_spatial_range",
+                    "dim_temporal_range",
+                    "inv_freq",
+                    "pooled_text_proj",
+                    "pooled_text_sigma_film",
+                )
+            )
+        ]
+        if unexpected_missing:
+            raise RuntimeError(
+                f"Missing keys in checkpoint: {unexpected_missing[:10]}{'...' if len(unexpected_missing) > 10 else ''}"
+            )
+        missing = {}  # all missing keys were expected
+    if unexpected:
+        raise RuntimeError(
+            f"Unexpected keys in checkpoint: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}"
+        )
+    logger.info(
+        f"Loaded DiT model from {dit_path}, unexpected missing keys: {len(missing)}, unexpected keys: {len(unexpected)}"
+    )
+
+    # Non-checkpoint modules (RoPE embeddings, pooled_text_proj) are absent from the
+    # checkpoint, so load_state_dict(assign=True) leaves them as meta tensors —
+    # to_empty() + re-init materializes them onto loading_device.
+    if hasattr(model, "pos_embedder"):
+        model.pos_embedder.to(loading_device)
+    if hasattr(model, "pooled_text_proj"):
+        model.pooled_text_proj.to_empty(device=loading_device)
+        # Re-init all layers: to_empty() leaves uninitialized memory (may contain NaN).
+        for m in model.pooled_text_proj:
+            if isinstance(m, torch.nn.Linear):
+                torch.nn.init.kaiming_uniform_(m.weight)
+                if m.bias is not None:
+                    torch.nn.init.zeros_(m.bias)
+        # Zero-init output layer so the module is a no-op at init (same as init_weights)
+        torch.nn.init.zeros_(model.pooled_text_proj[-1].weight)
+        torch.nn.init.zeros_(model.pooled_text_proj[-1].bias)
+    if hasattr(model, "pooled_text_sigma_film"):
+        # σ-FiLM sibling: also absent from the base checkpoint → materialize and
+        # zero-init (identity FiLM). Stays inert until load_pooled_text_proj sees
+        # σ-FiLM weights and flips enable_pooled_text_sigma_film.
+        model.pooled_text_sigma_film.to_empty(device=loading_device)
+        torch.nn.init.zeros_(model.pooled_text_sigma_film.weight)
+        torch.nn.init.zeros_(model.pooled_text_sigma_film.bias)
+
+    _attach_vocab_pack_if_set(model, vocab_pack)
+    return model
+
+
+def _attach_vocab_pack_if_set(model_or_adapter, vocab_pack) -> None:
+    """Hook a vocab pack's rows onto the adapter's embed when one is selected."""
+    if vocab_pack is None or vocab_pack == "":
+        return
+    # Lazy: vocab_pack imports the strategy module, which imports this one.
+    from library.anima.vocab_pack import attach_vocab_pack, load_vocab_pack
+
+    pack = load_vocab_pack(vocab_pack)
+    if pack is not None:
+        attach_vocab_pack(model_or_adapter, pack)
+
+
+def load_pooled_text_proj(
+    model: anima_models.Anima,
+    path: str,
+    device: Union[str, torch.device] = "cpu",
+) -> None:
+    """Load trained pooled_text_proj weights into the model."""
+    from safetensors.torch import load_file
+
+    state = load_file(path, device=str(device))
+    # σ-FiLM weights (if the checkpoint was trained with it) ride under a
+    # ``sigma_film.`` prefix; everything else is the plain pooled_text_proj.
+    film_state = {
+        k[len("sigma_film.") :]: v
+        for k, v in state.items()
+        if k.startswith("sigma_film.")
+    }
+    proj_state = {k: v for k, v in state.items() if not k.startswith("sigma_film.")}
+    model.pooled_text_proj.load_state_dict(proj_state, assign=True)
+    # Trained weights are now live — arm the per-forward modulation path.
+    model.enable_pooled_text_modulation = True
+    if film_state:
+        model.pooled_text_sigma_film.load_state_dict(film_state, assign=True)
+        model.enable_pooled_text_sigma_film = True
+        logger.info("  σ-FiLM weights present → timestep-conditioned mod head armed")
+    logger.info(f"Loaded pooled_text_proj from {path}")
+
+
+def load_llm_adapter(
+    dit_path: Optional[str],
+    llm_adapter_path: Optional[str] = None,
+    dtype: torch.dtype = torch.bfloat16,
+    device: Union[str, torch.device] = "cpu",
+    vocab_pack=None,
+) -> anima_models.LLMAdapter:
+    """Load only the LLM adapter weights.
+
+    This is useful for caching adapter outputs without loading the full DiT model.
+
+    Args:
+        dit_path: Path to the DiT safetensors file (used when llm_adapter_path is None).
+        llm_adapter_path: Optional path to a separate adapter safetensors file.
+        dtype: Target dtype.
+        device: Target device.
+        vocab_pack: CJK vocab pack to hook onto ``embed`` (see ``load_anima_model``)
+            so cached ``crossattn_emb`` sees the same rows the DiT will.
+    """
+    weight_path = llm_adapter_path or dit_path
+    if weight_path is None:
+        raise ValueError("Either dit_path or llm_adapter_path must be provided")
+    if os.path.splitext(weight_path)[1].lower() != ".safetensors":
+        raise ValueError(
+            f"LLM adapter weights must be a .safetensors file, got: {weight_path}"
+        )
+
+    with safe_open(weight_path, framework="pt", device="cpu") as f:
+        keys = list(f.keys())
+
+    candidates = ("llm_adapter.", *(p + "llm_adapter." for p in _DIT_PREFIXES))
+    prefix = next(
+        (c for c in candidates if any(k.startswith(c) for k in keys)),
+        None,  # adapter-only weights file (no prefix)
+    )
+
+    state_dict: Dict[str, torch.Tensor] = {}
+    with safe_open(weight_path, framework="pt", device="cpu") as f:
+        for key in f.keys():
+            if prefix is not None:
+                if not key.startswith(prefix):
+                    continue
+                stripped = key[len(prefix) :]
+            else:
+                stripped = key
+            state_dict[stripped] = f.get_tensor(key)
+
+    if prefix is not None and len(state_dict) == 0:
+        raise ValueError(f"No llm_adapter weights found in {weight_path}")
+
+    adapter = anima_models.LLMAdapter(
+        source_dim=1024,
+        target_dim=1024,
+        model_dim=1024,
+        num_layers=6,
+        self_attn=True,
+    )
+    missing, unexpected = adapter.load_state_dict(state_dict, strict=False)
+    if unexpected:
+        logger.warning(
+            f"Unexpected keys in LLM adapter weights: {unexpected[:10]}{'...' if len(unexpected) > 10 else ''}"
+        )
+    if missing:
+        logger.warning(
+            f"Missing keys in LLM adapter weights: {missing[:10]}{'...' if len(missing) > 10 else ''}"
+        )
+
+    adapter.to(device=device, dtype=dtype)
+    adapter.eval()
+    _attach_vocab_pack_if_set(adapter, vocab_pack)
+    return adapter
+
+
+def _is_qwen3_5(path: str) -> bool:
+    """Detect whether a path refers to a Qwen3.5 model (vs Qwen3)."""
+    basename = os.path.basename(path).lower()
+    return "qwen_3_5" in basename or "qwen3_5" in basename or "qwen3.5" in basename
+
+
+def _get_qwen_config_dir(qwen3_path: str) -> str:
+    """Return the appropriate bundled config directory for the given model path."""
+    configs_root = os.path.join(os.path.dirname(__file__), "configs")
+    if _is_qwen3_5(qwen3_path):
+        config_dir = os.path.join(configs_root, "qwen3_5_08b")
+        model_name = "Qwen3.5-0.8B"
+    else:
+        config_dir = os.path.join(configs_root, "qwen3_06b")
+        model_name = "Qwen3-0.6B"
+
+    if not os.path.exists(config_dir):
+        raise FileNotFoundError(
+            f"{model_name} config directory not found at {config_dir}. "
+            f"Expected config.json, tokenizer.json, etc. "
+            f"You can download these from the {model_name} HuggingFace repository."
+        )
+    return config_dir
+
+
+def qwen3_tokenizer_dir(qwen3_path: str) -> str:
+    """Directory holding the tokenizer for ``qwen3_path`` (the path itself when
+    it is a model directory, else the bundled Qwen3/Qwen3.5 config dir).
+
+    Trainer-side resolver handed to curation stages (``--qwen3 <dir>``), which
+    load tokenizers from directories only (``anime_tools.captions.tokenizers``).
+    """
+    qwen3_path = str(resolve_under_home(qwen3_path))
+    if os.path.isdir(qwen3_path):
+        return qwen3_path
+    return _get_qwen_config_dir(qwen3_path)
+
+
+def t5_tokenizer_dir() -> str:
+    """The bundled ``t5_old`` tokenizer config directory."""
+    return os.path.join(os.path.dirname(__file__), "configs", "t5_old")
+
+
+def load_qwen3_tokenizer(qwen3_path: str):
+    """Load Qwen3/Qwen3.5 tokenizer only (without the text encoder model).
+
+    Args:
+        qwen3_path: Path to either a directory with model files or a safetensors file.
+                     If a directory, loads tokenizer from it directly.
+                     If a file, auto-detects Qwen3 vs Qwen3.5 from filename and uses
+                     the appropriate bundled config directory.
+    Returns:
+        tokenizer
+    """
+    from transformers import AutoTokenizer
+
+    qwen3_path = str(resolve_under_home(qwen3_path))
+    if os.path.isdir(qwen3_path):
+        tokenizer = AutoTokenizer.from_pretrained(qwen3_path, local_files_only=True)
+    else:
+        config_dir = _get_qwen_config_dir(qwen3_path)
+        tokenizer = AutoTokenizer.from_pretrained(config_dir, local_files_only=True)
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    return tokenizer
+
+
+def load_qwen3_text_encoder(
+    qwen3_path: str,
+    dtype: torch.dtype = torch.bfloat16,
+    device: str = "cpu",
+    lora_weights: Optional[List[Dict[str, torch.Tensor]]] = None,
+    lora_multipliers: Optional[List[float]] = None,
+):
+    """Load Qwen3 or Qwen3.5 text encoder.
+
+    Auto-detects Qwen3.5 from filename (looks for 'qwen_3_5', 'qwen3_5', or 'qwen3.5').
+
+    Args:
+        qwen3_path: Path to either a directory with model files or a safetensors file
+        dtype: Model dtype
+        device: Device to load to
+
+    Returns:
+        (text_encoder_model, tokenizer)
+    """
+    import transformers
+    from transformers import AutoTokenizer
+
+    qwen3_path = str(resolve_under_home(qwen3_path))
+    is_qwen35 = _is_qwen3_5(qwen3_path)
+    model_label = "Qwen3.5" if is_qwen35 else "Qwen3"
+    logger.info(f"Loading {model_label} text encoder from {qwen3_path}")
+
+    if os.path.isdir(qwen3_path):
+        tokenizer = AutoTokenizer.from_pretrained(qwen3_path, local_files_only=True)
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            qwen3_path, torch_dtype=dtype, local_files_only=True
+        ).model
+    else:
+        # Single safetensors file - use bundled config
+        config_dir = _get_qwen_config_dir(qwen3_path)
+
+        tokenizer = AutoTokenizer.from_pretrained(config_dir, local_files_only=True)
+
+        if is_qwen35:
+            qwen_config = transformers.Qwen3_5TextConfig.from_pretrained(
+                config_dir, local_files_only=True
+            )
+            model = transformers.Qwen3_5ForCausalLM(qwen_config).model
+        else:
+            qwen_config = transformers.Qwen3Config.from_pretrained(
+                config_dir, local_files_only=True
+            )
+            model = transformers.Qwen3ForCausalLM(qwen_config).model
+
+        if qwen3_path.endswith(".safetensors"):
+            if lora_weights is None:
+                state_dict = load_file(qwen3_path, device="cpu")
+            else:
+                state_dict = load_safetensors_with_lora(
+                    model_files=qwen3_path,
+                    lora_weights_list=lora_weights,
+                    lora_multipliers=lora_multipliers,
+                    calc_device=device,
+                    move_to_device=True,
+                    dit_weight_dtype=None,
+                )
+        else:
+            assert lora_weights is None, (
+                "LoRA weights merging is only supported for safetensors checkpoints"
+            )
+            state_dict = torch.load(qwen3_path, map_location="cpu", weights_only=True)
+
+        new_sd = {}
+        for k, v in state_dict.items():
+            if k.startswith("model."):
+                new_sd[k[len("model.") :]] = v
+            else:
+                new_sd[k] = v
+
+        info = model.load_state_dict(new_sd, strict=False)
+        logger.info(f"Loaded {model_label} state dict: {info}")
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model.config.use_cache = False
+    model = model.requires_grad_(False).to(device, dtype=dtype)
+
+    logger.info(
+        f"Loaded Qwen3 text encoder. Parameters: {sum(p.numel() for p in model.parameters()):,}"
+    )
+    return model, tokenizer
+
+
+def load_t5_tokenizer(t5_tokenizer_path: Optional[str] = None):
+    """Load T5 tokenizer for LLM Adapter target tokens.
+
+    Args:
+        t5_tokenizer_path: Optional path to T5 tokenizer directory. If None, uses default configs.
+    """
+    from transformers import T5TokenizerFast
+
+    if t5_tokenizer_path is not None:
+        return T5TokenizerFast.from_pretrained(t5_tokenizer_path, local_files_only=True)
+
+    config_dir = os.path.join(os.path.dirname(__file__), "configs", "t5_old")
+    if os.path.exists(config_dir):
+        return T5TokenizerFast(
+            vocab_file=os.path.join(config_dir, "spiece.model"),
+            tokenizer_file=os.path.join(config_dir, "tokenizer.json"),
+        )
+
+    raise FileNotFoundError(
+        f"T5 tokenizer config directory not found at {config_dir}. "
+        "Expected library/anima/configs/t5_old/ with spiece.model and tokenizer.json. "
+        "You can download these from the google/t5-v1_1-xxl HuggingFace repository."
+    )
+
+
+def save_anima_model(
+    save_path: str,
+    dit_state_dict: Dict[str, torch.Tensor],
+    metadata: Dict[str, any],
+    dtype: Optional[torch.dtype] = None,
+):
+    """Save Anima DiT model with 'net.' prefix for ComfyUI compatibility.
+
+    Args:
+        save_path: Output path (.safetensors)
+        dit_state_dict: State dict from dit.state_dict()
+        metadata: Metadata dict to include in the safetensors file
+        dtype: Optional dtype to cast to before saving
+    """
+    prefixed_sd = {}
+    for k, v in dit_state_dict.items():
+        v = v.detach().to(device="cpu", dtype=dtype or v.dtype)
+        for export_key, export_tensor in _dit_export_tensors(k, v):
+            prefixed_sd["net." + export_key] = export_tensor.contiguous()
+
+    if metadata is None:
+        metadata = {}
+    metadata["format"] = "pt"  # For compatibility with the official .safetensors file
+
+    save_file(
+        prefixed_sd, save_path, metadata=metadata
+    )  # safetensors.save_file cosumes a lot of memory, but Anima is small enough
+    logger.info(f"Saved Anima model to {save_path}")

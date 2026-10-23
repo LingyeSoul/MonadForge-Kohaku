@@ -1,0 +1,467 @@
+# Classic LoRA. `merge_to` bakes a checkpoint slice into the base Linear/Conv2d
+# weight; `fuse_weight` bakes the live delta and turns forward into a no-op.
+
+import logging
+import math
+from typing import Dict, List
+
+import torch
+
+from networks.attn_fuse import match_fused_spec
+from networks.lora_modules.base import BaseLoRAModule
+from networks.lora_modules.custom_autograd import (
+    eager_lora_down_project,
+    eager_lora_up_residual,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# Smallest (lam_cols / lam_0) a fp32 eigh still resolves into the right
+# eigenvector. lam is sigma^2, so 1e-3 is a 32:1 singular-value window — every
+# weight group of the base DiT clears it by an order of magnitude at the 256
+# columns eight r=32 slices need, except the ones that need the SVD anyway.
+_GRAM_EIG_FLOOR = 1e-3
+
+
+def _gram_window_is_resolvable(lam: torch.Tensor) -> bool:
+    """``lam`` = the descending eigenvalues of the window actually requested."""
+    return bool(lam[0] > 0 and (lam[-1] / lam[0]).item() >= _GRAM_EIG_FLOOR)
+
+
+def _top_right_singular_vectors(W: torch.Tensor, cols: int) -> torch.Tensor:
+    """Top-``cols`` right singular vectors of ``W``, as an ``(in, cols)`` matrix.
+
+    The same subspace ``torch.linalg.svd(W).Vh[:cols].T`` returns, but routed
+    through an eigendecomposition of the **smaller Gram matrix**: ~7.5x cheaper
+    on the base DiT *and* tighter-orthonormal columns than cuSOLVER's Jacobi
+    SVD (1e-6 vs 1e-3 max off-diagonal), which is the property ``svd_slice``
+    leans on.
+
+    What the Gram costs is the **bottom** of the window: it squares the spectrum,
+    so ``lam_cols / lam_0 == (sigma_cols / sigma_0)^2`` sinks under the fp32 eigh
+    error floor long before the SVD would notice, and those eigenvectors come
+    back orthonormal but spanning the wrong subspace (the 256-vector
+    ``(6144, 256)`` Linears decay 1569:1 and a slice-7 window — the last 32 of
+    the 256 — captured only 0.796 of the exact one). ``in > out`` is worse still:
+    the ``(out, out)`` eigenvectors are U, and ``V_r = W^T U_r / sigma_r``
+    amplifies the same error again (the 3325:1 adaln ``.1`` Linears lose
+    orthogonality outright, 0.49). So both branches read their own conditioning
+    off the eigenvalues they just computed and hand the layer to the SVD when the
+    requested window reaches too deep — which is cheap, because those are the
+    narrow layers.
+    """
+    out_dim, in_dim = W.shape
+    if in_dim <= out_dim:
+        # V are the eigenvectors of the (in x in) Gram directly.
+        lam, Q = torch.linalg.eigh(W.T @ W)
+        lam, V = lam.flip(-1)[:cols], Q.flip(-1)[:, :cols]
+        if _gram_window_is_resolvable(lam):
+            return V
+    elif cols <= out_dim:
+        # out < in: eigh gives U, and V follows through W^T U / sigma.
+        lam, Q = torch.linalg.eigh(W @ W.T)
+        lam, U = lam.flip(-1)[:cols], Q.flip(-1)[:, :cols]
+        if _gram_window_is_resolvable(lam):
+            return (W.T @ U) / lam.clamp_min(0).sqrt().clamp_min(1e-12)
+    _, _, Vh = torch.linalg.svd(W, full_matrices=False)
+    return Vh.T[:, :cols]
+
+
+class LoRAModule(BaseLoRAModule):
+    supports_conv2d = True
+
+    def __init__(
+        self,
+        lora_name,
+        org_module: torch.nn.Module,
+        multiplier=1.0,
+        lora_dim=4,
+        alpha=1,
+        dropout=None,
+        rank_dropout=None,
+        module_dropout=None,
+        channel_scale=None,
+        down_init="kaiming",
+        grad_basis=None,
+        svd_slice=0,
+        svd_slice_count=0,
+    ):
+        """if alpha == 0 or None, alpha is rank (no scaling).
+
+        ``down_init`` selects the ``lora_down`` initialization (Linear only):
+        ``"kaiming"`` (default ``kaiming_uniform_(a=sqrt(5))``), ``"weight_svd"``
+        (SVD-Down — seed the input basis from W0's top-r right singular vectors,
+        scale-matched to Kaiming's expected row-norm so it is NOT a larger step),
+        or the two gradient-seeded modes ``"grad_svd"`` / ``"basis_file"``, which
+        take the same scale-matched seed from a precomputed ``grad_basis``
+        (``in × r_store``; see networks/grad_basis.py). Still ordinary LoRA after
+        init in every mode: ΔW=0 (up=0), full B trainable on step 1.
+        ``svd_slice=k`` (weight_svd only) takes right singular vectors
+        ``[k·r, (k+1)·r)`` instead of the top-r, so adapters trained with
+        different slices own mutually orthogonal input subspaces (slices of one
+        orthonormal basis) — a per-artist address for merging. 0 = top-r.
+        ``svd_slice_count=N`` (> 0) interleaves instead: slice k takes vectors
+        ``{k, k+N, k+2N, …}``, so every slice gets one of the top-N directions.
+        See docs/methods/svd-down-lora.md.
+        """
+        super().__init__(
+            lora_name,
+            org_module,
+            multiplier=multiplier,
+            lora_dim=lora_dim,
+            alpha=alpha,
+            dropout=dropout,
+            rank_dropout=rank_dropout,
+            module_dropout=module_dropout,
+        )
+
+        if org_module.__class__.__name__ == "Conv2d":
+            in_dim = org_module.in_channels
+            out_dim = org_module.out_channels
+            kernel_size = org_module.kernel_size
+            stride = org_module.stride
+            padding = org_module.padding
+            self.lora_down = torch.nn.Conv2d(
+                in_dim, self.lora_dim, kernel_size, stride, padding, bias=False
+            )
+            self.lora_up = torch.nn.Conv2d(
+                self.lora_dim, out_dim, (1, 1), (1, 1), bias=False
+            )
+        else:
+            in_dim = org_module.in_features
+            out_dim = org_module.out_features
+            self.lora_down = torch.nn.Linear(in_dim, self.lora_dim, bias=False)
+            self.lora_up = torch.nn.Linear(self.lora_dim, out_dim, bias=False)
+
+        torch.nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
+        torch.nn.init.zeros_(self.lora_up.weight)
+
+        if down_init == "weight_svd":
+            self._init_down_weight_svd(org_module, svd_slice, svd_slice_count)
+        elif down_init in ("grad_svd", "basis_file"):
+            self._init_down_grad_basis(grad_basis, down_init)
+        elif down_init != "kaiming":
+            raise ValueError(
+                f"down_init={down_init!r}: expected 'kaiming', 'weight_svd', "
+                f"'grad_svd' or 'basis_file'."
+            )
+
+        self._register_channel_scale(self.lora_down.weight.data, channel_scale)
+
+        # List wrapping prevents nn.Module from registering org_module as a
+        # submodule (would double-count params). apply_to() deletes
+        # self.org_module after rerouting forward, leaving this as the only
+        # handle for fuse/unfuse.
+        self.org_module_ref = [org_module]
+        self._fused = False
+
+    def _init_down_weight_svd(
+        self, org_module: torch.nn.Module, svd_slice: int = 0, svd_slice_count: int = 0
+    ) -> None:
+        """SVD-Down: seed ``lora_down`` with W0's top-r right singular vectors.
+
+        ``svd_slice=k`` shifts the window to singular vectors ``[k·r, (k+1)·r)``;
+        with ``svd_slice_count=N`` it takes the interleaved comb ``k + N·j``
+        (j < r) instead. The window must fit inside ``min(W.shape)`` or the init
+        refuses — on the base DiT the 256-row adaln Linears cap r=32 at slices
+        0–7 (contiguous) or N·r ≤ 256 (interleaved).
+
+        ``A_0 = V_r^T / sqrt(3)`` where ``W0 = U Σ V^T`` and the ``1/sqrt(3)``
+        matches the expected row-norm of the Kaiming default (a row of V_r^T has
+        norm 1; a Kaiming row has E[‖·‖²] ≈ 1/3), so "better direction" is not
+        confounded with "larger effective step". Linear only — Conv2d keeps the
+        Kaiming init already written above. The basis comes from
+        ``_top_right_singular_vectors`` (exact, Gram-routed).
+        """
+        if not isinstance(self.lora_down, torch.nn.Linear):
+            logger.warning(
+                "down_init='weight_svd' is Linear-only (v0); %s keeps Kaiming.",
+                self.lora_name,
+            )
+            return
+        W = org_module.weight.data.float()
+        rank = self.lora_dim
+        if svd_slice_count:
+            idx = int(svd_slice) + int(svd_slice_count) * torch.arange(rank)
+        else:
+            idx = int(svd_slice) * rank + torch.arange(rank)
+        offset, end = int(idx[0]), int(idx[-1]) + 1
+        if end > min(W.shape):
+            raise ValueError(
+                f"svd_slice={svd_slice}: window [{offset}, {end}) exceeds "
+                f"the {min(W.shape)}-vector spectrum of {self.lora_name} "
+                f"({tuple(W.shape)}); lower the slice or the rank."
+            )
+        # Exact basis: slice 0 is the actual top-r and every slice pair is
+        # exactly orthogonal (a randomized sketch would break both).
+        V = _top_right_singular_vectors(W, end)
+        with torch.no_grad():
+            v_r = V[:, idx].T / math.sqrt(3)
+            self.lora_down.weight.copy_(v_r.to(self.lora_down.weight.dtype))
+
+    def _init_down_grad_basis(self, grad_basis, mode: str) -> None:
+        """Gradient-SVD: seed ``lora_down`` from a precomputed gradient row space.
+
+        ``grad_basis`` is the ``(in, r_store)`` slice for THIS module, resolved by
+        the network from the per-run sketch (``grad_svd``) or the shipped
+        artifact (``basis_file``); ``None`` means the basis carries no entry for
+        this module (a TE module, or a layer whose sketch was empty) and Kaiming
+        stands. Scale matching and the ``r_store < r`` tail are owned by
+        ``grad_basis.init_down_from_basis`` so both modes are identical.
+        """
+        if not isinstance(self.lora_down, torch.nn.Linear):
+            logger.warning(
+                "down_init=%r is Linear-only; %s keeps Kaiming.", mode, self.lora_name
+            )
+            return
+        if grad_basis is None:
+            self._grad_basis_seeded = 0
+            return
+        from networks.grad_basis import init_down_from_basis
+
+        self._grad_basis_seeded = init_down_from_basis(
+            self.lora_down.weight.data, grad_basis, lora_name=self.lora_name
+        )
+
+
+    # Forward is the shared BaseLoRAModule scaffold; this class supplies the
+    # down / up GEMMs (Linear-or-Conv2d dispatch) and the eval delta.
+
+    def _project_down(self, x, work):
+        if (
+            self.use_custom_down_autograd
+            and self.training
+            and work == torch.float32
+            and isinstance(self.lora_down, torch.nn.Linear)
+            and not torch.compiler.is_compiling()
+        ):
+            inv_scale = self.inv_scale if self._has_channel_scale else None
+            return eager_lora_down_project(x, self.lora_down.weight, inv_scale)
+        return super()._project_down(x, work)
+
+    def _project_up_and_merge(self, org_forwarded, lx, work, scale):
+        if (
+            self.use_custom_down_autograd
+            and self.training
+            and work == torch.float32
+            and isinstance(self.lora_up, torch.nn.Linear)
+            and not torch.compiler.is_compiling()
+        ):
+            return eager_lora_up_residual(
+                org_forwarded,
+                lx,
+                self.lora_up.weight,
+                self.multiplier * scale,
+            )
+        return super()._project_up_and_merge(org_forwarded, lx, work, scale)
+
+    def _down(self, x_lora, work):
+        if isinstance(self.lora_down, torch.nn.Linear):
+            return torch.nn.functional.linear(x_lora, self.lora_down.weight.to(work))
+        return self.lora_down(x_lora)  # Conv2d
+
+    def _up(self, lx, work):
+        if isinstance(self.lora_up, torch.nn.Linear):
+            return torch.nn.functional.linear(lx, self.lora_up.weight.to(work))
+        return self.lora_up(lx)  # Conv2d
+
+    def _eval_delta(self, x, org_forwarded):
+        # Full-rank inference path: no T-LoRA mask, plain module calls (params
+        # already in the model dtype), so no work-dtype cast dance.
+        x_lora = self._rebalance(x)
+        lx = self.lora_up(self.lora_down(x_lora))
+        return lx * self.multiplier * self.scale
+
+    def get_weight(self, multiplier=None):
+        """Return the LoRA delta as a tensor matching org_module.weight shape."""
+        if multiplier is None:
+            multiplier = self.multiplier
+
+        up_weight = self.lora_up.weight.to(torch.float)
+        down_weight = self.lora_down.weight.to(torch.float)
+
+        # Undo channel absorption so the merged delta applies to raw inputs.
+        if self._has_channel_scale and down_weight.dim() == 2:
+            down_weight = down_weight * self.inv_scale.to(down_weight).unsqueeze(0)
+
+        if len(down_weight.size()) == 2:
+            weight = multiplier * (up_weight @ down_weight) * self.scale
+        elif down_weight.size()[2:4] == (1, 1):
+            weight = (
+                multiplier
+                * (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2))
+                .unsqueeze(2)
+                .unsqueeze(3)
+                * self.scale
+            )
+        else:
+            conved = torch.nn.functional.conv2d(
+                down_weight.permute(1, 0, 2, 3), up_weight
+            ).permute(1, 0, 2, 3)
+            weight = multiplier * conved * self.scale
+
+        return weight
+
+    def merge_to(self, sd, dtype, device):
+        """Merge a per-LoRA state-dict slice into org_module.weight in-place.
+
+        Alternative to apply_to: delta lands on the base weight, no forward
+        hook. `sd` is the raw checkpoint slice — the LoRA module hasn't been
+        load_state_dict'd at this point.
+        """
+        with torch.no_grad():
+            weight = self.org_module.weight
+            org_dtype = weight.dtype
+            if dtype is None:
+                dtype = org_dtype
+            if device is None:
+                device = weight.device
+
+            w = weight.data.float()
+
+            down_weight = sd["lora_down.weight"].to(torch.float).to(device)
+            up_weight = sd["lora_up.weight"].to(torch.float).to(device)
+
+            # Merged forward has no x rebalancing — undo absorption first.
+            if "inv_scale" in sd:
+                inv_scale = sd["inv_scale"].to(torch.float).to(device)
+                if down_weight.dim() == 2:
+                    down_weight = down_weight * inv_scale.unsqueeze(0)
+
+            if len(w.size()) == 2:
+                w += self.multiplier * (up_weight @ down_weight) * self.scale
+            elif down_weight.size()[2:4] == (1, 1):
+                w += (
+                    self.multiplier
+                    * (
+                        up_weight.squeeze(3).squeeze(2)
+                        @ down_weight.squeeze(3).squeeze(2)
+                    )
+                    .unsqueeze(2)
+                    .unsqueeze(3)
+                    * self.scale
+                )
+            else:
+                conved = torch.nn.functional.conv2d(
+                    down_weight.permute(1, 0, 2, 3), up_weight
+                ).permute(1, 0, 2, 3)
+                w += self.multiplier * conved * self.scale
+
+            weight.data.copy_(w.to(dtype))
+
+    def fuse_weight(self):
+        """Bake LoRA delta into org_module.weight; subsequent forwards no-op."""
+        if self._fused:
+            return
+        org_module = self.org_module_ref[0]
+        delta = self.get_weight().to(org_module.weight.dtype)
+        org_module.weight.data += delta
+        self._fused = True
+
+    def unfuse_weight(self):
+        """Subtract a previously fused LoRA delta back out of org_module.weight."""
+        if not self._fused:
+            return
+        org_module = self.org_module_ref[0]
+        delta = self.get_weight().to(org_module.weight.dtype)
+        org_module.weight.data -= delta
+        self._fused = False
+
+
+# Save-pipeline helpers (state_dict-level, no module instance required).
+# Co-located with LoRAModule because they operate on the layout this class
+# writes (``.lora_down.weight`` / ``.lora_up.weight`` / ``.alpha`` /
+# optional ``.inv_scale``). The standard variant write fires these; the
+# Hydra writer also defuses its plain-LoRA leg by calling
+# :func:`defuse_standard_qkv` directly.
+
+
+def defuse_standard_qkv(state_dict: Dict[str, torch.Tensor]) -> None:
+    """Split runtime-fused ``…_qkv_proj`` / ``…_kv_proj`` keys per-component.
+
+    Operates on the plain LoRA layout (single ``.lora_down.weight`` +
+    single ``.lora_up.weight`` per fused Linear). The down projection is
+    cloned per component; the up projection (rows = concatenated output
+    channels) is chunked along dim 0. ``.alpha`` / ``.inv_scale``
+    (per_channel_scaling) get cloned/chunked alongside — ``inv_scale`` is
+    shape ``[in_dim]`` and identical for q/k/v which all see the same Linear
+    input, so it clones rather than chunks.
+
+    Used by:
+      * the standard write path,
+      * the Hydra write path's "plain-LoRA leg" (modules excluded from
+        ``router_targets`` save under the plain layout).
+    """
+    fused_groups: List[tuple] = []
+    for key in list(state_dict.keys()):
+        if not key.endswith(".lora_down.weight"):
+            continue
+        prefix = key.removesuffix(".lora_down.weight")
+        spec = match_fused_spec(prefix)
+        if spec is not None:
+            fused_groups.append((prefix, spec))
+
+    for prefix, spec in fused_groups:
+        suffixes = spec.component_letters
+        n = len(suffixes)
+        down = state_dict.pop(f"{prefix}.lora_down.weight")
+        up = state_dict.pop(f"{prefix}.lora_up.weight")
+        alpha = state_dict.pop(f"{prefix}.alpha", None)
+        inv_scale = state_dict.pop(f"{prefix}.inv_scale", None)
+
+        up_chunks = up.chunk(n, dim=0)
+
+        base_prefix = prefix.removesuffix(spec.fused_frag)
+        for letter, up_chunk in zip(suffixes, up_chunks):
+            new_prefix = base_prefix + spec.component_frag(letter)
+            state_dict[f"{new_prefix}.lora_down.weight"] = down.clone()
+            state_dict[f"{new_prefix}.lora_up.weight"] = up_chunk
+            if alpha is not None:
+                state_dict[f"{new_prefix}.alpha"] = alpha.clone()
+            if inv_scale is not None:
+                state_dict[f"{new_prefix}.inv_scale"] = inv_scale.clone()
+
+
+def bake_inv_scale(state_dict: Dict[str, torch.Tensor]) -> None:
+    """Fold per_channel_scaling ``inv_scale`` into ``lora_down`` and drop the key.
+
+    ``per_channel_scaling`` (SmoothQuant-style channel absorption) bakes
+    ``s_norm`` into the saved ``lora_down`` (``W[:,c] *= s_norm[c]``) and stores
+    ``inv_scale = 1/s_norm`` separately; the trained forward is
+    ``F.linear(x * inv_scale, down)``. Pre-folding ``down *= inv_scale`` makes
+    the on-disk delta act on raw inputs — a standard LoRA that any consumer
+    (stock ComfyUI, ``merge_to_dit``, third-party loaders) applies correctly
+    without knowing the ``.inv_scale`` convention.
+
+    Operates on the split (post-defuse) layout: each ``<prefix>.inv_scale`` has
+    a sibling ``<prefix>.lora_down.weight``. Run AFTER ``defuse_standard_qkv``.
+    Mutates ``state_dict`` in place. Resume re-derives the reparameterization
+    from calibration — see ``LoRANetwork.load_weights``'s re-absorb guard.
+    """
+    for key in list(state_dict.keys()):
+        if not key.endswith(".inv_scale"):
+            continue
+        prefix = key.removesuffix(".inv_scale")
+        down_key = f"{prefix}.lora_down.weight"
+        inv_scale = state_dict.pop(key)
+        down = state_dict.get(down_key)
+        if down is None or down.dim() != 2:
+            logger.warning(
+                f"bake_inv_scale: no 2D sibling lora_down for {key}; "
+                "dropping inv_scale unbaked (delta will be wrong)."
+            )
+            continue
+        orig_dtype = down.dtype
+        state_dict[down_key] = (
+            down.to(torch.float)
+            * inv_scale.to(device=down.device, dtype=torch.float).unsqueeze(0)
+        ).to(orig_dtype)
+
+
+def defuse_and_bake_standard(
+    state_dict: Dict[str, torch.Tensor],
+) -> None:
+    """Standard write pipeline: qkv defuse + inv_scale bake."""
+    defuse_standard_qkv(state_dict)
+    bake_inv_scale(state_dict)

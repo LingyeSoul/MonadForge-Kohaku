@@ -1,0 +1,118 @@
+# ChimeraHydra — dual-pool additive routing for timestep-aware MoE.
+#
+# Proposal: docs/proposal/chimera_hydra.md
+# Module:   networks/lora_modules/chimera.py
+# Spec:     networks/__init__.py::NETWORK_REGISTRY["chimera_hydra"]
+#
+# Two pools of B-heads share one A per adapted Linear:
+#   • content pool (K_c=3) routed by the per-layer rank-R router on pooled lx.
+#   • freq    pool (K_f=3) routed by the network-level FreqRouter on
+#                          concat(FEI(z_t), sinusoidal-σ-features).
+# Pool outputs are added (no multiplicative gate, no σ-band overlap mask).
+# Specialization is enforced by router-input separation — the content router
+# can't see σ; the freq router can't see pooled text features.
+#
+# Single phase: both pools, both routers, and shared A train jointly under
+# the denoise loss + per-pool balance loss. T-LoRA's mask is applied to
+# the content branch only (the freq branch keeps full rank at every t).
+
+network_alpha = 128
+network_dim = 32
+
+learning_rate = 2e-5
+max_train_epochs = 16
+save_every_n_epochs = 4
+checkpointing_epochs = 4
+
+use_shuffled_caption_variants = true
+cache_llm_adapter_outputs = true
+caption_dropout_rate = 0.1
+
+# CMMD val (PE-Core MMD²) is the primary val signal.
+# use_cmmd = true
+
+output_name = "anima_chimera-0616"
+# path_pattern = "ama_mitsuki/*|channel_(caststation)/*|sweetonedollar/*"
+
+use_ortho = true
+
+# Per-expert capability levers — make each FROZEN ortho expert deeper instead
+# of adding experts. Orthogonality-preserving alternative to use_ortho_init
+# (which frees the bases and lets experts collapse to an averaged subspace);
+# require use_ortho_init=false. Both distill into the standard up-stack, so
+# inference / on-disk layout is unchanged.
+#   chimera_expert_basis_mult: m≥1. Each expert gets an over-complete (out, m·r)
+#     frozen pool from a DISJOINT U-slice + an m·r Cayley rotation; the forward
+#     selects an r-dim Stiefel subspace within it → the expert's colspace is
+#     trainable yet stays disjoint across experts (no collapse). Auto-downgrades
+#     per-layer when m·r overflows a Linear's width. m=1 = canonical r-slice.
+#   chimera_expert_diag: per-expert (K, r) trainable diagonal σ (the singular
+#     spectrum the orthogonal-only path lacks). ΔW=0 at init still holds.
+# bench/chimera (expert_capacity probe): subspace freedom (m=2) is the big lever
+# (×700 reach on an off-slice target); diag alone is a minor ×1.15.
+chimera_expert_basis_mult = 4
+chimera_expert_diag = true
+
+# use_timestep_mask = true
+# min_rank = 8
+# alpha_rank_scale = 1.0
+blocks_to_swap=0
+
+# -------------
+# ChimeraHydra activation. The three-axis routing fields
+# (use_moe_style / route_per_layer / router_source) are auto-pinned to
+# ("shared_A", true, "input") by LoRANetworkCfg.from_kwargs when
+# use_chimera_hydra=true — they get stamped into save metadata so the
+# loader can re-instantiate the chimera without a parallel discrimination
+# path.
+
+use_chimera_hydra = true
+num_experts_content = 6
+num_experts_freq = 2
+
+balance_loss_warmup_ratio = 0.0
+balance_loss_weight = 1.0
+# EMA-usage load balance on the content pool (O(1) at uniform, → K_c at full collapse). 
+balance_w_content = 1e-3
+network_content_router_lr_scale = 5.0
+
+# Content routing is always the network-level ContentRouter fed the pooled
+# crossattn_emb (the per-Linear lx_c router was removed).
+content_router_layer_norm = true   # parameterless LN on the pooled input
+
+use_repa       = true
+repa_mode      = "relational"
+repa_weight    = 0.05          # vs v1's 0.5 — late-run gradient is where style drifts
+repa_layer     = 8            # block to hook (of 28)
+repa_encoder   = "pe_spatial"
+repa_lr_scale  = 1.0          # head LR multiplier (absolute mode only)
+repa_target_dog= true
+
+# Freq-pool routing mode.
+#   "fei"     — hardwire π_f = normalize(FEI ** (1/freq_router_tau)) directly.
+#               No learned router, no σ-features, no freq balance loss. The
+#               FEI 2-band simplex (e_low, e_high) IS the gate, so K_f
+#               (num_experts_freq) MUST equal fei_feature_dim. Motivation: the
+#               archived FEI trace (_archive/bench/fera/.../fei_traces.png)
+#               shows FEI already carries the load-bearing per-prompt routing
+#               signal at low σ; the learned MLP only reshaped inputs no richer
+#               than FEI itself, and σ is the non-discriminating half.
+#   "learned" — paper-faithful FreqRouter MLP over concat(FEI, σ-features).
+freq_router_mode = "fei"
+freq_router_tau = 1.0   # 1.0 = raw FEI passthrough; <1 sharpens, >1 flattens
+activation_memory_budget = 0.99
+
+# FEI = 2-band simplex (e_low, e_high). fei_sigma_low_div=4.0 places the
+# low/high crossover near σ≈0.3 (mid-denoising) on this dataset.
+fei_feature_dim = 2
+fei_sigma_low_div = 4.0
+max_data_loader_n_workers=0
+# Routing scope. Every Linear matched by this regex becomes a chimera
+# leaf; non-matching layers fall back to OrthoLoRA (single-pool Cayley,
+# no router). Same default as the other hydra variants.
+router_targets = ".*(output_proj|mlp\\.layer[12])$"
+
+# router_targets = ".*(cross_attn\\.output_proj|mlp\\.layer[12])$"
+# output_name = "anima_chimera-0521"
+[[datasets]]
+validation_split_num = 8

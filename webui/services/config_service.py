@@ -1,0 +1,2157 @@
+"""Pure TOML config service — no Qt dependencies.
+
+Handles the merge/read/write logic for training configs, variant discovery,
+and field help for the WebUI.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Optional
+
+import re
+
+import toml
+
+from webui.services.config_storage import (
+    CONFIG_WRITE_LOCK,
+    atomic_write_text,
+    read_json_object,
+)
+from webui.services.sandbox import resolve_within
+from library.config.lokr import (
+    LOKR_BACKENDS,
+)
+from webui.explanations import (
+    field_help_lang as _field_help_lang,
+    preprocess_field_help_lang as _pre_field_help_lang,
+    _read_fields,
+    _read_preprocess_fields,
+)
+
+_ROOT = Path(__file__).resolve().parent.parent.parent
+# Allow letters, digits, hyphens, underscores, and `custom/<name>` prefixes.
+_SAFE_NAME_RE = re.compile(r"^(?:[a-zA-Z0-9_-]+/)?[a-zA-Z0-9_-]+$")
+
+
+def _safe_variant(variant: str) -> str:
+    """Reject path-traversal attempts in variant/preset names."""
+    if not _SAFE_NAME_RE.match(variant):
+        raise ValueError(f"Invalid variant name: {variant!r}")
+    return variant
+
+
+def _resolve_variant_path(variant: str) -> Path:
+    """Resolve a variant name to its TOML file path.
+
+    For custom/<name> variants, returns CUSTOM_VARIANTS_DIR/<name>.toml.
+    For built-in variants, checks CUSTOM_VARIANTS_DIR/<variant>.toml first
+    (overlay), then falls back to GUI_METHODS_DIR/<variant>.toml.
+    """
+    if variant.startswith("custom/"):
+        stem = variant[len("custom/") :]
+        return CUSTOM_VARIANTS_DIR / f"{stem}.toml"
+    overlay = CUSTOM_VARIANTS_DIR / f"{variant}.toml"
+    if overlay.exists():
+        return overlay
+    return GUI_METHODS_DIR / f"{variant}.toml"
+
+
+ROOT = _ROOT
+CONFIGS_DIR = ROOT / "configs"
+METHODS_DIR = CONFIGS_DIR / "methods"
+GUI_METHODS_DIR = CONFIGS_DIR / "gui-methods"
+PRESETS_FILE = CONFIGS_DIR / "presets.toml"
+CUSTOM_DIR = CONFIGS_DIR / "custom"
+CUSTOM_VARIANTS_DIR = CUSTOM_DIR / "variants"
+CUSTOM_PRESETS_DIR = CUSTOM_DIR / "presets"
+
+# Variant families whose dataset blueprints actually consume a condition
+# latent (subset.cond_cache_dir). Only these may carry conditioning keys
+# (conditioning_data_dir / conditioning_resized_dir / cond_cache_dir) — any
+# other family with such a key would have BlueprintGenerator map
+# conditioning_data_dir → cond_cache_dir onto every subset and silently turn a
+# plain LoRA run into a cond≠target task that crashes on the empty default dir.
+# Single source of truth; the WebUI frontend
+# (webui/frontend/src/views/ConfigEditor.vue::CONDITIONING_FAMILIES) and
+# preprocess_service.save_path_overrides must stay in sync with this set.
+CONDITIONING_CAPABLE_FAMILIES = frozenset({"controlnet", "easycontrol"})
+
+# ── Path overrides from the config chain ──────────────────────────
+
+_DEFAULT_PATHS = {
+    "source_image_dir": "image_dataset",
+    "resized_image_dir": "post_image_dataset/resized",
+    "lora_cache_dir": "post_image_dataset/lora",
+    "conditioning_data_dir": "conditioning_data",
+    "conditioning_resized_dir": "post_image_dataset/cond_resized",
+}
+
+
+def get_path_overrides(
+    preset: str = "default", variant: str | None = None
+) -> dict[str, str]:
+    """Resolve dataset paths from the config chain (base → preset → method).
+
+    Returns ``{"source_image_dir": ..., "resized_image_dir": ...,
+    "lora_cache_dir": ...}`` with defaults filled in for missing keys.
+    """
+    from library.config.io import load_path_overrides
+
+    method = variant
+    overrides = load_path_overrides(
+        preset=preset,
+        method=method,
+        methods_subdir="gui-methods" if method else "methods",
+    )
+    return {k: overrides.get(k, v) for k, v in _DEFAULT_PATHS.items()}
+
+
+_METHOD_ORDER = (
+    "lora",
+    "tlora",
+    "hydralora",
+    "reft",
+    "postfix",
+    "fera",
+    "chimera",
+    "soft_tokens",
+    "ip_adapter",
+    "easycontrol",
+    "controlnet",
+)
+
+_ATTN_MODES = ["flash", "torch", "mem_efficient", "sageattn", "flex", "xformers"]
+_SAMPLER_CHOICES = ["euler", "er_sde"]
+_SAMPLE_DECODE_INLINE_CHOICES = ["auto", "true", "false"]
+_LORA_FP32_COMPUTE_CHOICES = ["auto", "true", "false"]
+_BASE_COMPUTE_CHOICES = ["bf16", "w8a16_convrot", "w8a8_convrot"]
+_CONVROT_HADAMARD_CHOICES = ["sylvester", "regular"]
+_CONVROT_SCOPE_CHOICES = [
+    "mlp",
+    "all",
+    "attention",
+    "self_attn_qkv",
+    "attention_out",
+]
+_CONVROT_WEIGHT_SOURCE_CHOICES = ["online_from_bf16", "prequant_checkpoint"]
+_CONVROT_LARGE_MODE_CHOICES = ["none", "w8a16", "w8a8"]
+_CONVROT_FIELDS = {
+    "base_compute",
+    "convrot_group_size",
+    "convrot_hadamard",
+    "convrot_scope",
+    "convrot_weight_source",
+    "convrot_prequant_path",
+    "convrot_min_in_features",
+    "convrot_largest_in_features_only",
+    "convrot_large_layer_mode",
+    "convrot_large_min_in_features",
+}
+
+# Curated to exactly what library/training/optimizers.py::get_optimizer and
+# library/training/schedulers.py::get_scheduler_fix accept. Keep in sync with
+# those two — a name listed here that the trainer no longer branches on either
+# crashes (Adafactor → AttributeError via the torch.optim fallback; inverse_sqrt
+# → TypeError; cosine_with_min_lr → ValueError) or silently drops its params
+# (cosine_with_restarts / polynomial / warmup_stable_decay). The Adafactor +
+# 5 LR-scheduler names were pruned from the trainer in commit 772dda7.
+_SELECT_OPTIONS: dict[str, list[str]] = {
+    "lokr_backend": list(LOKR_BACKENDS),
+    "attn_mode": _ATTN_MODES,
+    "v100_flash_stability": ["off", "hybrid", "safe"],
+    "base_compute": _BASE_COMPUTE_CHOICES,
+    "convrot_hadamard": _CONVROT_HADAMARD_CHOICES,
+    "convrot_scope": _CONVROT_SCOPE_CHOICES,
+    "convrot_weight_source": _CONVROT_WEIGHT_SOURCE_CHOICES,
+    "convrot_large_layer_mode": _CONVROT_LARGE_MODE_CHOICES,
+    "optimizer_type": [
+        "AdamW",
+        "CAME",
+        "AdamW8bit",
+        "Lion",
+        "Lion8bit",
+        "SGDNesterov",
+        "SGDNesterov8bit",
+        "PagedAdamW",
+        "PagedAdamW8bit",
+        "PagedAdamW32bit",
+        "PagedLion8bit",
+        "DAdaptation",
+        "DAdaptAdam",
+        "DAdaptAdamPreprint",
+        "DAdaptAdaGrad",
+        "DAdaptAdan",
+        "DAdaptAdanIP",
+        "DAdaptLion",
+        "DAdaptSGD",
+        "Prodigy",
+        "RAdamScheduleFree",
+        "AdamWScheduleFree",
+        "SGDScheduleFree",
+    ],
+    "lr_scheduler": [
+        "constant",
+        "constant_with_warmup",
+        "linear",
+        "cosine",
+        "piecewise_constant",
+    ],
+    "timestep_sampling": [
+        "sigmoid",
+        "sigma",
+        "uniform",
+        "shift",
+        "flux_shift",
+    ],
+    "sample_sampler": ["euler", "er_sde"],
+    "sample_decode_inline": _SAMPLE_DECODE_INLINE_CHOICES,
+    "lora_fp32_compute": _LORA_FP32_COMPUTE_CHOICES,
+}
+
+_GROUPS = {
+    "Architecture": {
+        "network_dim",
+        "network_alpha",
+        "network_module",
+        "network_args",
+        "use_ortho",
+        "use_timestep_mask",
+        "use_moe_style",
+        "route_per_layer",
+        "router_source",
+        "add_reft",
+        "min_rank",
+        "alpha_rank_scale",
+        "num_experts",
+        "balance_loss_weight",
+        "balance_loss_warmup_ratio",
+        "reft_dim",
+        "reft_alpha",
+        "reft_layers",
+        "sigma_feature_dim",
+        "router_targets",
+        "per_bucket_balance_weight",
+        "num_sigma_buckets",
+        "specialize_experts_by_sigma_buckets",
+        "sigma_bucket_boundaries",
+        "network_train_unet_only",
+        "use_lokr",
+        "lokr_factor",
+        "lokr_backend",
+        "decompose_both",
+        "lokr_full_factor",
+        "use_glokr",
+        "glokr_factor",
+        "glokr_full_factor",
+        "glokr_rs_lora",
+        "glokr_bora",
+        "use_loha",
+        "use_dylora",
+        "dylora_unit",
+        "dylora_algo",
+        "use_ve",
+        "vera_seed",
+        "network_reg_dims",
+        "network_reg_lrs",
+    },
+    "Training": {
+        "learning_rate",
+        "max_train_epochs",
+        "save_every_n_epochs",
+        "checkpointing_epochs",
+        "batch_size",
+        "num_repeats",
+        "sample_ratio",
+        "gradient_accumulation_steps",
+        "use_shuffled_caption_variants",
+        "caption_dropout_rate",
+        "optimizer_type",
+        "lr_scheduler",
+        "timestep_sampling",
+        "discrete_flow_shift",
+        "use_valid",
+        "validation_split_num",
+    },
+    "Performance": {
+        "attn_mode",
+        "v100_flash_stability",
+        *_CONVROT_FIELDS,
+        "debug_finite_checks",
+        "gradient_checkpointing",
+        "unsloth_offload_checkpointing",
+        "blocks_to_swap",
+        "torch_compile",
+        "compile_dynamic_seq",
+        "compile_mode",
+        "trim_crossattn_kv",
+        "cache_llm_adapter_outputs",
+        "masked_loss",
+        "mixed_precision",
+        "lora_fp32_compute",
+        "vae_chunk_size",
+        "vae_disable_cache",
+        "cache_latents",
+        "cache_latents_to_disk",
+        "cache_text_encoder_outputs",
+        "cache_text_encoder_outputs_to_disk",
+        "skip_cache_check",
+        "layer_start",
+        "use_cmmd",
+        "channel_scaling_alpha",
+    },
+    "Paths": {
+        "pretrained_model_name_or_path",
+        "qwen3",
+        "vae",
+        "output_dir",
+        "output_name",
+        "save_model_as",
+        "source_image_dir",
+        "resized_image_dir",
+        "lora_cache_dir",
+        "path_pattern",
+        "drop_lowres_images",
+        "min_pixels",
+    },
+    "Preview Sampling": {
+        "sample_every_n_epochs",
+        "sample_every_n_steps",
+        "sample_at_first",
+        "sample_prompts",
+        "sample_sampler",
+        "sample_decode_inline",
+        "sample_guidance_scale",
+        "sample_flow_shift",
+        "sample_image_size",
+        "sample_seed",
+    },
+    "Resume & Warm-start": {
+        "network_weights",
+        "dim_from_weights",
+        "save_state_on_train_end",
+    },
+}
+_K2G = {k: g for g, ks in _GROUPS.items() for k in ks}
+_SKIP = {"base_config", "dataset_config", "general", "datasets", "variant", "gui"}
+_VIRTUAL_KEYS = {
+    "use_valid",
+    "validation_split_num",
+    "batch_size",
+    "num_repeats",
+    "sample_ratio",
+}
+# Most inherited fields are intentionally read-only in the WebUI. Preview decode
+# timing is safe to override per variant, and save_variant_config persists that
+# choice in the user overlay without touching base.toml.
+_EDITABLE_INHERITED_KEYS = {
+    "sample_decode_inline",
+    "lora_fp32_compute",
+    *_CONVROT_FIELDS,
+}
+
+# Resume & Warm-start defaults. These keys are NOT in base.toml (which is
+# overwritten by `make update`), so merged_gui_variant_preset injects them with
+# these neutral defaults so the group always renders in the WebUI form. Values
+# written to the variant TOML still win over these (checked before inject).
+# ``network_weights = ""`` means "no warm-start" and is stripped on save
+# (empty string would be passed to train.py as a literal arg otherwise).
+_RESUME_DEFAULTS = {
+    "network_weights": "",
+    "dim_from_weights": False,
+    "save_state_on_train_end": False,
+}
+
+# Regex-set keys (network_reg_dims / network_reg_lrs) are never present in
+# base.toml, so inject them with an empty default the same way Resume &
+# Warm-start keys are handled — otherwise the fields would never render in
+# the form. Empty string = feature off; stripped again on save.
+_REGEX_SET_DEFAULTS = {
+    "network_reg_dims": "",
+    "network_reg_lrs": "",
+}
+
+# Frontend widget type for the regex-set keys (RegexSetEditor).
+_REGEX_SET_KEYS = frozenset(_REGEX_SET_DEFAULTS)
+
+
+def _is_neutral_resume_value(key: str, value: Any) -> bool:
+    if key == "network_weights":
+        return value is None or (isinstance(value, str) and not value.strip())
+    return key in _RESUME_DEFAULTS and value == _RESUME_DEFAULTS[key]
+
+
+def _strip_neutral_resume_defaults(data: dict) -> dict:
+    return {
+        key: value
+        for key, value in data.items()
+        if not _is_neutral_resume_value(key, value)
+    }
+
+
+def _canonicalize_lora_fp32_compute_layer(data: dict) -> dict:
+    """Promote the legacy network_args spelling into the normal merge layer."""
+    out = dict(data)
+    network_args = out.get("network_args")
+    if not isinstance(network_args, list):
+        return out
+
+    cleaned: list = []
+    legacy_value = None
+    for item in network_args:
+        if isinstance(item, str) and "=" in item:
+            key, value = item.split("=", 1)
+            if key.strip() == "lora_fp32_compute":
+                legacy_value = value.strip().lower()
+                continue
+        cleaned.append(item)
+    if legacy_value is not None:
+        out["lora_fp32_compute"] = legacy_value
+    if cleaned:
+        out["network_args"] = cleaned
+    else:
+        out.pop("network_args", None)
+    return out
+
+
+def _normalize_lora_fp32_compute(data: dict, *, keep_auto: bool = False) -> dict:
+    """Convert the WebUI tri-state sentinel to the trainer's optional bool."""
+    out = _canonicalize_lora_fp32_compute_layer(data)
+    if "lora_fp32_compute" not in out:
+        return out
+    normalized = str(out["lora_fp32_compute"]).strip().lower()
+    if normalized not in _LORA_FP32_COMPUTE_CHOICES:
+        raise ValueError("lora_fp32_compute must be auto, true, or false")
+    if normalized == "auto":
+        if keep_auto:
+            out["lora_fp32_compute"] = "auto"
+        else:
+            out.pop("lora_fp32_compute", None)
+    else:
+        out["lora_fp32_compute"] = normalized == "true"
+    return out
+
+
+_BASIC = {
+    "base_compute",
+    "learning_rate",
+    "max_train_epochs",
+    "save_every_n_epochs",
+    "network_dim",
+    "network_alpha",
+    "lokr_full_factor",
+    "num_experts",
+    "output_name",
+    "batch_size",
+    "num_repeats",
+    "use_shuffled_caption_variants",
+    "caption_dropout_rate",
+    "gradient_checkpointing",
+    "blocks_to_swap",
+    "source_image_dir",
+    "lora_cache_dir",
+    "output_dir",
+    "path_pattern",
+    "drop_lowres_images",
+    "min_pixels",
+    "use_valid",
+    "validation_split_num",
+}
+
+
+# ── Low-level helpers ──────────────────────────────────────────
+
+
+def _load(p: Path) -> dict:
+    return toml.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+
+def _save(p: Path, d: dict) -> None:
+    atomic_write_text(p, toml.dumps(d))
+
+
+def _effective_variant(variant: str) -> dict:
+    """Use the same builtin + sparse overlay layer as lora-gui training."""
+    from library.config.io import _load_gui_method_merged
+
+    _safe_variant(variant)
+    return _load_gui_method_merged(str(CONFIGS_DIR), variant.removeprefix("custom/"))[0]
+
+
+# ── Variant / preset discovery ─────────────────────────────────
+
+
+def _read_variant_metadata(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        data = toml.loads(path.read_text(encoding="utf-8"))
+    except (toml.TomlDecodeError, OSError):
+        return {}
+    meta = data.get("variant")
+    return meta if isinstance(meta, dict) else {}
+
+
+def _builtin_variants_by_family() -> dict[str, list[tuple[int, str, str]]]:
+    by_family: dict[str, list[tuple[int, str, str]]] = {}
+    if not GUI_METHODS_DIR.is_dir():
+        return by_family
+    for path in GUI_METHODS_DIR.glob("*.toml"):
+        meta = _read_variant_metadata(path)
+        family = meta.get("family")
+        if not isinstance(family, str) or not family:
+            continue
+        order = meta.get("order")
+        order_int = order if isinstance(order, int) else 100
+        label = meta.get("label") if isinstance(meta.get("label"), str) else path.stem
+        by_family.setdefault(family, []).append((order_int, path.stem, label))
+    for entries in by_family.values():
+        entries.sort(key=lambda e: (e[0], e[1]))
+    return by_family
+
+
+def _standalone_custom_variants() -> list[tuple[str | None, str, str]]:
+    """User templates, excluding sparse overlays owned by a builtin variant."""
+    entries = []
+    for path in sorted(CUSTOM_VARIANTS_DIR.glob("*.toml")):
+        if (GUI_METHODS_DIR / path.name).is_file():
+            continue
+        meta = _read_variant_metadata(path)
+        family = meta.get("family")
+        family = family if isinstance(family, str) and family else None
+        label = meta.get("label")
+        label = label if isinstance(label, str) and label else path.stem
+        entries.append((family, f"custom/{path.stem}", label))
+    return entries
+
+
+def list_methods() -> list[str]:
+    available = set(_builtin_variants_by_family())
+    available.update(
+        family for family, _variant, _label in _standalone_custom_variants() if family
+    )
+    return [method for method in _METHOD_ORDER if method in available] + sorted(
+        available.difference(_METHOD_ORDER)
+    )
+
+
+def list_gui_variants(method: str) -> list[str]:
+    by_family = _builtin_variants_by_family()
+    ordered = [stem for _order, stem, _label in by_family.get(method, [])]
+    for family, variant, _label in _standalone_custom_variants():
+        # Pre-metadata custom templates remain available without guessing their
+        # algorithm. Explicit families stay in their declared family only.
+        if family is None or family == method:
+            ordered.append(variant)
+    return ordered
+
+
+def variant_labels(method: str) -> dict[str, str]:
+    by_family = _builtin_variants_by_family()
+    out: dict[str, str] = {}
+    for _order, stem, label in by_family.get(method, []):
+        out[stem] = label
+    for family, variant, label in _standalone_custom_variants():
+        if family is None or family == method:
+            out[variant] = label
+    return out
+
+
+def get_field_groups() -> dict[str, set[str]]:
+    """Return the field→group mapping (public accessor)."""
+    return dict(_GROUPS)
+
+
+def create_variant(name: str, seed_from: str | None = None) -> list[str]:
+    """Create a new custom variant, optionally seeded from an existing one.
+
+    Returns the updated variants list for the variant's family.
+    """
+    _safe_variant(name)
+    CUSTOM_VARIANTS_DIR.mkdir(parents=True, exist_ok=True)
+    dest = CUSTOM_VARIANTS_DIR / f"{name}.toml"
+    if dest.exists():
+        raise ValueError(f"Variant already exists: {name}")
+
+    seed_data: dict = {}
+    family = "lora"
+    if seed_from:
+        seed_data = _effective_variant(seed_from)
+        meta = seed_data.get("variant")
+        if isinstance(meta, dict):
+            family = meta.get("family", family)
+            # Preserve family-based conditioning/preflight behavior while
+            # giving the independent copy its own display name.
+            meta["label"] = name
+
+    _save(dest, seed_data)
+    return list_gui_variants(family)
+
+
+def variant_metadata(variant: str) -> dict:
+    _safe_variant(variant)
+    # Always read metadata from the built-in file, not the custom overlay.
+    # A custom overlay (configs/custom/variants/<stem>.toml) is a sparse user
+    # edit that carries no [variant] block, so reading it would return
+    # family=None and break family-based gating (e.g. the conditioning-key
+    # guard in preprocess_service). Fall back through: custom/<stem> → builtin
+    # <stem>.toml if it exists, else the overlay file itself.
+    stem = variant.split("/", 1)[-1] if variant.startswith("custom/") else variant
+    builtin_path = GUI_METHODS_DIR / f"{stem}.toml"
+    if builtin_path.is_file():
+        path = builtin_path
+    else:
+        path = _resolve_variant_path(variant)
+    meta = _read_variant_metadata(path)
+    return {
+        "variant": variant,
+        "family": meta.get("family"),
+        "label": meta.get("label"),
+        "description": meta.get("description"),
+        "experimental": bool(meta.get("experimental")),
+        "order": meta.get("order", 100),
+    }
+
+
+def variant_path(variant: str) -> Path:
+    _safe_variant(variant)
+    return _resolve_variant_path(variant)
+
+
+def _load_all_presets() -> dict:
+    presets: dict = {}
+    if PRESETS_FILE.exists():
+        data = toml.loads(PRESETS_FILE.read_text(encoding="utf-8"))
+        presets.update({k: v for k, v in data.items() if isinstance(v, dict)})
+    if CUSTOM_PRESETS_DIR.exists():
+        for p in sorted(CUSTOM_PRESETS_DIR.glob("*.toml")):
+            try:
+                presets[p.stem] = toml.loads(p.read_text(encoding="utf-8"))
+            except (toml.TomlDecodeError, OSError):
+                continue
+    return presets
+
+
+def list_presets() -> list[str]:
+    return sorted(_load_all_presets())
+
+
+def is_builtin_preset(name: str) -> bool:
+    """Check if a preset is defined in the built-in presets.toml."""
+    if not PRESETS_FILE.exists():
+        return False
+    data = toml.loads(PRESETS_FILE.read_text(encoding="utf-8"))
+    return name in data and isinstance(data[name], dict)
+
+
+def create_custom_preset(name: str, data: dict) -> list[str]:
+    """Create a custom preset in configs/custom/presets/<name>.toml."""
+    _safe_variant(name)
+    if is_builtin_preset(name):
+        raise ValueError(f"Cannot overwrite built-in preset: {name}")
+    CUSTOM_PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+    _save(
+        CUSTOM_PRESETS_DIR / f"{name}.toml",
+        _normalize_lora_fp32_compute(_strip_neutral_resume_defaults(data)),
+    )
+    return list_presets()
+
+
+def delete_custom_preset(name: str) -> list[str]:
+    """Delete a custom preset. Built-in presets cannot be deleted."""
+    _safe_variant(name)
+    if is_builtin_preset(name):
+        raise ValueError(f"Cannot delete built-in preset: {name}")
+    path = CUSTOM_PRESETS_DIR / f"{name}.toml"
+    if not path.exists():
+        raise ValueError(f"Custom preset not found: {name}")
+    path.unlink()
+    return list_presets()
+
+
+# ── Merge chain ────────────────────────────────────────────────
+
+
+def _validation_enabled_from_datasets(datasets: Any) -> Optional[bool]:
+    if not isinstance(datasets, list) or not datasets:
+        return None
+    first = datasets[0]
+    if not isinstance(first, dict):
+        return None
+    vsn = first.get("validation_split_num")
+    vs = first.get("validation_split")
+    if vsn is None and vs is None:
+        return None
+    return (vsn or 0) > 0 or (vs or 0.0) > 0.0
+
+
+def _base_validation_enabled(base_data: dict) -> bool:
+    return bool(_validation_enabled_from_datasets(base_data.get("datasets")))
+
+
+def _base_validation_split_num(base_data: dict) -> int:
+    datasets = base_data.get("datasets")
+    if not isinstance(datasets, list) or not datasets:
+        return 0
+    first = datasets[0]
+    if not isinstance(first, dict):
+        return 0
+    vsn = first.get("validation_split_num")
+    return int(vsn) if vsn is not None else 0
+
+
+def _base_batch_size(base_data: dict) -> int:
+    datasets = base_data.get("datasets")
+    if not isinstance(datasets, list) or not datasets:
+        return 1
+    first = datasets[0]
+    if not isinstance(first, dict):
+        return 1
+    bs = first.get("batch_size")
+    return int(bs) if bs is not None else 1
+
+
+def _base_num_repeats(base_data: dict) -> int:
+    """Read num_repeats from the first subset of the first dataset in *base_data*."""
+    datasets = base_data.get("datasets")
+    if not isinstance(datasets, list) or not datasets:
+        return 1
+    first_ds = datasets[0]
+    if not isinstance(first_ds, dict):
+        return 1
+    subsets = first_ds.get("subsets")
+    if not isinstance(subsets, list) or not subsets:
+        return 1
+    first_sub = subsets[0]
+    if not isinstance(first_sub, dict):
+        return 1
+    nr = first_sub.get("num_repeats")
+    return int(nr) if nr is not None else 1
+
+
+def _base_sample_ratio(base_data: dict) -> float:
+    """Read sample_ratio from the first subset of the first dataset in *base_data*."""
+    datasets = base_data.get("datasets")
+    if not isinstance(datasets, list) or not datasets:
+        return 1.0
+    first_ds = datasets[0]
+    if not isinstance(first_ds, dict):
+        return 1.0
+    subsets = first_ds.get("subsets")
+    if not isinstance(subsets, list) or not subsets:
+        return 1.0
+    first_sub = subsets[0]
+    if not isinstance(first_sub, dict):
+        return 1.0
+    sr = first_sub.get("sample_ratio")
+    return float(sr) if sr is not None else 1.0
+
+
+def merged_gui_variant_preset(variant: str, preset: str) -> tuple[dict, dict[str, str]]:
+    """Merge model paths + base + preset + gui-methods/<variant>.toml.
+
+    Returns (merged_dict, origin_map) where origin_map[key] is
+    'base' | 'preset' | 'method'.
+    """
+    _safe_variant(variant)
+    from library.config.io import _filter_gui_preset_for_method
+    from library.config.model_paths import load_model_config
+
+    base = _canonicalize_lora_fp32_compute_layer(_load(CONFIGS_DIR / "base.toml"))
+    model = _canonicalize_lora_fp32_compute_layer(load_model_config(CONFIGS_DIR))
+    pset = _canonicalize_lora_fp32_compute_layer(_load_all_presets().get(preset, {}))
+    meth = _effective_variant(variant)
+    merged: dict = {}
+    origin: dict[str, str] = {}
+
+    def _merge_layer(layer: dict, src: str) -> None:
+        for k, v in layer.items():
+            if isinstance(v, dict) and k not in _SKIP:
+                # Flatten nested TOML sections (e.g. [preview]) into
+                # top-level keys so they appear individually in the WebUI.
+                for sub_k, sub_v in v.items():
+                    merged[sub_k] = sub_v
+                    origin[sub_k] = src
+            else:
+                merged[k] = v
+                origin[k] = src
+
+    _merge_layer(base, "base")
+    _merge_layer(model, "base")
+    _merge_layer(_filter_gui_preset_for_method(pset, meth), "preset")
+    _merge_layer(meth, "method")
+
+    # The V100 FP16 protection is intentionally tri-state. An omitted
+    # lora_fp32_compute lets train.py auto-enable it only for V100/sm_70 FP16;
+    # explicit true/false force the user's choice. Surface the omitted state as
+    # "auto" in the WebUI; the training merge consumes that sentinel before
+    # network kwargs are built.
+    if merged.get("network_module") == "networks.lora_anima":
+        if "lora_fp32_compute" not in merged:
+            merged["lora_fp32_compute"] = "auto"
+            origin["lora_fp32_compute"] = "base"
+    else:
+        merged.pop("lora_fp32_compute", None)
+        origin.pop("lora_fp32_compute", None)
+
+    # Inject virtual keys from [[datasets]]
+    variant_override = _validation_enabled_from_datasets(meth.get("datasets"))
+    if variant_override is not None:
+        merged["use_valid"] = variant_override
+        origin["use_valid"] = "method"
+    else:
+        merged["use_valid"] = _base_validation_enabled(base)
+        origin["use_valid"] = "base"
+
+    datasets = meth.get("datasets")
+    variant_vsn = None
+    if isinstance(datasets, list) and datasets and isinstance(datasets[0], dict):
+        vsn = datasets[0].get("validation_split_num")
+        if vsn is not None:
+            try:
+                variant_vsn = int(vsn)
+            except (TypeError, ValueError):
+                pass
+
+    if variant_vsn is not None:
+        merged["validation_split_num"] = variant_vsn
+        origin["validation_split_num"] = "method"
+    else:
+        merged["validation_split_num"] = _base_validation_split_num(base)
+        origin["validation_split_num"] = "base"
+
+    # batch_size virtual key
+    variant_bs = None
+    if isinstance(datasets, list) and datasets and isinstance(datasets[0], dict):
+        bs = datasets[0].get("batch_size")
+        if bs is not None:
+            try:
+                variant_bs = int(bs)
+            except (TypeError, ValueError):
+                pass
+
+    if variant_bs is not None:
+        merged["batch_size"] = variant_bs
+        origin["batch_size"] = "method"
+    else:
+        merged["batch_size"] = _base_batch_size(base)
+        origin["batch_size"] = "base"
+
+    # num_repeats virtual key (subset-level: datasets[0].subsets[0].num_repeats)
+    variant_nr = None
+    if isinstance(datasets, list) and datasets and isinstance(datasets[0], dict):
+        subsets = datasets[0].get("subsets")
+        if isinstance(subsets, list) and subsets and isinstance(subsets[0], dict):
+            nr = subsets[0].get("num_repeats")
+            if nr is not None:
+                try:
+                    variant_nr = int(nr)
+                except (TypeError, ValueError):
+                    pass
+
+    if variant_nr is not None:
+        merged["num_repeats"] = variant_nr
+        origin["num_repeats"] = "method"
+    else:
+        merged["num_repeats"] = _base_num_repeats(base)
+        origin["num_repeats"] = "base"
+
+    # sample_ratio virtual key (subset-level: datasets[0].subsets[0].sample_ratio)
+    variant_sr = None
+    if isinstance(datasets, list) and datasets and isinstance(datasets[0], dict):
+        subsets = datasets[0].get("subsets")
+        if isinstance(subsets, list) and subsets and isinstance(subsets[0], dict):
+            sr = subsets[0].get("sample_ratio")
+            if sr is not None:
+                try:
+                    variant_sr = float(sr)
+                except (TypeError, ValueError):
+                    pass
+
+    if variant_sr is not None:
+        merged["sample_ratio"] = variant_sr
+        origin["sample_ratio"] = "method"
+    else:
+        merged["sample_ratio"] = _base_sample_ratio(base)
+        origin["sample_ratio"] = "base"
+
+    # Resume & Warm-start keys are not in base.toml (base.toml is overwritten by
+    # `make update`), so inject them with neutral defaults so the group always
+    # renders in the form. A value already present at the method layer wins.
+    for key, default in {**_RESUME_DEFAULTS, **_REGEX_SET_DEFAULTS}.items():
+        if key not in merged:
+            merged[key] = default
+            origin[key] = "method"  # editable on built-in presets
+
+    if merged.get("use_lokr") is True and "lokr_backend" not in merged:
+        merged["lokr_backend"] = "torch"
+        origin["lokr_backend"] = "method"
+
+    return merged, origin
+
+
+# ── Field metadata for the frontend ────────────────────────────
+
+
+def _field_visibility(key: str) -> list[dict[str, list[Any]]] | None:
+    """Declare display dependencies without dropping inactive saved values.
+
+    Each clause is an AND of accepted values; clauses are ORed. The frontend
+    evaluates against the current draft, including legacy network_args, so
+    toggling a feature reveals its existing settings without a save/reload.
+    """
+    disabled = [None, False]
+    moe = ["shared_A", "independent_A"]
+    conditions: list[dict[str, list[Any]]] | None = None
+    module: dict[str, list[Any]] = {}
+    lora_only = {
+        "use_lokr",
+        "use_glokr",
+        "use_loha",
+        "use_ve",
+        "use_dylora",
+        "use_ortho",
+        "use_ortho_init",
+        "use_timestep_mask",
+        "use_moe_style",
+        "use_chimera_hydra",
+        "min_rank",
+        "alpha_rank_scale",
+        "down_init",
+        "decompose_both",
+        "route_per_layer",
+        "router_source",
+        "num_experts",
+        "router_targets",
+        "balance_loss_weight",
+        "balance_loss_warmup_ratio",
+        "per_bucket_balance_weight",
+        "num_sigma_buckets",
+        "specialize_experts_by_sigma_buckets",
+        "sigma_bucket_boundaries",
+        "sigma_feature_dim",
+        "channel_scaling_alpha",
+        "network_reg_dims",
+        "network_reg_lrs",
+        "network_reg_alphas",
+        "lora_fp32_compute",
+    }
+    if key in lora_only or key.startswith(("lokr_", "glokr_", "dylora_", "vera_")):
+        module = {"network_module": [None, "networks.lora_anima"]}
+
+    for prefix, flag in (
+        ("lokr_", "use_lokr"),
+        ("glokr_", "use_glokr"),
+        ("dylora_", "use_dylora"),
+        ("vera_", "use_ve"),
+        ("sigma_lowres_", "sigma_lowres"),
+    ):
+        if key.startswith(prefix):
+            conditions = [{flag: [True]}]
+            break
+    if key == "decompose_both":
+        conditions = [{"use_lokr": [True]}, {"use_glokr": [True]}]
+    elif key in {"min_rank", "alpha_rank_scale"}:
+        conditions = [{"use_timestep_mask": [True]}]
+    elif key in {"route_per_layer", "router_source", "num_experts"}:
+        conditions = [{"use_moe_style": moe, "use_chimera_hydra": disabled}]
+    elif key in {
+        "router_targets",
+        "balance_loss_weight",
+        "balance_loss_warmup_ratio",
+        "network_router_lr_scale",
+    }:
+        conditions = [{"use_moe_style": moe}, {"use_chimera_hydra": [True]}]
+    elif key == "num_sigma_buckets":
+        conditions = [{"use_moe_style": moe, "use_chimera_hydra": disabled}]
+    elif key == "per_bucket_balance_weight":
+        conditions = [
+            {
+                "use_moe_style": ["shared_A"],
+                "use_chimera_hydra": disabled,
+                "router_source": ["sigma"],
+                "route_per_layer": [None, True],
+            }
+        ]
+    elif key in {"specialize_experts_by_sigma_buckets", "sigma_bucket_boundaries"}:
+        conditions = [{"use_moe_style": ["shared_A"], "use_chimera_hydra": disabled}]
+        if key == "sigma_bucket_boundaries":
+            conditions[0]["specialize_experts_by_sigma_buckets"] = [True]
+    elif key == "sigma_feature_dim":
+        conditions = [
+            {"use_moe_style": moe, "router_source": ["sigma"]},
+            {"use_chimera_hydra": [True], "freq_router_mode": [None, "learned"]},
+        ]
+    elif key in {"fei_feature_dim", "fei_sigma_low_div"}:
+        conditions = [
+            {"use_moe_style": moe, "router_source": ["fei"]},
+            {"use_chimera_hydra": [True]},
+        ]
+    elif key in {"router_hidden_dim", "router_hidden", "router_tau"}:
+        conditions = [
+            {"use_moe_style": moe, "route_per_layer": [False]},
+            {"use_chimera_hydra": [True]},
+        ]
+    elif key in {
+        "num_experts_content",
+        "num_experts_freq",
+        "balance_w_content",
+        "balance_w_freq",
+        "network_content_router_lr_scale",
+        "network_freq_router_lr_scale",
+    } or key.startswith(("chimera_", "content_router_", "freq_router_")):
+        conditions = [{"use_chimera_hydra": [True]}]
+        if key == "freq_router_tau":
+            conditions[0]["freq_router_mode"] = ["fei"]
+        elif key in {
+            "freq_router_layer_norm",
+            "network_freq_router_lr_scale",
+            "balance_w_freq",
+        }:
+            conditions[0]["freq_router_mode"] = [None, "learned"]
+        elif key == "freq_router_init_std":
+            # The centered learned router always initializes at zero.
+            conditions = []
+    elif key == "down_init":
+        conditions = [
+            {
+                "use_lokr": disabled,
+                "use_glokr": disabled,
+                "use_loha": disabled,
+                "use_ve": disabled,
+                "use_dylora": disabled,
+                "use_ortho": disabled,
+                "use_ortho_init": disabled,
+                "use_moe_style": disabled,
+                "use_chimera_hydra": disabled,
+            }
+        ]
+    elif key == "channel_scaling_alpha":
+        conditions = [
+            {"use_lokr": disabled, "use_glokr": disabled, "use_loha": disabled}
+        ]
+    elif key == "use_repa" or key.startswith("repa_"):
+        module = {
+            "network_module": [
+                None,
+                "networks.lora_anima",
+                "networks.methods.easycontrol",
+            ]
+        }
+        if key != "use_repa":
+            conditions = [{"use_repa": [True]}]
+            if key.startswith("repa_dog_"):
+                conditions[0]["repa_target_dog"] = [None, True]
+    elif key == "train_adaln" or key.startswith("adaln_"):
+        module = {
+            "network_module": [
+                None,
+                "networks.lora_anima",
+                "networks.methods.easycontrol",
+            ]
+        }
+        if key != "train_adaln":
+            conditions = [{"train_adaln": [True]}]
+    elif key == "network_alpha":
+        conditions = [
+            {
+                "network_module": [
+                    None,
+                    "networks.lora_anima",
+                    "networks.methods.easycontrol",
+                ]
+            }
+        ]
+    elif key == "network_dim":
+        conditions = [
+            {
+                "network_module": [
+                    None,
+                    "networks.lora_anima",
+                    "networks.methods.easycontrol",
+                    "networks.methods.soft_tokens",
+                ]
+            }
+        ]
+    elif key == "validation_split_num":
+        conditions = [{"use_valid": [True]}]
+    elif key in {"compile_dynamic_seq", "compile_mode", "activation_memory_budget"}:
+        conditions = [{"torch_compile": [True]}]
+    elif key == "unsloth_offload_checkpointing":
+        conditions = [{"gradient_checkpointing": [True]}]
+    elif key == "sigmoid_bias":
+        conditions = [{"timestep_sampling": [None, "sigmoid"]}]
+    elif key.startswith("convrot_"):
+        conditions = [{"base_compute": ["w8a16_convrot", "w8a8_convrot"]}]
+        if key == "convrot_prequant_path":
+            conditions[0]["convrot_weight_source"] = ["prequant_checkpoint"]
+        elif key == "convrot_large_min_in_features":
+            conditions[0]["convrot_large_layer_mode"] = ["w8a16", "w8a8"]
+
+    if conditions is None:
+        return [module] if module else None
+    return [{**module, **condition} for condition in conditions]
+
+
+def _field_desc(key: str, lang: str) -> str | None:
+    """Return the localized description for *key* from FIELD_HELP."""
+    return _pre_field_help_lang(key, lang) or _field_help_lang(key, lang)
+
+
+def _field_desc_en(key: str) -> str | None:
+    """Return the English description for *key* from FIELD_HELP."""
+    return _pre_field_help_lang(key, "en") or _field_help_lang(key, "en")
+
+
+def get_field_type(key: str, value: Any) -> str:
+    """Map a Python value + key to a frontend widget type."""
+    if key in _REGEX_SET_KEYS:
+        return "regex_set"
+    if key in _SELECT_OPTIONS:
+        return "select"
+    if key == "sample_sampler":
+        return "select"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, list):
+        return "list"
+    return "str"
+
+
+def build_merged_config(variant: str, preset: str, lang: str = "cn") -> dict:
+    """Build the full merged config with field metadata for the frontend.
+
+    Returns a dict with ``fields`` (list of FieldMeta-like dicts),
+    ``variant``, and ``preset``.
+    """
+    merged, origin = merged_gui_variant_preset(variant, preset)
+    custom_preset = not is_builtin_preset(preset)
+    return describe_config(
+        merged, origin, variant, preset, lang, custom_preset=custom_preset
+    )
+
+
+def describe_config(
+    merged: dict,
+    origin: dict,
+    variant: str,
+    preset: str,
+    lang: str,
+    *,
+    custom_preset: bool = False,
+) -> dict:
+    """Describe an already pinned config without reading mutable presets."""
+    fields = []
+    for key, value in sorted(merged.items()):
+        if key in _SKIP:
+            continue
+        ftype = get_field_type(key, value)
+        orig = origin.get(key, "base")
+        # Custom presets: all fields are editable (user owns the preset)
+        # Built-in presets: only method-layer fields are editable
+        if custom_preset:
+            read_only = False
+        else:
+            read_only = (
+                orig in ("base", "preset") and key not in _EDITABLE_INHERITED_KEYS
+            )
+        fields.append(
+            {
+                "key": key,
+                "value": value,
+                "origin": orig,
+                "field_type": ftype,
+                # Keep the named group (_K2G) so fields land in their section
+                # (Training / Architecture / ...). The frontend's "basic" group
+                # is reserved for a compact card driven by is_basic; mapping
+                # _BASIC keys to group="basic" here would pull them OUT of their
+                # named section, so don't do that.
+                "group": _K2G.get(key),
+                "is_basic": key in _BASIC,
+                "is_virtual": key in _VIRTUAL_KEYS,
+                "read_only": read_only,
+                "visible_when": _field_visibility(key),
+                "options": (
+                    _SAMPLER_CHOICES
+                    if key == "sample_sampler"
+                    else _SELECT_OPTIONS.get(key)
+                ),
+                "description": _field_desc(key, lang),
+                "description_en": _field_desc_en(key),
+            }
+        )
+    return {"fields": fields, "variant": variant, "preset": preset}
+
+
+# ── Read/write single layers ───────────────────────────────────
+
+
+def read_layer(layer: str, variant: str = "lora", preset: str = "default") -> dict:
+    """Read a single config layer as a dict."""
+    if layer == "base":
+        return _load(CONFIGS_DIR / "base.toml")
+    if layer == "preset":
+        return _load_all_presets().get(preset, {})
+    if layer == "method":
+        _safe_variant(variant)
+        return _load(_resolve_variant_path(variant))
+    raise ValueError(f"Unknown layer: {layer}")
+
+
+def write_layer(
+    layer: str, data: dict, variant: str = "lora", preset: str = "default"
+) -> None:
+    """Write a single config layer. Only method layer is user-editable."""
+    if layer == "base":
+        raise ValueError("base.toml is read-only; edit via custom/variants/ overlays")
+    if layer == "preset":
+        raise ValueError(
+            "presets.toml is read-only; create custom presets in custom/presets/"
+        )
+    if layer == "method":
+        _safe_variant(variant)
+        if variant.startswith("custom/"):
+            path = _resolve_variant_path(variant)
+        else:
+            path = CUSTOM_VARIANTS_DIR / f"{variant}.toml"
+        _save(path, data)
+    else:
+        raise ValueError(f"Unknown layer: {layer}")
+
+
+def apply_validation_choice(
+    out: dict,
+    enabled: bool,
+    split_num: Optional[int] = None,
+    base_split_num: Optional[int] = None,
+) -> None:
+    """Encode the use_valid checkbox into the variant TOML dict."""
+    existing = out.get("datasets")
+    if enabled:
+        keep_override = (
+            split_num is not None
+            and split_num > 0
+            and split_num != (base_split_num or 0)
+        )
+        if keep_override:
+            if not isinstance(existing, list):
+                existing = []
+                out["datasets"] = existing
+            if not existing:
+                existing.append({})
+            first = existing[0]
+            if not isinstance(first, dict):
+                first = {}
+                existing[0] = first
+            first["validation_split_num"] = int(split_num)
+            first.pop("validation_split", None)
+            return
+        if not isinstance(existing, list) or not existing:
+            return
+        first = existing[0]
+        if not isinstance(first, dict):
+            return
+        first.pop("validation_split_num", None)
+        first.pop("validation_split", None)
+        if not first and len(existing) == 1:
+            del out["datasets"]
+        return
+
+    if not isinstance(existing, list):
+        existing = []
+        out["datasets"] = existing
+    if not existing:
+        existing.append({})
+    first = existing[0]
+    if not isinstance(first, dict):
+        first = {}
+        existing[0] = first
+    first["validation_split_num"] = 0
+    first["validation_split"] = 0.0
+
+
+def _apply_batch_size(out: dict, value: int, base_value: int) -> None:
+    """Write or strip the batch_size override in the variant TOML's [[datasets]]."""
+    existing = out.get("datasets")
+    if value != base_value:
+        # Write override
+        if not isinstance(existing, list):
+            existing = []
+            out["datasets"] = existing
+        if not existing:
+            existing.append({})
+        first = existing[0]
+        if not isinstance(first, dict):
+            first = {}
+            existing[0] = first
+        first["batch_size"] = value
+        return
+    # Same as base — strip override to keep variant TOML clean
+    if not isinstance(existing, list) or not existing:
+        return
+    first = existing[0]
+    if not isinstance(first, dict):
+        return
+    first.pop("batch_size", None)
+    if not first and len(existing) == 1:
+        del out["datasets"]
+
+
+def _apply_num_repeats(out: dict, value: int, base_value: int) -> None:
+    """Write or strip the num_repeats override in the variant TOML's [[datasets.subsets]]."""
+    if value == base_value:
+        # Same as base — strip override to keep variant TOML clean
+        datasets = out.get("datasets")
+        if not isinstance(datasets, list) or not datasets:
+            return
+        first_ds = datasets[0]
+        if not isinstance(first_ds, dict):
+            return
+        subsets = first_ds.get("subsets")
+        if not isinstance(subsets, list) or not subsets:
+            return
+        first_sub = subsets[0]
+        if not isinstance(first_sub, dict):
+            return
+        first_sub.pop("num_repeats", None)
+        # Clean up empty subset -> empty datasets chain
+        if not first_sub and len(subsets) == 1:
+            del first_ds["subsets"]
+            if not first_ds and len(datasets) == 1:
+                del out["datasets"]
+        return
+
+    # Write override — ensure datasets -> subsets chain exists
+    datasets = out.get("datasets")
+    if not isinstance(datasets, list):
+        datasets = []
+        out["datasets"] = datasets
+    if not datasets:
+        datasets.append({})
+    first_ds = datasets[0]
+    if not isinstance(first_ds, dict):
+        first_ds = {}
+        datasets[0] = first_ds
+    subsets = first_ds.get("subsets")
+    if not isinstance(subsets, list):
+        subsets = []
+        first_ds["subsets"] = subsets
+    if not subsets:
+        subsets.append({})
+    first_sub = subsets[0]
+    if not isinstance(first_sub, dict):
+        first_sub = {}
+        subsets[0] = first_sub
+    first_sub["num_repeats"] = value
+
+
+def _apply_sample_ratio(out: dict, value: float, base_value: float) -> None:
+    """Write or strip the sample_ratio override in the variant TOML's [[datasets.subsets]]."""
+    if math.isclose(value, base_value, rel_tol=1e-9):
+        # Same as base -- strip override to keep variant TOML clean
+        datasets = out.get("datasets")
+        if not isinstance(datasets, list) or not datasets:
+            return
+        first_ds = datasets[0]
+        if not isinstance(first_ds, dict):
+            return
+        subsets = first_ds.get("subsets")
+        if not isinstance(subsets, list) or not subsets:
+            return
+        first_sub = subsets[0]
+        if not isinstance(first_sub, dict):
+            return
+        first_sub.pop("sample_ratio", None)
+        # Clean up empty subset -> empty datasets chain
+        if not first_sub and len(subsets) == 1:
+            del first_ds["subsets"]
+            if not first_ds and len(datasets) == 1:
+                del out["datasets"]
+        return
+
+    # Write override -- ensure datasets -> subsets chain exists
+    datasets = out.get("datasets")
+    if not isinstance(datasets, list):
+        datasets = []
+        out["datasets"] = datasets
+    if not datasets:
+        datasets.append({})
+    first_ds = datasets[0]
+    if not isinstance(first_ds, dict):
+        first_ds = {}
+        datasets[0] = first_ds
+    subsets = first_ds.get("subsets")
+    if not isinstance(subsets, list):
+        subsets = []
+        first_ds["subsets"] = subsets
+    if not subsets:
+        subsets.append({})
+    first_sub = subsets[0]
+    if not isinstance(first_sub, dict):
+        first_sub = {}
+        subsets[0] = first_sub
+    first_sub["sample_ratio"] = value
+
+
+def _validate_regex_set(key: str, value: Any, *, is_int: bool) -> list[str]:
+    """Validate a ``network_reg_dims`` / ``network_reg_lrs`` kv-pair string.
+
+    Mirrors what ``networks.lora_anima.config._parse_kv_pairs`` will accept at
+    train time: comma-separated ``pattern=number`` segments, where *pattern*
+    must survive ``re.compile`` (fullmatch target) and must not contain a
+    literal comma (the trainer's parser splits on commas — a comma inside a
+    pattern would silently truncate it into two broken segments).
+    """
+    text = str(value or "").strip()
+    if not text:
+        return []
+    errors: list[str] = []
+    for segment in text.split(","):
+        segment = segment.strip()
+        if not segment:
+            continue
+        if "=" not in segment:
+            errors.append(f"{key}: expected 'regex=value', got {segment!r}")
+            continue
+        pattern, _, raw_value = segment.partition("=")
+        pattern = pattern.strip()
+        raw_value = raw_value.strip()
+        if not pattern:
+            errors.append(f"{key}: empty regex in {segment!r}")
+            continue
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            errors.append(f"{key}: invalid regex {pattern!r} ({exc})")
+            continue
+        try:
+            number = int(raw_value) if is_int else float(raw_value)
+        except ValueError:
+            kind = "integer" if is_int else "number"
+            errors.append(f"{key}: {raw_value!r} is not a valid {kind}")
+            continue
+        if number < 0:
+            errors.append(f"{key}: {raw_value!r} must be non-negative")
+    return errors
+
+
+def validate_config(data: dict) -> list[str]:
+    """Validate a config dict. Returns a list of error strings (empty = valid)."""
+    errors: list[str] = []
+    try:
+        from library.anima.compat import (
+            _network_options,
+            validate_lokr_training_options,
+        )
+
+        validate_lokr_training_options(
+            _network_options(data), int(data.get("anima_num_blocks", 28))
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        errors.append(str(exc))
+    if "learning_rate" in data:
+        lr = data["learning_rate"]
+        if (
+            type(lr) not in (int, float)
+            or (isinstance(lr, float) and not math.isfinite(lr))
+            or lr <= 0
+        ):
+            errors.append("learning_rate must be a finite positive number")
+    for key in ("network_dim", "max_train_epochs", "batch_size", "num_repeats"):
+        if key in data and (type(data[key]) is not int or data[key] < 1):
+            errors.append(f"{key} must be a positive integer")
+    if "sample_ratio" in data:
+        sr = data["sample_ratio"]
+        if type(sr) not in (int, float) or not (0.0 < sr <= 1.0):
+            errors.append(
+                "sample_ratio must be between 0.0 (exclusive) and 1.0 (inclusive)"
+            )
+    if "sample_decode_inline" in data:
+        value = data["sample_decode_inline"]
+        valid = isinstance(value, bool) or (
+            isinstance(value, str)
+            and value.strip().lower() in _SAMPLE_DECODE_INLINE_CHOICES
+        )
+        if not valid:
+            errors.append("sample_decode_inline must be auto, true, or false")
+    if "lora_fp32_compute" in data:
+        value = data["lora_fp32_compute"]
+        valid = isinstance(value, bool) or (
+            isinstance(value, str)
+            and value.strip().lower() in _LORA_FP32_COMPUTE_CHOICES
+        )
+        if not valid:
+            errors.append("lora_fp32_compute must be auto, true, or false")
+    if "base_compute" in data:
+        value = str(data["base_compute"] or "").strip().lower()
+        if value not in _BASE_COMPUTE_CHOICES:
+            errors.append("base_compute must be bf16, w8a16_convrot, or w8a8_convrot")
+    if "network_reg_dims" in data:
+        errors.extend(
+            _validate_regex_set(
+                "network_reg_dims", data["network_reg_dims"], is_int=True
+            )
+        )
+    if "network_reg_lrs" in data:
+        errors.extend(
+            _validate_regex_set(
+                "network_reg_lrs", data["network_reg_lrs"], is_int=False
+            )
+        )
+    if "convrot_group_size" in data:
+        value = data["convrot_group_size"]
+        if type(value) is not int or value not in {64, 256, 1024}:
+            errors.append("convrot_group_size must be 64, 256, or 1024")
+    if "convrot_hadamard" in data:
+        value = str(data["convrot_hadamard"] or "").strip().lower()
+        if value not in _CONVROT_HADAMARD_CHOICES:
+            errors.append("convrot_hadamard must be sylvester or regular")
+    if "convrot_scope" in data:
+        try:
+            from library.runtime.convrot.scope import selected_convrot_modules
+
+            selected_convrot_modules(str(data["convrot_scope"] or ""))
+        except ValueError as exc:
+            errors.append(str(exc).replace("int8 linear", "ConvRot"))
+    if "convrot_weight_source" in data or "convrot_prequant_path" in data:
+        source = (
+            str(data.get("convrot_weight_source") or "online_from_bf16").strip().lower()
+        )
+        if source not in _CONVROT_WEIGHT_SOURCE_CHOICES:
+            errors.append(
+                "convrot_weight_source must be online_from_bf16 or prequant_checkpoint"
+            )
+        prequant_path = str(data.get("convrot_prequant_path") or "").strip()
+        if source == "prequant_checkpoint" and not prequant_path:
+            errors.append("convrot_prequant_path is required for prequant_checkpoint")
+        if source == "online_from_bf16" and prequant_path:
+            errors.append(
+                "convrot_prequant_path is only valid with prequant_checkpoint"
+            )
+    if "convrot_min_in_features" in data:
+        value = data["convrot_min_in_features"]
+        if type(value) is not int or value < 0:
+            errors.append("convrot_min_in_features must be a non-negative integer")
+    if "convrot_large_layer_mode" in data or "convrot_large_min_in_features" in data:
+        mode = str(data.get("convrot_large_layer_mode") or "none").strip().lower()
+        threshold = data.get("convrot_large_min_in_features", 0)
+        if mode not in {
+            "none",
+            "w8a16",
+            "w8a8",
+            "w8a16_convrot",
+            "w8a8_convrot",
+        }:
+            errors.append("convrot_large_layer_mode must be none, w8a16, or w8a8")
+        if type(threshold) is not int or threshold < 0:
+            errors.append(
+                "convrot_large_min_in_features must be a non-negative integer"
+            )
+        elif mode in {"none", "off", ""} and threshold > 0:
+            errors.append(
+                "convrot_large_min_in_features requires convrot_large_layer_mode"
+            )
+        elif mode not in {"none", "off", ""} and threshold <= 0:
+            errors.append(
+                "convrot_large_layer_mode requires convrot_large_min_in_features > 0"
+            )
+    if data.get("use_lokr") is True and data.get("use_timestep_mask") is True:
+        errors.append("use_timestep_mask is not supported by LoKr; set it to false")
+    return errors
+
+
+def save_variant_config(variant: str, data: dict) -> None:
+    """Save user-edited config fields back to the variant TOML.
+
+    Separates virtual keys (written into [[datasets]] blocks) from
+    flat TOML keys. Skips ``_SKIP`` keys and keys that match the
+    merged base+preset values (no-op saves).
+
+    If ``data`` contains an ``extra_args`` key with a non-empty string,
+    it is parsed as TOML and merged as overrides (extra_args win on
+    conflicts with form values).
+    """
+    _safe_variant(variant)
+    data = dict(data)  # copy to avoid mutating caller's dict
+    if variant.startswith("custom/"):
+        path = _resolve_variant_path(variant)
+    else:
+        # Built-in variant: always save to custom overlay, never to template
+        path = CUSTOM_VARIANTS_DIR / f"{variant}.toml"
+    current = _canonicalize_lora_fp32_compute_layer(_load(path))
+
+    # Handle extra_args: parse as TOML and merge as overrides
+    extra_text = data.pop("extra_args", None)
+    extras: dict = {}
+    if extra_text is not None and not isinstance(extra_text, str):
+        raise ValueError("extra_args must be TOML text")
+    if isinstance(extra_text, str) and extra_text.strip():
+        text = extra_text.strip()
+        try:
+            parsed = toml.loads(text)
+        except toml.TomlDecodeError as exc:
+            # Windows path backslash workaround: bare backslashes break TOML
+            if "\\" in text:
+                try:
+                    parsed = toml.loads(text.replace("\\", "/"))
+                except toml.TomlDecodeError as retry:
+                    raise ValueError(f"Invalid extra_args TOML: {retry}") from retry
+            else:
+                raise ValueError(f"Invalid extra_args TOML: {exc}") from exc
+        extras = {k: v for k, v in parsed.items() if not isinstance(v, dict)}
+
+    # Validate the values that will actually be saved, before virtual values
+    # are converted to dataset fields or removed from the flat config.
+    data.update(extras)
+    stem = variant.split("/", 1)[-1]
+    candidate = {**_load(GUI_METHODS_DIR / f"{stem}.toml"), **current, **data}
+    errors = validate_config(candidate)
+    if errors:
+        raise ValueError("; ".join(errors))
+
+    # Handle virtual keys
+    use_valid = data.pop("use_valid", None)
+    vsn = data.pop("validation_split_num", None)
+    bs = data.pop("batch_size", None)
+    nr = data.pop("num_repeats", None)
+    sr = data.pop("sample_ratio", None)
+    if use_valid is not None:
+        base = _load(CONFIGS_DIR / "base.toml")
+        base_vsn = _base_validation_split_num(base)
+        apply_validation_choice(current, use_valid, vsn, base_vsn)
+
+    if bs is not None:
+        base = _load(CONFIGS_DIR / "base.toml")
+        base_bs = _base_batch_size(base)
+        _apply_batch_size(current, int(bs), base_bs)
+
+    if nr is not None:
+        base = _load(CONFIGS_DIR / "base.toml")
+        base_nr = _base_num_repeats(base)
+        _apply_num_repeats(current, int(nr), base_nr)
+
+    if sr is not None:
+        base = _load(CONFIGS_DIR / "base.toml")
+        base_sr = _base_sample_ratio(base)
+        _apply_sample_ratio(current, float(sr), base_sr)
+
+    # Write flat keys. Strip Resume & Warm-start keys left at their neutral
+    # default (empty path / False) so the variant TOML stays clean and the
+    # flag isn't forwarded to train.py as a literal empty/false arg.
+    # Regex-set keys get the same treatment: an empty string means "feature
+    # off" and must not land in the TOML (train.py forwards any non-None
+    # top-level value into the network kwargs).
+    for key, value in data.items():
+        if key in _SKIP:
+            continue
+        if key in _REGEX_SET_KEYS:
+            normalized = str(value or "").strip()
+            if normalized:
+                current[key] = normalized
+            else:
+                current.pop(key, None)
+            continue
+        if key == "sample_decode_inline":
+            normalized = str(value).strip().lower()
+            if normalized not in _SAMPLE_DECODE_INLINE_CHOICES:
+                raise ValueError("sample_decode_inline must be auto, true, or false")
+            if normalized == "auto":
+                current.pop(key, None)
+            else:
+                current[key] = normalized == "true"
+            continue
+        if key == "lora_fp32_compute":
+            current[key] = value
+            continue
+        if _is_neutral_resume_value(key, value):
+            current.pop(key, None)
+            continue
+        current[key] = value
+
+    # Keep an explicit auto sentinel at the method layer so it can clear a
+    # custom preset's true/false. The training config loader consumes this
+    # sentinel after all layers have merged and does not forward it as a
+    # network kwarg.
+    current = _normalize_lora_fp32_compute(current, keep_auto=True)
+
+    # Validate the prospective effective method config, not only the sparse
+    # overlay. Built-in LoKR flags live in gui-methods/lokr.toml while a user
+    # overlay may contain only network_dim, so validating the overlay alone
+    # would miss the deprecated sentinel.
+    stem = variant.split("/", 1)[-1]
+    candidate = _load(GUI_METHODS_DIR / f"{stem}.toml")
+    candidate.update(current)
+    errors = validate_config(candidate)
+    if errors:
+        raise ValueError("; ".join(errors))
+
+    _save(path, current)
+
+
+# ── Prelaunch checks (cache + checkpoint) ───────────────────────
+
+# Cache-file suffixes
+_LATENT_SUFFIX = "_anima.npz"
+_TE_SUFFIX = "_anima_te.safetensors"
+_PE_SUFFIX = "_anima_pe.safetensors"
+
+# Variant families that require PE cache
+_PE_REQUIRED_FAMILIES = {"ip_adapter", "easycontrol"}
+
+
+def count_preprocess_caches(cache_dir: Path) -> dict[str, int]:
+    """Count latent / TE / PE cache sidecars under *cache_dir*."""
+    out = {"latents": 0, "te": 0, "pe": 0}
+    if not cache_dir.is_dir():
+        return out
+    for p in cache_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        n = p.name
+        if n.endswith(_TE_SUFFIX):
+            out["te"] += 1
+        elif n.endswith(_PE_SUFFIX):
+            out["pe"] += 1
+        elif n.endswith(_LATENT_SUFFIX):
+            out["latents"] += 1
+    return out
+
+
+def find_resumable_checkpoint(merged: dict) -> tuple[Path, int] | None:
+    """Check for a resumable checkpoint state directory.
+
+    Returns ``(state_dir, current_step)`` or ``None``. Checks two candidate
+    dirs (newest first):
+      1. ``<output_name>-checkpoint-state`` — mid-training snapshot written by
+         ``checkpointing_epochs`` (only consulted when it is set).
+      2. ``<output_name>-state`` — end-of-training snapshot written by
+         ``save_state_on_train_end`` (consulted when it is set), so a finished
+         run can be continued.
+    """
+    output_dir = merged.get("output_dir")
+    output_name = merged.get("output_name") or "last"
+    if not output_dir:
+        return None
+    from library.anima.compat import validate_resume_model_signature
+    from library.io.output_layout import resolve_output_layout, safe_output_name
+    from library.training.state import read_train_state, state_is_complete
+
+    raw_base = Path(str(output_dir))
+    base_path = raw_base if raw_base.is_absolute() else ROOT / raw_base
+    safe_name = safe_output_name(output_name)
+    layout = resolve_output_layout(base_path, safe_name)
+    roots: list[Path] = []
+    for root in layout.legacy_candidates():
+        if root not in roots:
+            roots.append(root)
+
+    # Explicit stop wins, then the rolling checkpoint, then a normal end state.
+    # The latter two remain gated by their historical save flags to avoid
+    # surprising a user who intentionally disabled auto-resume; interrupted
+    # states are always considered because they represent an explicit stop.
+    suffixes = [f"{safe_name}-interrupted-state", f"{safe_name}-rolling-state"]
+    if merged.get("checkpointing_epochs"):
+        suffixes.append(f"{safe_name}-checkpoint-state")
+    if merged.get("save_state_on_train_end"):
+        suffixes.append(f"{safe_name}-state")
+    # An explicit daemon/CLI auto-resume request may opt into discovering old
+    # state even when the current GUI snapshot omitted the save flags. Keep the
+    # historical WebUI behavior (no flags => no prompt) otherwise.
+    if merged.get("auto_resume"):
+        for suffix in (f"{safe_name}-checkpoint-state", f"{safe_name}-state"):
+            if suffix not in suffixes:
+                suffixes.append(suffix)
+
+    seen: set[Path] = set()
+    eligible: list[tuple[int, int, int, Path]] = []
+    for root in roots:
+        for suffix in suffixes:
+            state_dir = root / suffix
+            if state_dir in seen or not state_is_complete(
+                state_dir, require_marker=True
+            ):
+                continue
+            seen.add(state_dir)
+            data = read_train_state(state_dir) or {}
+            expected_config = merged.get("config_signature")
+            expected_dataset = merged.get("dataset_signature")
+            if expected_config and data.get("config_signature") not in (
+                None,
+                expected_config,
+            ):
+                continue
+            if expected_dataset and data.get("dataset_signature") not in (
+                None,
+                expected_dataset,
+            ):
+                continue
+            try:
+                validate_resume_model_signature(
+                    data,
+                    expected_signature=merged.get("anima_model_signature"),
+                    num_blocks=merged.get("anima_num_blocks"),
+                )
+            except ValueError:
+                continue
+            step = int(data.get("global_step", data.get("current_step", 0)) or 0)
+            # Legacy states predate an explicit committed-step schema; retain
+            # their historical suffix order because their cursor may not match
+            # the binary payload. New schema states are ordered by max step.
+            modern = (
+                int(data.get("schema_version", 1) or 1) >= 2 and "global_step" in data
+            )
+            eligible.append(
+                (step, 0 if modern else -1, suffixes.index(suffix), state_dir)
+            )
+    if not eligible:
+        return None
+    step, modern, priority, state_dir = min(
+        eligible,
+        key=lambda item: (
+            (-item[0], item[2], str(item[3]))
+            if item[1] >= 0
+            else (0, item[2], str(item[3]))
+        ),
+    )
+    return state_dir, step
+
+
+def prelaunch_check(
+    variant: str,
+    preset: str,
+    preprocess_run: str | None = None,
+) -> dict:
+    """Check cache counts and checkpoint state for a training launch.
+
+    Returns a dict with cache_counts, has_cache, checkpoint info,
+    and whether PE cache is required.
+    """
+    merged, _origin = merged_gui_variant_preset(variant, preset)
+    errors = validate_config(merged)
+    if errors:
+        raise ValueError("; ".join(errors))
+
+    from library.anima.checkpoint import apply_layout_to_args
+    from library.anima.compat import (
+        preflight_anima_training,
+    )
+    from library.env import resolve_under_home
+
+    raw_model_path = merged.get("pretrained_model_name_or_path")
+    if not raw_model_path:
+        raise ValueError("pretrained_model_name_or_path is required")
+    model_path = str(resolve_under_home(str(raw_model_path)))
+    adapter_paths: list[str] = []
+    for value in (merged.get("network_weights"), merged.get("lora_path")):
+        if value:
+            adapter_paths.append(str(value))
+    base_weights = merged.get("base_weights") or []
+    if isinstance(base_weights, str):
+        base_weights = [base_weights]
+    adapter_paths.extend(str(path) for path in base_weights)
+    try:
+        model_layout, base_sha256, preflight = preflight_anima_training(
+            merged,
+            model_path,
+            adapter_paths=tuple(resolve_under_home(path) for path in adapter_paths),
+            raise_on_blockers=False,
+        )
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        raise ValueError(f"invalid Anima checkpoint: {exc}") from exc
+
+    identity = SimpleNamespace()
+    apply_layout_to_args(identity, model_layout, base_sha256)
+    merged.update(
+        {
+            "anima_arch": identity.anima_arch,
+            "anima_variant": identity.anima_variant,
+            "anima_num_blocks": identity.anima_num_blocks,
+            "anima_model_channels": identity.anima_model_channels,
+            "anima_base_sha256": identity.anima_base_sha256,
+            "anima_model_signature": identity.anima_model_signature,
+        }
+    )
+    compatibility = preflight.as_dict()
+
+    # Resolve cache directory. A selected preprocess manifest is authoritative;
+    # this keeps the preflight check aligned with train.py's run pinning.
+    selected_run = None
+    if preprocess_run:
+        from library.preprocess.runs import PreprocessRunError, run_from_manifest
+
+        try:
+            selected_run = run_from_manifest(preprocess_run)
+        except (PreprocessRunError, OSError, ValueError) as exc:
+            raise ValueError(f"invalid preprocess run: {exc}") from exc
+        cache_dir = selected_run.lora_cache_dir
+    else:
+        cache_dir_str = merged.get("lora_cache_dir", "post_image_dataset/lora")
+        cache_dir = Path(cache_dir_str)
+        if not cache_dir.is_absolute():
+            cache_dir = ROOT / cache_dir
+    cache_counts = count_preprocess_caches(cache_dir)
+
+    # Check if PE cache is required
+    meta = variant_metadata(variant)
+    family = meta.get("family", "")
+    requires_pe = family in _PE_REQUIRED_FAMILIES
+
+    has_cache = (
+        cache_counts["latents"] > 0
+        or cache_counts["te"] > 0
+        or (requires_pe and cache_counts["pe"] > 0)
+    )
+
+    # Check checkpoint
+    ckpt = find_resumable_checkpoint(merged)
+    checkpoint_info = None
+    if ckpt is not None:
+        state_dir, step = ckpt
+        checkpoint_info = {
+            "state_dir": str(state_dir),
+            "step": step,
+        }
+
+    return {
+        "cache_counts": cache_counts,
+        "has_cache": has_cache,
+        "checkpoint": checkpoint_info,
+        "requires_pe": requires_pe,
+        "preprocess_run": str(selected_run.manifest_path) if selected_run else None,
+        "model_layout": model_layout.as_dict(),
+        "compatibility": compatibility,
+    }
+
+
+def wipe_checkpoint(output_dir: str, output_name: str) -> None:
+    """Delete resumable checkpoint state dirs and their sidecar adapter file.
+
+    Clears both candidate resume dirs so the "Wipe & train" button fully resets
+    the run regardless of which flag (``checkpointing_epochs`` →
+    ``<name>-checkpoint-state``, or ``save_state_on_train_end`` →
+    ``<name>-state``) produced the snapshot.
+
+    Raises ``OSError`` if deletion fails.
+    """
+    from library.io.output_layout import (
+        OUTPUT_WEIGHT_EXTENSIONS,
+        remove_path_with_retry,
+        resolve_output_layout,
+        safe_output_name,
+    )
+
+    name = safe_output_name(output_name or "last")
+    # Browser-reachable: an absolute path must stay inside ROOT (or a root named
+    # by ANIMA_ALLOW_OUTSIDE_ROOTS), never delete files elsewhere on the disk.
+    parent = resolve_within(ROOT, output_dir)
+    layout = resolve_output_layout(parent, name)
+    roots: list[Path] = []
+    for root in layout.legacy_candidates():
+        if root not in roots:
+            roots.append(root)
+    for root in roots:
+        # Do not touch the final adapter, snapshot, or arbitrary historical
+        # epoch files. These are only resumable sidecars.
+        for suffix in (
+            "-interrupted-state",
+            "-rolling-state",
+            "-checkpoint-state",
+            "-state",
+        ):
+            remove_path_with_retry(root / f"{name}{suffix}")
+        for ext in OUTPUT_WEIGHT_EXTENSIONS:
+            for suffix in ("-interrupted", "-checkpoint"):
+                remove_path_with_retry(root / f"{name}{suffix}{ext}")
+
+
+# ── Sample prompts file I/O ────────────────────────────────────
+
+
+_NEG_PROMPT_RE = re.compile(r"n (.+)", re.IGNORECASE)
+_CN_RE = re.compile(r"cn (.+)", re.IGNORECASE)
+
+# A prompt file is plain text; refusing other extensions keeps the read/write
+# endpoint from doubling as an arbitrary-file primitive.
+_SAMPLE_PROMPT_SUFFIXES = (".txt",)
+
+
+def read_sample_prompts(path_str: str) -> list[dict]:
+    """Parse a sample_prompts.txt file into structured prompt entries.
+
+    Returns a list of ``{"prompt": str, "negative_prompt": str, "controlnet_image": str}`` dicts.
+    Lines starting with ``#`` and blank lines are skipped.
+    """
+    path = resolve_within(ROOT, path_str, suffixes=_SAMPLE_PROMPT_SUFFIXES)
+    if not path.is_file():
+        return []
+    entries: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(" --")
+        prompt = parts[0]
+        neg = ""
+        cn = ""
+        for part in parts[1:]:
+            m = _NEG_PROMPT_RE.match(part.strip())
+            if m:
+                neg = m.group(1).strip()
+                continue
+            m = _CN_RE.match(part.strip())
+            if m:
+                cn = m.group(1).strip()
+                continue
+        entry: dict[str, str] = {"prompt": prompt, "negative_prompt": neg}
+        if cn:
+            entry["controlnet_image"] = cn
+        entries.append(entry)
+    return entries
+
+
+def write_sample_prompts(path_str: str, entries: list[dict]) -> None:
+    """Write structured prompt entries back to a .txt file."""
+    path = resolve_within(ROOT, path_str, suffixes=_SAMPLE_PROMPT_SUFFIXES)
+    lines: list[str] = []
+    for entry in entries:
+        prompt = entry.get("prompt", "").strip()
+        if not prompt:
+            continue
+        parts = [prompt]
+        neg = entry.get("negative_prompt", "").strip()
+        cn = entry.get("controlnet_image", "").strip()
+        if neg:
+            parts.append(f"--n {neg}")
+        if cn:
+            parts.append(f"--cn {cn}")
+        lines.append(" ".join(parts))
+    atomic_write_text(path, "\n".join(lines) + "\n" if lines else "")
+
+
+# ── Field help + method guide ──────────────────────────────────
+
+
+def get_field_help_data(variant: str, lang: str = "cn") -> dict:
+    """Return field help dict + method guide HTML for the config editor.
+
+    Returns ``{"field_help": {key: text}, "guide_html": str}``.
+    """
+    _safe_variant(variant)
+    meta = variant_metadata(variant)
+    family = meta.get("family", variant)
+
+    # Collect all field help entries for the requested language (English fallback)
+    field_help: dict[str, str] = {}
+    for src_fn in (_read_preprocess_fields, _read_fields):
+        en_data = src_fn("en") if lang != "en" else {}
+        for key, text in src_fn(lang).items():
+            if text:
+                field_help[key] = text
+        # Fill in any keys present in English but missing in requested lang
+        for key, text in en_data.items():
+            if key not in field_help and text:
+                field_help[key] = text
+
+    # Load method guide HTML from webui/explanations/guides/
+    guide_html = _load_method_guide(family, lang)
+
+    return {"field_help": field_help, "guide_html": guide_html}
+
+
+_GUIDES_DIR = Path(__file__).resolve().parent.parent / "explanations" / "guides"
+_NOT_MERGEABLE = frozenset({"postfix", "hydralora", "reft", "fera"})
+_KNOWN_GUIDE_METHODS = frozenset(
+    {
+        "lora",
+        "tlora",
+        "postfix",
+        "hydralora",
+        "reft",
+        "fera",
+        "chimera",
+        "soft_tokens",
+        "easycontrol",
+        "colorize",
+        "turbo",
+        "spd",
+    }
+)
+
+
+def _read_guide(name: str, lang: str) -> str:
+    """Prefer locale directories, retaining legacy files and English fallback."""
+    language = lang if lang in ("en", "cn", "ja", "ko") else "en"
+    for locale in dict.fromkeys((language, "en")):
+        for path in (
+            _GUIDES_DIR / locale / f"{name}.html",
+            _GUIDES_DIR / f"{name}.{locale}.html",
+        ):
+            if path.is_file():
+                return path.read_text(encoding="utf-8")
+    return ""
+
+
+def _load_method_guide(method: str, lang: str = "cn") -> str:
+    """Assemble the full method guide HTML for the given method and language."""
+    if method not in _KNOWN_GUIDE_METHODS:
+        return ""
+    parts = [_read_guide("_apply_note", lang)]
+    if method in _NOT_MERGEABLE:
+        parts.append(_read_guide("_not_mergeable", lang))
+    parts.append(_read_guide(method, lang))
+    return "".join(parts)
+
+
+# ── WandB settings (persisted in webui_settings.json) ─────────────────
+
+_WANDB_DEFAULTS = {
+    "enabled": False,
+    "project": "anima-lora",
+    "run_name": "",
+    "api_key": "",
+    "log_every_n_steps": 50,
+    "log_gradients": True,
+    "log_weights": True,
+    "log_checkpoint_artifact": True,
+}
+
+_SETTINGS_FILE = _ROOT / "configs" / "webui_settings.json"
+
+
+def get_wandb_settings() -> dict:
+    """Read wandb settings from webui_settings.json, with defaults."""
+    if not _SETTINGS_FILE.exists():
+        return dict(_WANDB_DEFAULTS)
+    try:
+        data = json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return dict(_WANDB_DEFAULTS)
+    stored = data.get("wandb", {})
+    merged = dict(_WANDB_DEFAULTS)
+    merged.update(stored)
+    return merged
+
+
+def save_wandb_settings(settings: dict) -> dict:
+    """Write wandb settings to webui_settings.json. Returns saved settings."""
+    allowed_keys = set(_WANDB_DEFAULTS.keys())
+    filtered = {k: v for k, v in settings.items() if k in allowed_keys}
+
+    with CONFIG_WRITE_LOCK:
+        data = read_json_object(_SETTINGS_FILE)
+        existing_wandb = data.get("wandb", {})
+        if not isinstance(existing_wandb, dict):
+            raise ValueError("Stored wandb settings must be an object")
+        existing_wandb.update(filtered)
+        data["wandb"] = existing_wandb
+        atomic_write_text(
+            _SETTINGS_FILE, json.dumps(data, indent=2, ensure_ascii=False)
+        )
+        return {**_WANDB_DEFAULTS, **existing_wandb}

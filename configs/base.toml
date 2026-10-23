@@ -1,0 +1,88 @@
+test_prompt = "masterpiece, best quality, score_7, safe. An anime girl wearing a black tank-top and denim shorts is standing outdoors. She's holding a rectangular sign out in front of her that reads \"ANIMA\". She's looking at the viewer with a smile. The background features some trees and blue sky with clouds."
+test_negative_prompt = "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, sepia"
+output_dir = "output/ckpt"
+output_name = "anima_lora"
+save_model_as = "safetensors"
+logging_dir = "output/logs"
+training_comment = ""
+log_with = "tensorboard"
+network_module = "networks.lora_anima"
+network_train_unet_only = true
+resized_image_dir = "post_image_dataset/resized"
+lora_cache_dir = "post_image_dataset/lora"
+path_pattern = "*"
+optimizer_type = "AdamW"
+lr_scheduler = "constant"
+timestep_sampling = "sigmoid"
+sigmoid_bias = 0.0
+discrete_flow_shift = 1.0
+mixed_precision = "bf16"
+gradient_checkpointing = false
+unsloth_offload_checkpointing = false
+base_compute = "bf16"
+convrot_group_size = 256
+convrot_hadamard = "sylvester"
+convrot_scope = "mlp"
+convrot_weight_source = "online_from_bf16"
+convrot_prequant_path = ""
+convrot_min_in_features = 0
+convrot_largest_in_features_only = false
+convrot_large_layer_mode = "none"
+convrot_large_min_in_features = 0
+use_vae_cache = true
+use_text_cache = true
+skip_cache_check = true
+vae_chunk_size = 64
+vae_disable_cache = true
+# v2: masks are opt-in. `make mask` writes the tree, this key makes training
+# read it — the pair turns masking on; a mask dir left on disk alone does not.
+masked_loss = false
+torch_compile = true
+attn_mode = "flash"
+save_precision = "bf16"
+compile_dynamic_seq = true
+activation_memory_budget = 0.99
+log_every_n_steps = 2
+dataloader_pin_memory = true
+persistent_data_loader_workers = false
+max_data_loader_n_workers = 0
+use_cmmd = false
+channel_scaling_alpha = 0.5
+gradient_accumulation_steps = 1
+use_repa = false
+repa_target_dog = false
+sample_ratio = 1.0
+artists_shard = ""
+lr_warmup_steps = 0.05
+train_adaln = true
+adaln_rank = 16
+sigma_lowres = false
+sigma_lowres_route = "1024:896"
+sigma_lowres_threshold = 0.5
+sigma_lowres_span = "late:0.75"
+sigma_lowres_route2 = "1024:768"
+sigma_lowres_threshold2 = 0.65
+sigma_lowres_threshold2_max = 0.95
+sigma_lowres_span2 = "late:0.75"
+[[datasets]]
+batch_size = 1
+validation_split_num = 16
+validation_seed = 42
+[[datasets.subsets]]
+image_dir = "{resized_image_dir}"
+cache_dir = "{lora_cache_dir}"
+num_repeats = 1
+recursive = true
+
+
+[preview]
+sample_every_n_epochs = 2
+sample_prompts = "configs/custom/sample_prompts.txt"
+sample_sampler = "euler"
+sample_decode_inline = "false"
+sample_guidance_scale = 3.5
+sample_flow_shift = 1.0
+sample_image_size = [ 1024, 1024,]
+
+[general]
+caption_extension = ".txt"

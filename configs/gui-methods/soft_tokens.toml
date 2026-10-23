@@ -1,0 +1,39 @@
+network_module = "networks.methods.soft_tokens"
+
+network_dim = 4
+network_args = [
+    "n_layers=6",
+    "n_t_buckets=14",
+    "init_std=0.02",
+    "splice_position=front_of_padding",
+    "contrastive_weight=0.15",
+    "contrastive_every_n=3",
+    "contrastive_k=2",
+    "contrastive_negative_mode=hard_backoff",
+
+    "contrastive_objective=softrank",
+    "dual_bank=true",
+    "contrastive_jaccard_alpha=1.0",
+    "contrastive_tau=0.5",
+    "contrastive_warmup_ratio=0.1",
+]
+output_name = "anima_soft_tokens"
+
+use_shuffled_caption_variants = true
+cache_llm_adapter_outputs = true
+
+learning_rate = 1e-3
+max_train_epochs = 4
+save_every_n_epochs = 4
+checkpointing_epochs = 4
+
+blocks_to_swap = 0
+
+use_cmmd = false
+
+[variant]
+family = "soft_tokens"
+label = "Soft Tokens"
+description = "SoftREPA-style per-layer x per-t soft tokens (training-only v1)."
+order = 10
+experimental = true

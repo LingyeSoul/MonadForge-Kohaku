@@ -1,0 +1,807 @@
+"""MOSS-Image DiT + scheduler, vendored from ``pipeline_moss_image.py``.
+
+Source: OpenMOSS-Team/MOSS-Image-{Base,SFT} (``pipeline_moss_image.py``,
+https://github.com/OpenMOSS/MOSS-Image), Apache License 2.0, Copyright the
+OpenMOSS team. Vendored so nothing loads with ``trust_remote_code``. State-dict
+names are unchanged, so ``from_pretrained`` reads the published ``transformer/``
+folder as-is.
+
+Changes from the reference, all additive:
+
+- ``forward`` is the reference per-sample loop, op for op. It is split into
+  ``time_conditioning`` / ``embed_sample`` / ``run_layers`` / ``head`` so the
+  sampler (Spectrum) and the trainer can reach the pieces.
+- ``forward_batched``: every sample in one forward, text padded to the longest
+  and excluded by a key mask; ``skip_layers`` per sample, so cond and the
+  skip-22 uncond share a batch.
+- ``layer_hook``: optional ``(index, x, n_img) -> x`` run on each block's output
+  (rows that ran the block only), outside the compiled block. DAVE
+  (``library.moss.dave``) and its probe use it; ``None`` is the reference.
+- ``ref`` (i2i probe): clean reference latents on RoPE's ``r = 1`` axis.
+  ``ref_timestep`` (None = the image's timestep) gives the reference tokens their
+  own block modulation, e.g. ``0`` for a clean latent. ``ref_isolate`` restricts
+  the reference queries to the reference keys; image and text still read it.
+  ``library.moss.lora.load_for_inference`` sets both from the LoRA's metadata.
+- ``pack_latents`` / ``unpack_latents``: the FLUX.2 VAE ↔ DiT latent boundary
+  (2×2 ``patchify`` + the VAE's BatchNorm statistics).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+from diffusers import FlowMatchEulerDiscreteScheduler
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.models.modeling_outputs import Transformer2DModelOutput
+from diffusers.models.modeling_utils import ModelMixin
+from torch import Tensor, nn
+from torch.nn import functional as F
+
+from library.moss import ops
+from library.moss.requests import DEFAULT_SHIFT
+
+_EPS = 1e-6
+
+
+class _RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        y = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
+        return y.to(x.dtype) * self.weight
+
+
+def _situ(hidden, gate):
+    return (4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)) * (
+        25.0 * torch.tanh(hidden / 25.0)
+    )
+
+
+@dataclass(frozen=True)
+class _Fused:
+    """What ``_Block``'s fused branch needs beyond the reference branch's arguments:
+    the RoPE positions and bands (``qk_norm_rope`` builds sin/cos in the kernel) and
+    the per-token segment ids the per-sample modulation and gate index. ``pos`` is
+    ``(B, T, A)`` and ``seg`` ``(B, T)``, so a row subset (per-sample ``skip_layers``)
+    slices both."""
+
+    pos: Tensor
+    bands: Tensor
+    seg: Tensor
+
+    def take(self, rows):
+        return _Fused(self.pos[rows], self.bands, self.seg[rows])
+
+
+def _validate_skip_layers(layers, depth, name="skip_layers"):
+    layers = () if layers is None else tuple(layers)
+    if any(type(index) is not int or not 0 <= index < depth for index in layers):
+        raise ValueError(f"{name} must contain integer block indices in [0, {depth}).")
+    return frozenset(layers)
+
+
+def rotate(x, rope):
+    sin, cos = rope.chunk(2, -1)
+    sin = torch.cat((sin, sin), -1).unsqueeze(-2)
+    cos = torch.cat((cos, cos), -1).unsqueeze(-2)
+    a, b = x.chunk(2, -1)
+    return x * cos + torch.cat((-b, a), -1) * sin
+
+
+def _attention(q, k, v, rope, heads, key_mask=None, ref_span=None, ref_isolate=False):
+    """``key_mask``: bool ``(B, L)``, True = attend. None = the reference path.
+    ``ref_isolate``: the queries in ``ref_span = (start, end)`` attend only to its
+    keys. ``rope=None``: ``q``/``k`` already rotated (the fused ``qk_norm_rope``)."""
+    shape = (*q.shape[:2], heads, q.shape[-1] // heads)
+    if rope is None:
+        q = q.reshape(shape).transpose(1, 2).to(v.dtype)
+        k = k.reshape(shape).transpose(1, 2).to(v.dtype)
+    else:
+        q = rotate(q.reshape(shape), rope).transpose(1, 2).to(v.dtype)
+        k = rotate(k.reshape(shape), rope).transpose(1, 2).to(v.dtype)
+    v = v.reshape(shape).transpose(1, 2)
+    attn_mask = None if key_mask is None else key_mask[:, None, None, :]
+    if not ref_isolate or ref_span is None:
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    else:
+        s, e = ref_span
+        main = F.scaled_dot_product_attention(
+            torch.cat((q[:, :, :s], q[:, :, e:]), 2), k, v, attn_mask=attn_mask
+        )
+        ref = F.scaled_dot_product_attention(q[:, :, s:e], k[:, :, s:e], v[:, :, s:e])
+        out = torch.cat((main[:, :, :s], ref, main[:, :, s:]), 2)
+    return out.transpose(1, 2).flatten(2)
+
+
+class _TextBlock(nn.Module):
+    def __init__(self, dim, ffn_dim, heads):
+        super().__init__()
+        self.heads = heads
+        self.norm1, self.norm2 = _RMSNorm(dim), _RMSNorm(dim)
+        self.q_norm, self.k_norm = _RMSNorm(dim // heads), _RMSNorm(dim // heads)
+        self.qkv = nn.Linear(dim, 3 * dim)
+        self.proj = nn.Linear(dim, dim)
+        self.ffn_gate, self.ffn_up = nn.Linear(dim, ffn_dim), nn.Linear(dim, ffn_dim)
+        self.ffn_down = nn.Linear(ffn_dim, dim)
+
+    def forward(self, x, rope, key_mask=None):
+        q, k, v = self.qkv(self.norm1(x)).chunk(3, -1)
+        q = self.q_norm(q.unflatten(-1, (self.heads, -1))).flatten(2)
+        k = self.k_norm(k.unflatten(-1, (self.heads, -1))).flatten(2)
+        x = x + self.proj(_attention(q, k, v, rope, self.heads, key_mask))
+        y = self.norm2(x)
+        return x + self.ffn_down(_situ(self.ffn_up(y), self.ffn_gate(y)))
+
+
+class _TextProjection(nn.Module):
+    def __init__(self, text_dim, dim, ffn_dim, heads):
+        super().__init__()
+        self.proj = nn.Linear(text_dim, dim)
+        self.blocks = nn.ModuleList([_TextBlock(dim, ffn_dim, heads) for _ in range(2)])
+
+    def forward(self, x, rope, key_mask=None):
+        x = self.proj(x.to(self.proj.weight.dtype))
+        for block in self.blocks:
+            x = block(x, rope, key_mask)
+        return x
+
+
+def _affine(y, scale, shift, ref_span):
+    """``y·(1 + scale) + shift``. ``scale``/``shift`` are ``(B, D)``, or ``(B, 2, D)``
+    with the second row applied to the tokens in ``ref_span = (start, end)``."""
+    if scale.ndim == 2:
+        return y * (1 + scale[:, None]) + shift[:, None]
+    s, e = ref_span
+    scale, shift = (1 + scale).unbind(1), shift.unbind(1)
+
+    def seg(part, i):
+        return part * scale[i][:, None] + shift[i][:, None]
+
+    return torch.cat((seg(y[:, :s], 0), seg(y[:, s:e], 1), seg(y[:, e:], 0)), 1)
+
+
+def _gated(y, gate, ref_span):
+    if gate.ndim == 2:
+        return y * gate[:, None]
+    s, e = ref_span
+    main, ref = gate.unbind(1)
+    return torch.cat(
+        (y[:, :s] * main[:, None], y[:, s:e] * ref[:, None], y[:, e:] * main[:, None]),
+        1,
+    )
+
+
+class _Block(nn.Module):
+    def __init__(self, dim, ffn_dim, heads):
+        super().__init__()
+        self.heads = heads
+        self.norm1, self.norm2 = _RMSNorm(dim), _RMSNorm(dim)
+        self.q_norm, self.k_norm = _RMSNorm(dim // heads), _RMSNorm(dim // heads)
+        self.proj = nn.ModuleDict(
+            {name: nn.Linear(dim, dim, bias=False) for name in ("q", "k", "v", "o")}
+        )
+        self.proj["ffn_up_gate"] = nn.Linear(dim, 2 * ffn_dim, bias=False)
+        self.proj["ffn_down"] = nn.Linear(ffn_dim, dim, bias=False)
+        # Set by ``library.moss.ops.fuse``: the branch below then runs the vendored
+        # fused kernels instead of the op-for-op reference.
+        self.fused = False
+
+    def forward(
+        self,
+        x,
+        rope,
+        modulation,
+        key_mask=None,
+        ref_span=None,
+        ref_isolate=False,
+        ctx=None,
+    ):
+        """``ref_span = (start, end)``: the reference tokens, if any. ``modulation``
+        is ``(B,6,D)``, or ``(B,6,2,D)`` with the second set modulating the
+        reference tokens. ``ref_isolate``: see ``_attention``. ``ctx`` (``_Fused``):
+        the fused branch's rope positions, bands and segment ids."""
+        if (
+            self.fused
+            and ctx is not None
+            and modulation.ndim == 3
+            and x.dtype in (torch.float16, torch.bfloat16)
+        ):
+            return self._forward_fused(
+                x, modulation, key_mask, ref_span, ref_isolate, ctx
+            )
+        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
+        y = _affine(self.norm1(x), scale_a, shift_a, ref_span)
+        dtype = self.proj["q"].weight.dtype
+        y = y.to(dtype)
+        q = self.q_norm(self.proj["q"](y).unflatten(-1, (self.heads, -1))).flatten(2)
+        k = self.k_norm(self.proj["k"](y).unflatten(-1, (self.heads, -1))).flatten(2)
+        attn = _attention(
+            q, k, self.proj["v"](y), rope, self.heads, key_mask, ref_span, ref_isolate
+        )
+        x = x + _gated(self.proj["o"](attn), gate_a, ref_span)
+        y = _affine(self.norm2(x), scale_f, shift_f, ref_span)
+        hidden, gate = self.proj["ffn_up_gate"](y.to(dtype)).chunk(2, -1)
+        return x + _gated(self.proj["ffn_down"](_situ(hidden, gate)), gate_f, ref_span)
+
+    def _forward_fused(self, x, modulation, key_mask, ref_span, ref_isolate, ctx):
+        """``forward`` with the norm+modulation, qk-norm+RoPE, SiTU-GLU and gated
+        residuals each collapsed into one kernel launch. Same arithmetic, fewer
+        memory round trips; ``ref_span`` keeps the same tokens in the same places.
+        """
+        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
+        dtype = self.proj["q"].weight.dtype
+        batch, tokens, dim = x.shape
+        head_dim = dim // self.heads
+        seg = ctx.seg.reshape(-1)
+        y = ops.rms_norm_mod(
+            x.to(dtype).reshape(-1, dim),
+            self.norm1.weight,
+            shift_a,
+            scale_a,
+            seg,
+            _EPS,
+        )
+        q, k = ops.qk_norm_rope(
+            self.proj["q"](y).reshape(-1, self.heads, head_dim),
+            self.proj["k"](y).reshape(-1, self.heads, head_dim),
+            self.q_norm.weight,
+            self.k_norm.weight,
+            ctx.pos.reshape(-1, ctx.pos.shape[-1]),
+            ctx.bands,
+            _EPS,
+        )
+        v = self.proj["v"](y).reshape(batch, tokens, dim)
+        attn = _attention(
+            q.reshape(batch, tokens, dim),
+            k.reshape(batch, tokens, dim),
+            v,
+            None,
+            self.heads,
+            key_mask,
+            ref_span,
+            ref_isolate,
+        )
+        x = ops.gated_residual(x, self.proj["o"](attn), gate_a, ctx.seg, 1.0)
+        y = ops.rms_norm_mod(
+            x.to(dtype).reshape(-1, dim),
+            self.norm2.weight,
+            shift_f,
+            scale_f,
+            seg,
+            _EPS,
+        )
+        up_gate = self.proj["ffn_up_gate"](y)
+        hidden = ops.situ_glu(up_gate.reshape(-1, up_gate.shape[-1]))
+        return ops.gated_residual(
+            x,
+            self.proj["ffn_down"](hidden.reshape(batch, tokens, -1)),
+            gate_f,
+            ctx.seg,
+            1.0,
+        )
+
+
+class _RoPE(nn.Module):
+    def __init__(self, head_dim, base):
+        super().__init__()
+        self.num_bands = head_dim // 8
+        self.base = base
+        self.register_buffer("bands", self._default_bands(torch.device("cpu")))
+
+    def _default_bands(self, device):
+        # Match training's CPU fp32 construction, including under meta init.
+        exponent = (
+            torch.arange(self.num_bands, device="cpu", dtype=torch.float32)
+            / self.num_bands
+        )
+        return (1 / (self.base**exponent)).to(device)
+
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse=recurse)
+        # .float() cannot recover frequencies already rounded by .to(bf16).
+        self.bands = self._default_bands(self.bands.device)
+        return self
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        super()._load_from_state_dict(*args, **kwargs)
+        # Frequencies are derived constants; retain the key for checkpoint compatibility.
+        self.bands = self._default_bands(self.bands.device)
+
+    def forward(self, height, width, text_length, device, ref_hw=None):
+        """``(1, H·W [+ h·w] + text_length, head_dim)``, fp32. Image tokens first.
+
+        ``ref_hw = (h, w)`` adds a reference grid after the image tokens on the
+        reserved ``r = 1`` axis, its ``(h, w)`` coordinates stretched onto the
+        image's grid so each reference token sits over the image region it covers."""
+        return self.embed(self.pos(height, width, text_length, device, ref_hw))
+
+    def embed(self, pos):
+        """``pos (T, 4)`` → the ``sin | cos`` rope ``(1, T, head_dim)`` it encodes."""
+        # Diffusers/Accelerate can install tensors directly, bypassing load hooks.
+        if self.bands.dtype != torch.float32:
+            self.bands = self._default_bands(self.bands.device)
+        phase = pos.unsqueeze(-1) * self.bands
+        return torch.cat((phase.sin(), phase.cos()), -2).flatten(-2).unsqueeze(0)
+
+    def pos(self, height, width, text_length, device, ref_hw=None):
+        """``(T, 4)`` fp32 ``(r, f, h, w)`` coordinates: image, reference, text.
+
+        Split out of ``forward`` so the fused ``qk_norm_rope`` gets the same
+        positions the reference ``rotate`` reads out of the rope tensor."""
+        # Diffusers/Accelerate can install tensors directly, bypassing load hooks.
+        if self.bands.dtype != torch.float32:
+            self.bands = self._default_bands(device)
+        # Coordinates: (r, f, h, w); sequence order is image followed by text.
+        h, w = torch.meshgrid(
+            torch.arange(height, device=device),
+            torch.arange(width, device=device),
+            indexing="ij",
+        )
+        image = (
+            torch.stack(
+                (torch.zeros_like(h), torch.full_like(h, text_length), h, w), -1
+            )
+            .flatten(0, 1)
+            .float()
+        )
+        image[:, 2] -= (height - 1) / 2
+        image[:, 3] -= (width - 1) / 2
+        parts = [image]
+        if ref_hw is not None:
+            rh, rw = ref_hw
+            h, w = torch.meshgrid(
+                (torch.arange(rh, device=device) + 0.5) * height / rh - 0.5,
+                (torch.arange(rw, device=device) + 0.5) * width / rw - 0.5,
+                indexing="ij",
+            )
+            ref = torch.stack(
+                (torch.ones_like(h), torch.full_like(h, text_length), h, w), -1
+            ).flatten(0, 1)
+            ref[:, 2] -= (height - 1) / 2
+            ref[:, 3] -= (width - 1) / 2
+            parts.append(ref)
+        text = torch.zeros(text_length, 4, device=device, dtype=torch.float32)
+        text[:, 1] = torch.arange(text_length, device=device)
+        return torch.cat((*parts, text), 0).float()
+
+
+class MOSSImageTransformer(ModelMixin, ConfigMixin):
+    """MOSS-Image DiT with training-compatible state-dict names and SDPA attention.
+
+    The sequence is ``[image (H·W) | text (S)]`` through every block; only the
+    image tokens reach the head.
+    """
+
+    @register_to_config
+    def __init__(
+        self,
+        dim=3072,
+        ffn_dim=8192,
+        num_heads=24,
+        num_layers=42,
+        text_dim=4096,
+        freq_dim=256,
+        latent_channels=128,
+        rope_base=10000.0,
+    ):
+        super().__init__()
+        if dim % num_heads or (dim // num_heads) % 8 or freq_dim % 2:
+            raise ValueError(
+                "Require dim divisible by heads, head_dim divisible by 8, and even freq_dim."
+            )
+        self.video_embedder = nn.Linear(latent_channels, dim)
+        self.text_embedder = _TextProjection(text_dim, dim, ffn_dim, num_heads)
+        self.rope = _RoPE(dim // num_heads, rope_base)
+        self.time_embedding = nn.Sequential(
+            nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim)
+        )
+        self.shared_block_modulation = nn.Linear(dim, 6 * dim)
+        self.layers = nn.ModuleList(
+            [_Block(dim, ffn_dim, num_heads) for _ in range(num_layers)]
+        )
+        self.final_norm_video = _RMSNorm(dim)
+        self.final_linear_video = nn.Linear(dim, latent_channels, bias=False)
+        self.video_head_modulation = nn.Linear(dim, 2 * dim)
+        self.layer_hook = None
+        self.ref_timestep = None
+        self.ref_isolate = False
+
+    def load_training_state_dict(self, state_dict, *, prefix=""):
+        """Load a consolidated raw/EMA model mapping, strictly; no silent key drops."""
+        if prefix:
+            if any(not key.startswith(prefix) for key in state_dict):
+                raise ValueError("All keys must start with the explicit prefix.")
+            state_dict = {
+                key[len(prefix) :]: value for key, value in state_dict.items()
+            }
+        return self.load_state_dict(state_dict, strict=True)
+
+    # ------------------------------------------------------------------ pieces
+
+    def time_conditioning(self, timestep, batch):
+        """``timestep`` is ``1000·σ`` (scalar or ``(B,)``) → ``mod (B,6,D)``, ``head (B,2,D)``."""
+        times = torch.as_tensor(
+            timestep, device=self.time_embedding[0].weight.device, dtype=torch.float32
+        ).reshape(-1)
+        times = times.expand(batch)
+        # Training computes the sinusoid in float64 and feeds float32 into its MLP.
+        half = self.config.freq_dim // 2
+        freq = 10000 ** (
+            -torch.arange(half, device=times.device, dtype=torch.float64) / half
+        )
+        phase = times.double()[:, None] * freq
+        embedding = torch.cat((phase.cos(), phase.sin()), -1).float()
+        time = self.time_embedding(
+            embedding.to(self.time_embedding[0].weight.dtype)
+        ).float()
+        mod = self.shared_block_modulation(
+            time.to(self.shared_block_modulation.weight.dtype)
+        )
+        head = self.video_head_modulation(
+            time.to(self.video_head_modulation.weight.dtype)
+        )
+        return mod.view(batch, 6, -1), head.view(batch, 2, -1)
+
+    def ref_modulation(self, mod, n_img, ref_hw):
+        """``(mod, ref_span)`` for the blocks: ``ref_span`` the reference tokens
+        (None without a reference); ``mod`` unchanged when the reference shares
+        the image's timestep, else ``(B,6,2,D)`` with the ``ref_timestep`` set
+        second."""
+        if ref_hw is None:
+            return mod, None
+        span = (n_img, n_img + ref_hw[0] * ref_hw[1])
+        if self.ref_timestep is None:
+            return mod, span
+        ref_mod, _ = self.time_conditioning(self.ref_timestep, mod.shape[0])
+        return torch.stack((mod, ref_mod.to(mod.dtype)), 2), span
+
+    def embed_sample(self, latent, context, ref=None):
+        """One sample: ``latent (1,C,H,W)``, ``context (1,S,text_dim)`` at its true
+        length, optional clean reference latent ``ref (1,C,h,w)`` → ``x (1, H·W
+        [+ h·w] + S, D)``, ``rope`` to match, and the ``(1, T, 4)`` positions the
+        fused RoPE reads (unused by the reference branch)."""
+        _, _, height, width = latent.shape
+        video = self._embed_latent(latent)
+        ref_hw = None if ref is None else tuple(ref.shape[-2:])
+        pos = self.rope.pos(height, width, context.shape[1], latent.device, ref_hw)
+        # Match the reference activation dtype under fp32 weights + autocast.
+        rope = self.rope.embed(pos).to(video.dtype)
+        parts = [video]
+        if ref is not None:
+            parts.append(self._embed_latent(ref))
+        n = sum(p.shape[1] for p in parts)
+        text = self.text_embedder(context, rope[:, n:])
+        return torch.cat((*parts, text), 1), rope, pos.unsqueeze(0)
+
+    def _embed_latent(self, latent):
+        tokens = latent.flatten(2).transpose(1, 2)
+        return self.video_embedder(
+            tokens.to(self.video_embedder.weight.dtype).contiguous()
+        )
+
+    def run_layers(
+        self,
+        x,
+        rope,
+        mod,
+        skip_layers=frozenset(),
+        key_mask=None,
+        n_img=None,
+        ref_span=None,
+        pos=None,
+    ):
+        """The 42 blocks. ``skip_layers``: one frozenset for the whole batch, or a
+        sequence of frozensets, one per sample (rows skipping a block keep ``x``).
+        ``n_img`` (leading image tokens) is what ``layer_hook`` sees. ``ref_span``
+        and ``mod`` come from ``ref_modulation``; ``ref_isolate`` applies to that
+        span. ``pos`` (``(B, T, 4)``) switches fused blocks to the kernel branch."""
+        per_sample = not isinstance(skip_layers, (frozenset, set))
+        iso = self.ref_isolate and ref_span is not None
+        hook = self.layer_hook
+        ctx = None
+        if pos is not None and self.layers[0].fused:
+            ctx = _Fused(
+                pos=pos,
+                bands=self.rope.bands,
+                seg=ops.segments(x.shape[0], x.shape[1], x.device),
+            )
+        for index, layer in enumerate(self.layers):
+            if per_sample:
+                active = [
+                    b for b, skips in enumerate(skip_layers) if index not in skips
+                ]
+                if not active:
+                    continue
+                if len(active) < x.shape[0]:
+                    rows = torch.tensor(active, device=x.device)
+                    sub = layer(
+                        x[rows],
+                        rope[rows],
+                        mod[rows],
+                        None if key_mask is None else key_mask[rows],
+                        ref_span,
+                        iso,
+                        None if ctx is None else ctx.take(rows),
+                    )
+                    if hook is not None:
+                        sub = hook(index, sub, n_img)
+                    x = x.index_copy(0, rows, sub)
+                    continue
+            elif index in skip_layers:
+                continue
+            x = layer(x, rope, mod, key_mask, ref_span, iso, ctx)
+            if hook is not None:
+                x = hook(index, x, n_img)
+        return x
+
+    def head(self, features, head_mod, height, width):
+        """Image-token hidden state after the last block ``(B, H·W, D)`` →
+        velocity ``(B, C, H, W)``. Spectrum forecasts ``features`` and calls this."""
+        x = self.final_norm_video(features.to(self.final_norm_video.weight.dtype))
+        x = x * (1 + head_mod[:, 1, None]) + head_mod[:, 0, None]
+        x = self.final_linear_video(x.to(self.final_linear_video.weight.dtype))
+        return x.transpose(1, 2).reshape(x.shape[0], -1, height, width)
+
+    # ---------------------------------------------------------------- forwards
+
+    def _check_inputs(self, hidden_states, encoder_hidden_states, mask):
+        if (
+            hidden_states.ndim != 4
+            or hidden_states.shape[1] != self.config.latent_channels
+        ):
+            raise ValueError("hidden_states must be [B, latent_channels, H, W].")
+        batch = hidden_states.shape[0]
+        if encoder_hidden_states.ndim != 3 or encoder_hidden_states.shape[0] != batch:
+            raise ValueError("encoder_hidden_states must be [B, S, text_dim].")
+        if mask is None:
+            mask = torch.ones(
+                encoder_hidden_states.shape[:2],
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+        if mask.shape != encoder_hidden_states.shape[:2] or not torch.all(
+            (mask == 0) | (mask == 1)
+        ):
+            raise ValueError("encoder_attention_mask must be a binary [B, S] mask.")
+        if not torch.all(mask.bool().any(1)):
+            raise ValueError("Each sample needs at least one valid text token.")
+        return mask.bool()
+
+    def forward(
+        self,
+        hidden_states,
+        timestep,
+        encoder_hidden_states,
+        encoder_attention_mask=None,
+        return_dict=True,
+        skip_layers=None,
+        return_features=False,
+        ref=None,
+    ):
+        """The reference per-sample loop. ``return_features`` returns the
+        image-token hidden state ``(B, H·W, D)`` before ``head`` instead.
+        ``ref (B,C,h,w)``: clean reference latents (``embed_sample``)."""
+        skip_layers = _validate_skip_layers(skip_layers, len(self.layers))
+        mask = self._check_inputs(
+            hidden_states, encoder_hidden_states, encoder_attention_mask
+        )
+        batch, _, height, width = hidden_states.shape
+        mod, head = self.time_conditioning(timestep, batch)
+        ref_hw = None if ref is None else tuple(ref.shape[-2:])
+        mod, ref_span = self.ref_modulation(mod, height * width, ref_hw)
+        outputs = []
+        for index in range(batch):
+            context = encoder_hidden_states[index : index + 1, mask[index]]
+            x, rope, pos = self.embed_sample(
+                hidden_states[index : index + 1],
+                context,
+                None if ref is None else ref[index : index + 1],
+            )
+            x = self.run_layers(
+                x,
+                rope,
+                mod[index : index + 1],
+                skip_layers,
+                n_img=height * width,
+                ref_span=ref_span,
+                pos=pos,
+            )
+            features = x[:, : height * width]
+            if return_features:
+                outputs.append(features)
+            else:
+                outputs.append(
+                    self.head(features, head[index : index + 1], height, width)
+                )
+        sample = torch.cat(outputs)
+        if return_features:
+            return sample
+        return Transformer2DModelOutput(sample=sample) if return_dict else (sample,)
+
+    def forward_batched(
+        self,
+        hidden_states,
+        timestep,
+        encoder_hidden_states,
+        encoder_attention_mask=None,
+        skip_layers=None,
+        return_features=False,
+        ref=None,
+    ):
+        """All samples in one forward. Text is right-padded to the longest valid
+        length and masked out of every key set (text refiner and joint blocks), so
+        padding never reaches a valid token. Matches ``forward`` within bf16 noise
+        (the masked SDPA picks a different kernel).
+
+        ``skip_layers``: None, one iterable for the whole batch, or a list with one
+        iterable per sample (e.g. ``[(), (22,)]`` for cond + skip-22 uncond).
+        Returns the velocity ``(B, C, H, W)`` (or features ``(B, H·W, D)``).
+        """
+        depth = len(self.layers)
+        mask = self._check_inputs(
+            hidden_states, encoder_hidden_states, encoder_attention_mask
+        )
+        batch, _, height, width = hidden_states.shape
+        if (
+            skip_layers is not None
+            and len(skip_layers)
+            and not isinstance(skip_layers[0], int)
+        ):
+            if len(skip_layers) != batch:
+                raise ValueError("Per-sample skip_layers needs one entry per sample.")
+            skips = [_validate_skip_layers(s, depth) for s in skip_layers]
+            if len(set(skips)) == 1:
+                skips = skips[0]
+        else:
+            skips = _validate_skip_layers(skip_layers, depth)
+        mod, head = self.time_conditioning(timestep, batch)
+        n_img = height * width
+        ref_hw = None if ref is None else tuple(ref.shape[-2:])
+        n_ref = 0 if ref is None else ref_hw[0] * ref_hw[1]
+        lengths = mask.sum(1)
+        s_max = int(lengths.max())
+        device = hidden_states.device
+
+        context = encoder_hidden_states.new_zeros(
+            batch, s_max, encoder_hidden_states.shape[-1]
+        )
+        text_mask = torch.zeros(batch, s_max, dtype=torch.bool, device=device)
+        ropes = []
+        poses = []
+        for b in range(batch):
+            n = int(lengths[b])
+            context[b, :n] = encoder_hidden_states[b, mask[b]]
+            text_mask[b, :n] = True
+            pos = self.rope.pos(height, width, n, device, ref_hw)
+            rope = self.rope.embed(pos)
+            if n < s_max:
+                rope = F.pad(rope, (0, 0, 0, s_max - n))
+                pos = F.pad(pos, (0, 0, 0, s_max - n))
+            ropes.append(rope)
+            poses.append(pos)
+        video = self._embed_latent(hidden_states)
+        rope = torch.cat(ropes).to(video.dtype)
+        text = self.text_embedder(context, rope[:, n_img + n_ref :], text_mask)
+        parts = [video] if ref is None else [video, self._embed_latent(ref)]
+        x = torch.cat((*parts, text), 1)
+        key_mask = torch.cat((text_mask.new_ones(batch, n_img + n_ref), text_mask), 1)
+        if bool(text_mask.all()):
+            key_mask = None
+        mod, ref_span = self.ref_modulation(mod, n_img, ref_hw)
+        pos = torch.stack(poses)
+        x = self.run_layers(x, rope, mod, skips, key_mask, n_img, ref_span, pos)
+        features = x[:, :n_img]
+        if return_features:
+            return features
+        return self.head(features, head, height, width)
+
+
+class MOSSImageScheduler(FlowMatchEulerDiscreteScheduler):
+    """Euler integration using the training project's V2, nearest-grid schedule."""
+
+    @register_to_config
+    def __init__(self, num_train_timesteps=1000, shift=5.0, training_shift=1.0):
+        super().__init__(num_train_timesteps=num_train_timesteps, shift=1.0)
+        self.register_to_config(shift=shift, training_shift=training_shift)
+
+    def set_timesteps(self, num_inference_steps=50, device=None):
+        if (
+            num_inference_steps < 1
+            or self.config.shift <= 0
+            or self.config.training_shift <= 0
+        ):
+            raise ValueError("Steps and shifts must be positive.")
+        sigmas = snapped_sigmas(
+            num_inference_steps,
+            self.config.shift,
+            self.config.training_shift,
+            self.config.num_train_timesteps,
+        )
+        # Our sigmas have already been shifted and snapped. Avoid a second shift.
+        self._shift = 1.0
+        super().set_timesteps(device=device, sigmas=sigmas.tolist())
+
+
+def snapped_sigmas(num_steps, shift=DEFAULT_SHIFT, training_shift=1.0, total=1000):
+    """The inference σ grid (descending, no terminal 0): ``shift``-warped linspace
+    snapped to the nearest σ of the training grid, duplicates collapsed, so a
+    high step count can return fewer than ``num_steps`` values."""
+
+    def grid(count, s):
+        lower = s / (total + s - 1)
+        values = torch.linspace(1, lower, count)
+        return s * values / (1 + (s - 1) * values)
+
+    sigmas = grid(num_steps, shift)
+    training = grid(total, training_shift).flip(0)
+    upper = torch.searchsorted(training, sigmas).clamp(max=total - 1)
+    lower = (upper - 1).clamp(min=0)
+    nearest = torch.where(
+        (sigmas - training[lower]).abs() <= (training[upper] - sigmas).abs(),
+        lower,
+        upper,
+    )
+    return torch.unique_consecutive(training[nearest])
+
+
+# ------------------------------------------------------------- VAE boundary
+
+
+def _bn_stats(vae, like):
+    bn, eps = vae.bn, vae.config.batch_norm_eps
+    mean = bn.running_mean.to(like).view(1, -1, 1, 1)
+    std = (bn.running_var + eps).sqrt().to(like).view(1, -1, 1, 1)
+    return mean, std
+
+
+def patchify(z):
+    """``(B,32,H,W)`` → ``(B,128,H/2,W/2)``, FLUX.2's ``_patchify_latents``."""
+    b, c, h, w = z.shape
+    return (
+        z.view(b, c, h // 2, 2, w // 2, 2)
+        .permute(0, 1, 3, 5, 2, 4)
+        .reshape(b, c * 4, h // 2, w // 2)
+    )
+
+
+def unpatchify(z):
+    """Inverse of :func:`patchify`: ``(B,128,h,w)`` → ``(B,32,2h,2w)``."""
+    b, c, h, w = z.shape
+    return (
+        z.reshape(b, c // 4, 2, 2, h, w)
+        .permute(0, 1, 4, 2, 5, 3)
+        .reshape(b, c // 4, 2 * h, 2 * w)
+    )
+
+
+def unpack_latents(z, vae):
+    """DiT latent ``(B,128,h,w)`` → FLUX.2 VAE latent ``(B,32,2h,2w)``, in the VAE's
+    dtype: BN de-normalise, then 2×2 un-patchify (the reference decode)."""
+    z = z.to(dtype=vae.dtype)
+    mean, std = _bn_stats(vae, z)
+    return unpatchify(z * std + mean)
+
+
+def pack_latents(z, vae):
+    """FLUX.2 VAE latent ``(B,32,H,W)`` → DiT latent ``(B,128,H/2,W/2)``: the exact
+    inverse of ``unpack_latents`` (``patchify`` + BN normalise)."""
+    z = patchify(z)
+    mean, std = _bn_stats(vae, z)
+    return (z - mean) / std
+
+
+@torch.no_grad()
+def decode(z, vae):
+    """DiT latent → image tensor in ``[-1, 1]``, ``(B,3,16h,16w)``."""
+    return vae.decode(unpack_latents(z, vae), return_dict=False)[0].clamp(-1, 1)
+
+
+@torch.no_grad()
+def encode(pixels, vae):
+    """Image tensor in ``[-1, 1]`` ``(B,3,H,W)``, sides multiples of 16 → DiT latent
+    ``(B,128,H/16,W/16)``, fp32. Distribution mode, as FLUX.2 encodes references."""
+    dist = vae.encode(pixels.to(device=vae.device, dtype=vae.dtype)).latent_dist
+    return pack_latents(dist.mode(), vae).float()

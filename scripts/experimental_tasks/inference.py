@@ -1,0 +1,665 @@
+"""Experimental inference entry-points (exp-test-* commands).
+
+Covers the unstable methods kept under ``make exp-*``: soft tokens, BYG, plus
+the DirectEdit probes. Reference-image variants accept
+REF_IMAGE env or first positional arg, copy the ref alongside the generated
+output.
+"""
+
+from __future__ import annotations
+
+import os
+import random
+import shutil
+import sys
+from pathlib import Path
+
+from scripts.tasks._common import (
+    INFERENCE_BASE,
+    ROOT,
+    _random_ref_image,
+    _REF_IMAGE_EXTS,
+    latest_output,
+    override_arg,
+    run,
+)
+
+_TE_SUFFIX = "_anima_te.safetensors"
+
+
+def _te_cache_candidates(ref_image: str | os.PathLike) -> list[Path]:
+    """TE cache locations to probe for a resized reference image.
+
+    Preprocessing writes caches under ``post_image_dataset/lora/`` mirroring
+    the per-artist subdir layout of ``post_image_dataset/resized/`` (see
+    ``resolve_cache_path`` with ``image_dir``). So for
+    ``resized/mejikara_scene/10083096.png`` the cache lands at
+    ``lora/mejikara_scene/10083096_anima_te.safetensors`` — not flat under
+    ``lora/``. Probe, in order: the nested mirror, the flat ``lora/`` root,
+    and the legacy sidecar next to the image.
+    """
+    from library.io.cache import resolve_cache_path  # noqa: PLC0415
+
+    ref = Path(ref_image)
+    stem = ref.stem
+    resized_root = ROOT / "post_image_dataset" / "resized"
+    lora_root = ROOT / "post_image_dataset" / "lora"
+    nested = Path(
+        resolve_cache_path(
+            str(ref),
+            _TE_SUFFIX,
+            cache_dir=str(lora_root),
+            image_dir=str(resized_root),
+        )
+    )
+    # Deduplicate while preserving order (nested == flat when no subdir).
+    candidates = [
+        nested,
+        lora_root / f"{stem}{_TE_SUFFIX}",
+        ref.parent / f"{stem}{_TE_SUFFIX}",
+    ]
+    seen: set[Path] = set()
+    return [p for p in candidates if not (p in seen or seen.add(p))]
+
+
+def _resolve_te_cache(ref_image: str | os.PathLike) -> Path | None:
+    """First existing TE cache for ``ref_image``, or ``None``."""
+    return next((p for p in _te_cache_candidates(ref_image) if p.is_file()), None)
+
+
+def _resolve_ref_image(ref_image: str) -> str:
+    """Resolve a possibly-partial ``REF_IMAGE`` to a real file under ``resized/``.
+
+    Accepts a path that already exists as given, or a partial path relative to
+    ``post_image_dataset/resized/`` with or without an extension (e.g.
+    ``sushispin/10186995`` → ``.../resized/sushispin/10186995.png``). Returning
+    the full nested path is what lets ``_te_cache_candidates`` /
+    ``resolve_cache_path`` mirror the per-artist subdir into the cache lookup —
+    a bare ``artist/stem`` makes ``relpath`` escape the resized root and fall
+    back to the (wrong) flat ``lora/stem`` candidate. Returns ``ref_image``
+    untouched when nothing matches, so downstream "not found" messaging fires.
+    """
+    if Path(ref_image).is_file():
+        return ref_image
+    resized_root = ROOT / "post_image_dataset" / "resized"
+    base = resized_root / ref_image
+    if base.is_file():
+        return str(base)
+    for ext in _REF_IMAGE_EXTS:
+        for cand in (Path(f"{base}{ext}"), base.with_suffix(ext)):
+            if cand.is_file():
+                return str(cand)
+    return ref_image
+
+
+def cmd_test_soft(extra):
+    """Inference with latest soft_tokens weight (SoftREPA-style per-layer × per-t bank).
+
+    Resolves the newest ``anima_soft_tokens*.safetensors`` under ``output/ckpt/``
+    and passes it via ``--soft_tokens_weight``. The network is built in
+    ``library/inference/generation.py``, ``apply_to`` monkey-patches the first
+    ``n_layers`` ``Block.forward``s, and ``append_postfix(..., timesteps=t)``
+    fires per CFG branch inside the denoising loop (mirrored in the Spectrum
+    runner). Composes freely with ``--spectrum``; cached spectrum steps skip
+    blocks so soft_tokens silently no-ops on those steps.
+    """
+    run(
+        [
+            *INFERENCE_BASE,
+            "--soft_tokens_weight",
+            str(latest_output("anima_soft_tokens")),
+            *extra,
+        ]
+    )
+
+
+def cmd_test_directedit(extra):
+    """DirectEdit on a random source image, seeded by the Anima Tagger.
+
+    Pipeline:
+      1. Pick source image (REF_IMAGE env, first positional arg, or random
+         from ``post_image_dataset/resized/``).
+      2. Run the Anima Tagger on the source -> ``--prompt_src`` caption
+         (checkpoint auto-fetched on first use).
+      3. Pass the edit instruction as ``--edit_instruction`` (PROMPT env, else
+         a ``--prompt`` extra arg, else a "double peace" default); edit.py's
+         dispatcher derives ψ_tar from it.
+      4. Call ``scripts/edit.py`` (DirectEdit invert + edit) using the same
+         DiT/VAE/TE trio as the other inference targets.
+      5. Save under ``output/tests/directedit/`` and copy the source image
+         alongside as ``<name>_src.png``.
+
+    Examples:
+      make exp-test-directedit PROMPT='double peace'
+      REF_IMAGE=foo.png make exp-test-directedit PROMPT='glasses'
+      python tasks.py exp-test-directedit foo.png --prompt 'smile'
+    """
+    ref_image = os.environ.get("REF_IMAGE", "").strip()
+    if not ref_image and extra and not extra[0].startswith("-"):
+        ref_image = extra[0]
+        extra = extra[1:]
+    if not ref_image:
+        ref_image = _random_ref_image(ROOT / "post_image_dataset" / "resized") or ""
+    if not ref_image:
+        print(
+            "Usage: python tasks.py exp-test-directedit [<ref_image>] [extra...]\n"
+            "   or: REF_IMAGE=path/to/ref.png python tasks.py exp-test-directedit\n"
+            "   (no ref given and post_image_dataset/resized/ is empty)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    ref_image = _resolve_ref_image(ref_image)
+
+    # Edit instruction: PROMPT env wins, then a --prompt flag in extra, then default.
+    edit_prompt = os.environ.get("PROMPT", "").strip()
+    cleaned_extra: list[str] = []
+    skip_next = False
+    for j, tok in enumerate(extra):
+        if skip_next:
+            skip_next = False
+            continue
+        if tok == "--prompt" and j + 1 < len(extra):
+            if not edit_prompt:
+                edit_prompt = extra[j + 1]
+            skip_next = True
+            continue
+        cleaned_extra.append(tok)
+    extra = cleaned_extra
+    if not edit_prompt:
+        edit_prompt = "double peace, v v. She is showing double peace"
+
+    from PIL import Image  # noqa: PLC0415
+
+    from anime_tools.tagger.tagger import (  # noqa: PLC0415
+        DEFAULT_TAGGER_DIR,
+        AnimaTagger,
+        ensure_tagger_checkpoint,
+    )
+
+    # Auto-fetch the published checkpoint (sorryhyun/anima-tagger) when absent —
+    # same path every other tagger entry point takes (autotag.py / autotag_server.py).
+    ckpt_dir = ensure_tagger_checkpoint(ROOT / DEFAULT_TAGGER_DIR)
+    print(f"  > tagging source: {ref_image}")
+    tagger = AnimaTagger(ckpt_dir=ckpt_dir)
+
+    src_caption = tagger.predict_caption(Image.open(ref_image))
+    if not src_caption:
+        print(
+            "  ! tagger produced no tags above threshold; using empty source "
+            "prompt — DirectEdit reconstruction will be weaker than usual.",
+            file=sys.stderr,
+        )
+    print(
+        f"  > src caption: {src_caption[:120]}{'...' if len(src_caption) > 120 else ''}"
+    )
+
+    # Hand the edit instruction to edit.py via --edit_instruction so its dispatcher
+    # runs in-process — running it in this wrapper would load Qwen3 a second time.
+    save_dir = ROOT / "output" / "tests" / "directedit"
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    base_iter = iter(INFERENCE_BASE)
+    py = next(base_iter)
+    next(base_iter)  # drop "inference.py"
+    leftover_base = list(base_iter)
+    args = [py, "scripts/edit.py", *_filter_inference_base_for_edit(leftover_base)]
+    args += [
+        "--image",
+        str(ref_image),
+        "--prompt_src",
+        src_caption,
+        "--edit_instruction",
+        edit_prompt,
+        "--save_path",
+        str(save_dir),
+    ]
+    args += list(extra)
+    run(args)
+
+    pngs = sorted(
+        (p for p in save_dir.glob("*.png") if not p.name.endswith("_src.png")),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if pngs:
+        src_dst = pngs[0].with_name(pngs[0].stem + "_src.png")
+        shutil.copy(ref_image, src_dst)
+        print(f"  > Source pasted: {src_dst}")
+
+
+def cmd_test_directedit_dry(extra):
+    """DirectEdit functional sanity check using preprocessed cross-emb variants.
+
+    Bypasses the tagger and the text encoder. Auto-resolves the source image's
+    `_anima_te.safetensors` cache (the file `cache_text_embeddings.py` writes
+    — same format the trainer consumes) and runs one invert + edit pass per
+    stored variant with ψ_tar == ψ_src. With `--caption_shuffle_variants N`
+    caches, this sweeps v0 (pristine) + v1..v{N-1} (tag-shuffled). Each pass
+    should reconstruct the source; divergence flags numeric drift in
+    invert/edit_forward against that variant's cross-emb representation.
+
+    Add ``--fm_score`` to also rank each variant's ψ_src by its intrinsic
+    flow-matching error (AGSM-style reward; lower = more on-manifold) and
+    correlate that ranking against each variant's reconstruction MSE — a
+    quantitative replacement for eyeballing the side-by-side divergence.
+
+    Examples:
+      make exp-test-directedit-dry
+      REF_IMAGE=foo.png make exp-test-directedit-dry
+      python tasks.py exp-test-directedit-dry foo.png --seed 7
+      python tasks.py exp-test-directedit-dry foo.png --fm_score
+    """
+    ref_image = os.environ.get("REF_IMAGE", "").strip()
+    if not ref_image and extra and not extra[0].startswith("-"):
+        ref_image = extra[0]
+        extra = extra[1:]
+    if not ref_image:
+        ref_image = _random_ref_image(ROOT / "post_image_dataset" / "resized") or ""
+    if not ref_image:
+        print(
+            "Usage: python tasks.py exp-test-directedit-dry [<ref_image>] [extra...]\n"
+            "   or: REF_IMAGE=path/to/ref.png python tasks.py exp-test-directedit-dry\n"
+            "   (no ref given and post_image_dataset/resized/ is empty)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    ref_image = _resolve_ref_image(ref_image)
+
+    candidates = _te_cache_candidates(ref_image)
+    cache_path = _resolve_te_cache(ref_image)
+    if cache_path is None:
+        looked = "\n".join(f"      {p}" for p in candidates)
+        print(
+            f"  ! No TE cache found for {ref_image}.\n"
+            f"    Looked in:\n{looked}\n"
+            "    Run `make preprocess-te` first (with --caption_shuffle_variants N "
+            "to get a multi-variant cache).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(f"  > TE cache: {cache_path}")
+
+    save_dir = ROOT / "output" / "tests" / "directedit_dry"
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    base_iter = iter(INFERENCE_BASE)
+    py = next(base_iter)
+    next(base_iter)  # drop "inference.py"
+    leftover_base = list(base_iter)
+    args = [py, "scripts/edit.py", *_filter_inference_base_for_edit(leftover_base)]
+    args += [
+        "--image",
+        str(ref_image),
+        "--cached_embed",
+        str(cache_path),
+        "--save_path",
+        str(save_dir),
+    ]
+    args += list(extra)
+    run(args)
+
+    pngs = sorted(
+        (p for p in save_dir.glob("*.png") if not p.name.endswith("_src.png")),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if pngs:
+        src_dst = pngs[0].with_name(pngs[0].stem + "_src.png")
+        shutil.copy(ref_image, src_dst)
+        print(f"  > Source pasted: {src_dst}")
+
+
+def _filter_inference_base_for_edit(args: list[str]) -> list[str]:
+    """Drop INFERENCE_BASE flags that ``scripts/edit.py`` doesn't accept.
+
+    INFERENCE_BASE bundles plenty of generation-only flags (--prompt, --seed,
+    --image_size, --infer_steps, --sampler, etc.) that overlap with or
+    conflict with edit.py's own. Keep only the model/path flags we actually
+    want to forward; let edit.py supply its own defaults for the rest.
+    """
+    keep_flags = {
+        "--dit",
+        "--text_encoder",
+        "--vae",
+        "--vae_chunk_size",
+        "--attn_mode",
+    }
+    boolean_flags = {"--vae_disable_cache"}
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok in keep_flags and i + 1 < len(args):
+            out.extend([tok, args[i + 1]])
+            i += 2
+        elif tok in boolean_flags:
+            out.append(tok)
+            i += 1
+        else:
+            i += 1
+    return out
+
+
+def cmd_test_spd(extra):
+    """Inference with the latest SPD fine-tune LoRA on the SPD sampler.
+
+    Runs at the *schedule the LoRA was trained on* — read from the safetensors
+    metadata (``ss_spd_stages`` / ``ss_spd_transition_sigmas``, stamped by
+    ``scripts/distill_spd.py``) so the trajectory geometry can't silently
+    mismatch what was trained (proposal R2). CFG stays at the production
+    default (4.0); ``--spd`` forces Euler internally.
+
+        make exp-test-spd
+        make exp-test-spd ARGS="--spd_stages 0.5 0.75 1.0 --spd_transition_sigmas 0.6 0.4"
+        make exp-test-spd ARGS="--seed 1234 --image_size 832 1248"
+
+    User ``ARGS`` win: passing ``--spd_stages`` / ``--spd_transition_sigmas``
+    in ARGS overrides the metadata schedule.
+    """
+    import json
+
+    from safetensors import safe_open
+
+    weight = latest_output("anima_spd")
+    md: dict[str, str] = {}
+    try:
+        with safe_open(str(weight), "pt") as f:
+            md = f.metadata() or {}
+    except Exception as e:  # noqa: BLE001
+        print(f"  warn: could not read SPD schedule from {weight}: {e}")
+
+    base = override_arg(list(INFERENCE_BASE), "--sampler", "euler")  # SPD forces Euler
+    cmd = [*base, "--lora_weight", str(weight), "--spd"]
+
+    stages = md.get("ss_spd_stages")
+    trans = md.get("ss_spd_transition_sigmas")
+    label = md.get("ss_spd_schedule_label", "?")
+    if stages and "--spd_stages" not in extra:
+        cmd += ["--spd_stages", *(str(s) for s in json.loads(stages))]
+    if trans and "--spd_transition_sigmas" not in extra:
+        cmd += ["--spd_transition_sigmas", *(str(s) for s in json.loads(trans))]
+    print(f"  > SPD LoRA: {weight}  schedule='{label}' stages={stages} σ={trans}")
+    run([*cmd, *extra])
+
+
+def _resolve_inference_base_flag(name: str) -> str | None:
+    """Read a ``--name <value>`` pair out of ``INFERENCE_BASE``.
+
+    Lets ``cmd_invert_directedit`` reuse the same ``--dit`` path as the
+    other test commands without duplicating the model-path string.
+    """
+    base = list(INFERENCE_BASE)
+    for i, tok in enumerate(base):
+        if tok == name and i + 1 < len(base):
+            return base[i + 1]
+    return None
+
+
+def _resolve_ref_image_pool(directory: Path, n: int) -> list[str]:
+    """Pick ``n`` distinct random images from ``directory``.
+
+    Same convention as ``_random_ref_image`` but returns a list (no
+    replacement) for the N_IMAGES > 1 path.
+    """
+    if not directory.is_dir():
+        return []
+    pool = [p for p in directory.rglob("*") if p.suffix.lower() in _REF_IMAGE_EXTS]
+    if not pool:
+        return []
+    if n >= len(pool):
+        return [str(p) for p in pool]
+    return [str(p) for p in random.sample(pool, n)]
+
+
+def cmd_invert_directedit(extra):
+    """Probe: does an inverted per-image postfix tail make DirectEdit dry-mode
+    reconstruction (ψ_tar == ψ_src) more robust than the bare T5(tags) prefix?
+
+    For each of ``N_IMAGES`` source images:
+
+      1. Invert the orthogonal postfix tail (scripts/inversion/invert_postfix_tail.py)
+         — K trainable scales over a frozen Q@diag(s) basis, optimized against
+         flow-matching loss through the frozen DiT.
+      2. Run ``scripts/edit.py --cached_embed`` in dry mode against the
+         **baseline** v0 prefix (T5(tags)).
+      3. Splice ``Q @ diag(s)`` into the last K positions of that prefix and
+         run dry mode again. This is the **postfix-augmented** ψ_src.
+
+    Both runs write to ``output/tests/invert_directedit/<stem>/{baseline,postfix}/``
+    with the source pasted alongside, so the postfix's reconstruction lift can
+    be eyeballed without going through the full bench analyzer.
+
+    Env vars (all optional, all match invert_postfix_tail.py defaults):
+      N_IMAGES (default 1)   — number of images to process
+      REF_IMAGE              — single explicit image path (sets N_IMAGES=1)
+      K (default 48)         — tail length
+      INVERT_STEPS (100)     — inversion optimization steps
+      INVERT_LR (0.01)       — AdamW lr
+      LAMBDA_ZERO (0.0)      — ‖s‖² regularization
+      SIGMA_MIN (0.0)        — P-GRAFT low-σ skip (lower σ bound)
+      SIGMA_MAX (1.0)        — upper σ bound; <1.0 restricts to low-σ supervision
+      BASIS (svd_te)         — basis kind (svd_te|random)
+      SEED (0)               — per-image inversion seed
+      TIMESTEPS_PER_STEP (1) — batched sigmas per forward (× GRAD_ACCUM = total)
+      GRAD_ACCUM (1)         — grad accum steps
+
+    Examples:
+      make exp-invert-directedit
+      REF_IMAGE=post_image_dataset/resized/12345.png make exp-invert-directedit
+      N_IMAGES=3 make exp-invert-directedit
+      K=8 INVERT_STEPS=50 make exp-invert-directedit
+    """
+
+    ref_image_override = os.environ.get("REF_IMAGE", "").strip()
+    if not ref_image_override and extra and not extra[0].startswith("-"):
+        ref_image_override = extra[0]
+        extra = extra[1:]
+
+    n_images_env = os.environ.get("N_IMAGES", "").strip()
+    try:
+        n_images = max(1, int(n_images_env)) if n_images_env else 1
+    except ValueError:
+        print(f"  ! N_IMAGES={n_images_env!r} is not an int, using 1", file=sys.stderr)
+        n_images = 1
+    if ref_image_override:
+        n_images = 1
+
+    if ref_image_override:
+        images = [_resolve_ref_image(ref_image_override)]
+    else:
+        images = _resolve_ref_image_pool(
+            ROOT / "post_image_dataset" / "resized", n_images
+        )
+    if not images:
+        print(
+            "Usage: python tasks.py exp-invert-directedit [<ref_image>] [extra...]\n"
+            "   or: REF_IMAGE=path/to/ref.png python tasks.py exp-invert-directedit\n"
+            "   or: N_IMAGES=3 python tasks.py exp-invert-directedit\n"
+            "   (no ref given and post_image_dataset/resized/ is empty)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Inversion knobs — env overrides; defaults match invert_postfix_tail.py.
+    K = int(os.environ.get("K", "8"))
+    invert_steps = int(os.environ.get("INVERT_STEPS", "100"))
+    invert_lr = float(os.environ.get("INVERT_LR", "1e-1"))
+    lambda_zero = float(os.environ.get("LAMBDA_ZERO", "0.0"))
+    sigma_min = float(os.environ.get("SIGMA_MIN", "0"))
+    sigma_max = float(os.environ.get("SIGMA_MAX", "1.0"))
+    basis_kind = os.environ.get("BASIS", "random").strip()
+    seed = int(os.environ.get("SEED", "0"))
+    timesteps_per_step = int(os.environ.get("TIMESTEPS_PER_STEP", "1"))
+    grad_accum = int(os.environ.get("GRAD_ACCUM", "2"))
+
+    run_root = ROOT / "output" / "tests" / "invert_directedit"
+    run_root.mkdir(parents=True, exist_ok=True)
+    basis_path = run_root / f"svd_basis_K{K}.pt"
+
+    # Reuse INFERENCE_BASE's model trio so this target stays in sync.
+    dit_path = _resolve_inference_base_flag("--dit")
+    if dit_path is None:
+        print("  ! INFERENCE_BASE has no --dit value", file=sys.stderr)
+        sys.exit(1)
+    attn_mode = _resolve_inference_base_flag("--attn_mode") or "flash"
+
+    # Lazy import — keep the task module light when this command isn't run.
+    from library.inference.editing.postfix_inversion import (  # noqa: PLC0415
+        load_or_build_basis,
+        load_tail_s,
+        splice_tail_into_te_cache,
+    )
+
+    base_iter = iter(INFERENCE_BASE)
+    py = next(base_iter)
+    next(base_iter)  # drop 'inference.py'
+    leftover_base = list(base_iter)
+    edit_base_args = [
+        py,
+        "scripts/edit.py",
+        *_filter_inference_base_for_edit(leftover_base),
+    ]
+
+    for i, ref_image in enumerate(images):
+        stem = Path(ref_image).stem
+        print(f"\n=== [{i + 1}/{len(images)}] {stem} ===")
+
+        # The cached TE is the baseline v0 prefix.
+        te_path = _resolve_te_cache(ref_image)
+        if te_path is None:
+            looked = "\n".join(f"    {p}" for p in _te_cache_candidates(ref_image))
+            print(
+                f"  ! No TE cache found for {stem}. Looked in:\n{looked}\n"
+                "    Run `make preprocess-te` first.",
+                file=sys.stderr,
+            )
+            continue
+
+        # Invert the postfix tail via the standalone CLI.
+        img_dir = run_root / stem
+        invert_out = img_dir / "inversion"
+        s_path = invert_out / "s" / f"{stem}_s.safetensors"
+        if s_path.exists():
+            print(f"  > Reusing existing inversion: {s_path}")
+        else:
+            invert_cmd = [
+                py,
+                "scripts/inversion/invert_postfix_tail.py",
+                # directedit needs the ortho_tail s-vector (spliced via basis Q
+                # below); the probe script now defaults to soft_tokens, which
+                # writes a bank/ file instead — pin the mode explicitly.
+                "--parameterization",
+                "ortho_tail",
+                "--dit",
+                str(dit_path),
+                "--attn_mode",
+                str(attn_mode),
+                "--image_dir",
+                str(te_path.parent),
+                "--image_stem",
+                stem,
+                "--K",
+                str(K),
+                "--basis",
+                basis_kind,
+                "--basis_path",
+                str(basis_path),
+                "--steps",
+                str(invert_steps),
+                "--lr",
+                str(invert_lr),
+                "--lambda_zero",
+                str(lambda_zero),
+                "--sigma_min",
+                str(sigma_min),
+                "--sigma_max",
+                str(sigma_max),
+                "--seed",
+                str(seed),
+                "--timesteps_per_step",
+                str(timesteps_per_step),
+                "--grad_accum",
+                str(grad_accum),
+                "--output_dir",
+                str(invert_out),
+            ]
+            run(invert_cmd)
+            if not s_path.exists():
+                print(
+                    f"  ! Inversion did not produce {s_path}; skipping {stem}",
+                    file=sys.stderr,
+                )
+                continue
+
+        # Build the spliced TE cache. D=1024 = Qwen3's hidden size (the only one
+        # Anima ships against); load_or_build_basis fails loud on a shape mismatch.
+        s, _ = load_tail_s(str(s_path))
+        Q = load_or_build_basis(
+            K=K,
+            D=1024,
+            kind=basis_kind,
+            te_cache_dir=str(te_path.parent),
+            basis_path=str(basis_path),
+            seed=seed,
+        )
+
+        spliced_te = img_dir / "te_postfix.safetensors"
+        splice_tail_into_te_cache(
+            str(te_path),
+            str(spliced_te),
+            s=s,
+            Q=Q,
+            variant_index=0,
+        )
+        print(f"  > Spliced TE cache: {spliced_te}")
+
+        # Two dry-mode edit.py invocations: baseline + postfix.
+        for label, cache_for_run in (
+            ("baseline", te_path),
+            ("postfix", spliced_te),
+        ):
+            save_dir = img_dir / label
+            save_dir.mkdir(parents=True, exist_ok=True)
+            edit_cmd = [
+                *edit_base_args,
+                "--image",
+                str(ref_image),
+                "--cached_embed",
+                str(cache_for_run),
+                "--cached_embed_variants",
+                "0",
+                "--save_path",
+                str(save_dir),
+                *list(extra),
+            ]
+            run(edit_cmd)
+
+            pngs = sorted(
+                (p for p in save_dir.glob("*.png") if not p.name.endswith("_src.png")),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if pngs:
+                src_dst = pngs[0].with_name(pngs[0].stem + "_src.png")
+                shutil.copy(ref_image, src_dst)
+                print(f"  > [{label}] source pasted: {src_dst}")
+
+
+def cmd_test_byg(extra):
+    """Inference with the latest BYG editing LoRA (source image + instruction).
+
+    NOTE (v1): BYG ships as a *plain LoRA*, so the trained weights load via the
+    standard ``--lora_weight`` path; the only missing inference piece is the
+    parameter-free source-concat conditioning patch (``BYGConditioning`` in
+    ``networks/methods/byg.py``) being installed at generation time and primed
+    with the VAE-encoded reference. That wiring into ``library/inference/`` is
+    the next phase (mirrors the EasyControl KV-prefill node). Until then this
+    command is a placeholder so the collapse-watch validation can be run once
+    inference is wired.
+    """
+    raise SystemExit(
+        "exp-test-byg: BYG inference (source-concat patch install + ref encode) "
+        "is not wired yet — see the P2 inference step in "
+        "docs/proposal/byg_unpaired_editing.md. Training (exp-byg) is functional; "
+        "the trained checkpoint is a plain LoRA loadable via --lora_weight."
+    )

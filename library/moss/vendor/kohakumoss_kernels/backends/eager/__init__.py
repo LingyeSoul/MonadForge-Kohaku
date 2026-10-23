@@ -1,0 +1,19 @@
+"""Eager reference backend: what every op computes, and the CPU path. Every name in a
+module's `__all__` is registered as that op."""
+
+from library.moss.vendor.kohakumoss_kernels import fp8, quant  # noqa: F401  (register the eager quant ops)
+from library.moss.vendor.kohakumoss_kernels.backends.eager import (
+    attention,
+    ffn,
+    hadamard,
+    loss,
+    norm,
+    rope,
+    textenc,
+)
+from library.moss.vendor.kohakumoss_kernels.quant import rotated  # noqa: F401  (the eager rotated op)
+from library.moss.vendor.kohakumoss_kernels.registry import register
+
+for _module in (attention, ffn, hadamard, loss, norm, rope, textenc):
+    for _name in _module.__all__:
+        register(_name, "eager", getattr(_module, _name))

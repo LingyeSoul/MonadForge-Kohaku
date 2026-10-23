@@ -1,0 +1,122 @@
+# SPD fine-tuning LoRA — trajectory adapter for progressive-resolution inference
+# (proposal: _archive/proposals/spd_finetune_lora.md, "Case B").
+#
+# Read by scripts/distill_spd.py — NOT by train.py. Schema is bespoke
+# (sections, like turbo.toml). Don't `python tasks.py print-config METHOD=spd`.
+#
+# Trains a *plain* rank-32 LoRA on one frozen Anima DiT to follow the
+# stage-specific straight-line velocity targets of the SPD multi-resolution
+# trajectory (§4.3, Eq. 11–14). Output `output/ckpt/anima_spd.safetensors` is a
+# normal LoRA — load it through the standard inference path and run with the
+# SPD sampler at the *same* schedule (`make exp-test-spd`). The weights are
+# shape-agnostic; only the learned behavior is coupled to the schedule below,
+# so it is snapshotted into the safetensors metadata (R2).
+
+output_name = "anima_spd_snrgate128"
+dit_path = "models/diffusion_models/anima-base-v1.0.safetensors"
+data_dir = "post_image_dataset/lora"
+output_dir = "output/ckpt"
+
+iterations = 16000
+batch_size = 1
+seed = 42
+# compile_inductor_mode = "reduce-overhead"
+
+# torch.compile knobs (only active with --torch_compile, on by default).
+# compile_dynamic_seq: collapse the per-(stage x bucket) block graphs into ONE
+# symbolic-seq graph (mark_dynamic on the seq axis), bounded by the *downsampled*
+# stage token counts. Trades a handful of warmup recompiles for a single graph.
+compile_dynamic_seq = true
+# activation_memory_budget: partitioner saved-activation fraction (<1.0 recomputes
+# cheap intermediates in backward to cut peak VRAM). 1.0 = off. Ignored under
+# --grad_ckpt. 0.85 is the train.py default trade-off.
+activation_memory_budget = 0.99
+
+[network]
+rank = 128
+alpha = 128
+attn_mode = "flash"
+channel_scaling_alpha = 0.5
+
+# SPD schedule — the segment geometry this LoRA learns and MUST infer with.
+# Ascending resolution scales (last must be 1.0) and the σ thresholds at which
+# the sampler spectral-expands to the next stage (len = len(stages)-1).
+# v0 = the bench's single-late knee (SamplerSPEED `[0.5, 0.5, 0.99, 0.5]`):
+# run t∈(0.5,1] at half resolution, expand at σ≈0.5, finish full-res.
+[schedule]
+stages = [0.5, 1.0]
+transition_sigmas = [0.7]
+label = "single_0.5_sigma0.7"
+# Per-stage sampling multiplier (len = len(stages)). The trainer samples a stage
+# each micro-step ∝ (band width × stage_weight): the band-width factor keeps σ
+# marginally-uniform *within* each stage (paper's U(0,1)); stage_weights then tilt
+# how much of the gradient budget lands on each stage WITHOUT disturbing in-band σ
+# density. All-ones (or omitted) = exact band-width-proportional baseline.
+stage_weights = [0.4, 0.6]
+sigma_jitter = 0.0
+flow_shift = 3.0
+
+# On-policy (DAgger) stage entry. The analytic target trains each stage>0 entry
+# as a straight line from the true clean low-passed latent, but inference rolls
+# the prefix from pure noise to an imperfect, off-manifold state (exposure bias;
+# bench/spd/probe_onpolicy_handoff.py). When enabled, the stage>0 entry is the
+# state the adapter-on prefix actually rolls to, supervised back toward the true
+# clean x0 — and validation moves on-policy too, so best-ckpt selection tracks
+# the deployed sampler instead of the analytic line. CLI: --onpolicy /
+# --dagger_warmup / --onpolicy_ratio / --rollout_steps.
+[onpolicy]
+enabled = true
+# Steps (>=1) or ratio of iterations (<1) trained fully analytic before mixing
+# on-policy entries in — the adapter is too random early to roll a useful prefix.
+dagger_warmup = 0.25
+# Final fraction of stage>0 micro-steps that use the on-policy entry (ramped in
+# linearly after dagger_warmup). 1.0 = fully on-policy once warmed up.
+ratio = 1.0
+# Euler steps in the no-grad prefix rollout. Fewer than deploy is fine (only a
+# plausible on-policy state is needed) and keeps the extra forwards cheap.
+rollout_steps = 18
+
+# SNR-gated (information-aware) velocity loss. Plain per-sample velocity MSE
+# supervises every DCT band at every σ — including bands whose clean coefficient
+# is statistically unrecoverable from x_t (the post-expansion HF block is fresh
+# noise). The MSE-optimal response there is dataset-mean detail = learned HF
+# attenuation: the "blurs instead of improving" failure of the ungated run.
+# The gate weights the DCT-domain error per band by the recoverable fraction
+# w_ω(t) = SNR_ω(t)/(1+SNR_ω(t)) (paper Prop. 1 / Eq. 15 fed back into the
+# loss), with P_ω measured from the training latents at startup. Validation
+# scores the same gated loss, so best-ckpt selection stops rewarding hedging.
+# CLI: --snr_gate / --snr_gate_mode / --snr_gate_delta / --snr_gate_profile_n.
+[snr_gate]
+enabled = true
+mode = "soft"        # "soft" = w=SNR/(1+SNR); "hard" = 1[t<=t_ω] at delta below
+delta = 0.01         # hard-mode activation-time tolerance (paper default)
+profile_n = 64       # latents sampled to measure P_ω
+n_bins = 128         # radial-frequency bins of the measured profile
+
+[optim]
+lr = 1e-5
+weight_decay = 0.0
+grad_clip = 1.0
+# Micro-steps accumulated per optimizer step; the SPD stage is resampled each
+# one so every update mixes low-res and full-res grads (cancels the
+# regime-switching noise). 1 = off. `iterations` counts optimizer steps, so
+# wall-clock scales ~linearly. 4 is the suggested starting point.
+# grad_accum = 4
+warmup = 0.05           # ratio of iterations (int >=1 → absolute steps)
+# EMA decay on the LoRA params (e.g. 0.999). 0 = off. When on, the EMA weights
+# are what gets validated AND saved — smooths the late-overfit / early-underfit
+# curve so you don't have to hand-pick the iteration. CLI: --ema_decay.
+ema_decay = 0.0
+
+[io]
+save_every = 16000
+log_interval = 5
+log_dir = "output/logs/spd"
+# CMMD-free validation: held out per-bucket (never trained on), scored as the
+# deterministic analytic velocity-MSE over every stage × a fixed σ grid. Cheap
+# (one micro-step's memory, no PE-Core/sampling → won't OOM) and directly
+# comparable step-to-step, so train↓/val↑ flags the trajectory-memorisation
+# overfit. 0 = off. CLI: --val_split / --val_interval / --n_val_sigmas.
+val_split = 0.01
+val_interval = 16000
+n_val_sigmas = 4

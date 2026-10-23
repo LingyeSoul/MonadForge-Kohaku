@@ -1,0 +1,124 @@
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+.venv
+*.egg-info/
+dist/
+build/
+output/
+*.safetensors
+.vscode/
+# Ship the SmoothQuant-style per-channel calibration as a vendored asset —
+# small (~3.5MB), strictly an input-magnitude prior on the base DiT, not a
+# checkpoint. Regenerate via `bench/channel_stats/analyze_lora_input_channels.py`.
+!networks/calibration/channel_stats.safetensors
+!networks/calibration/channel_stats_anima40.safetensors
+!networks/calibration/cond_channel_stats.safetensors
+# MOSS-Image's (scripts/calibration/moss_channel_stats.py), same role.
+!library/moss/calibration/channel_stats.safetensors
+!library/moss/calibration/channel_mean.safetensors
+# The empty prompt's MOSS TE embedding (caption dropout's uncond); train.py re-encodes it if missing.
+!library/moss/asset/empty_prompt.safetensors
+*.ckpt
+*.pt
+.DS_Store
+*.whl
+image_dataset
+post_image_dataset/
+ip-adapter-dataset/
+easycontrol-dataset/
+masks/
+masks_mit/
+masks_sam/
+archive/graft/runtime/train_images/
+archive/graft/runtime/candidates/
+archive/graft/runtime/survivors/
+archive/graft/runtime/generation_prompts.txt
+/models/
+!library/models/
+sr/weights/
+test_output/
+output_temp/
+/workflows
+results
+logs
+.claude
+_logs/
+.claude/*
+!.claude/skills/
+!.claude/agents/
+.claude/agents/session-explorer.md
+.claude/agents/archive-explorer.md
+.env
+.anima_backend
+.anima_torch
+.anima-update-backups
+node.zip
+tools/
+_archive/
+configs/webui_settings.json
+configs/custom/
+configs/gui-methods/custom/
+/docs/plans
+/docs/compose
+/webui/frontend/node_modules
+*.tsbuildinfo
+/wandb
+/.playwright-mcp
+near_twins_temp.toml
+sincos_decensored/
+bench/x0_contradiction/prompts/
+/refs
+/__research__/AnimaLoraToolkit/
+/__research__/LyCORIS/
+
+# Local pytest scratch dirs (see tests README: --basetemp=.pytest_tmp)
+.pytest_tmp/
+.pytest_tmp_base/
+/.impeccable
+near_twins_temp.toml
+sincos_decensored/
+# ResShift SR sidecar (finished — lives under project/finished/sr/, whose own
+# .gitignore drops its venv / weights / data); the external clone is gone.
+/ResShift/
+/post_image_dataset
+# LaTeX build artifacts (paper dirs; main.pdf stays tracked)
+project/*/paper/*.log
+project/*/paper/*.blg
+# paper_bench = pure run artifacts (~15 GB, no scripts/docs; nothing ever tracked)
+project/sigma_lowres/paper_bench/
+
+project/sigma_lowres/bench/probe1024_closure
+project/sigma_lowres/bench/probe1280_cache
+
+# anime_tools stage reports (report_dir defaults anchor on ANIMA_HOME = this
+# checkout). Anchored: a bare `workspace/` also swallowed the
+# library/curation_compat/workspace/ package, which is tracked source.
+/workspace/
+# anime_tools panel settings (seeded by the WebUI's anime_tools panel)
+.anime_tools_gui.json
+
+# Path rules for a subdirectory go in a .gitignore inside it, not here: ripgrep
+# (Grep / Glob / Explore) applies this root file's path-anchored rules only when
+# a search starts at the repo root, so ignored files there leak into any search
+# started below it. Nested: configs/gui-methods, bench/cjk_{adapter,distill},
+# project/finished/{sr,cjk_aware_anima,cjk_aware_anima_dit,…/datasets}.
+
+# Font binaries (CJK lines fetch their own; on main their per-dir ignores are absent).
+# The WebUI ships its own web fonts.
+*.ttf
+*.otf
+*.ttc
+
+# ocr_reader gate images (labels stay tracked in project/finished/ocr_reader/assets/)
+project/finished/ocr_reader/eval_data/
+
+# Cross-process curation settings lock (runtime only).
+.anime_tools_webui.lock
+
+# Snow session runtime state (logs / screenshots / nested worktree). The audit
+# notes under .snow/plan/ stay trackable.
+.snow/logs/
+.snow/artifacts/
+.snow/team-worktree/

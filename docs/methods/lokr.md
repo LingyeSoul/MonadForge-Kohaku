@@ -1,0 +1,182 @@
+# LoKr
+
+LoKr parameterizes an adapter delta as a Kronecker product:
+
+```text
+delta_W = kron(w1, w2) * scale
+```
+
+MonadForge-Kohaku uses `lycoris-lora==4.0.0` as the LoKr backend. Each factor may be
+stored directly or decomposed again into a low-rank pair. `lokr_factor`
+controls the Kronecker dimension split and `network_dim` controls the
+secondary factor rank when full-matrix mode is off. The Anima integration only
+adds module targeting, fused-attention splitting, lifecycle, and checkpoint
+metadata around the official implementation.
+
+The wrapper uses official factorization, initialization, canonical state keys,
+and bypass operations. The wrapper calls the functional `kron_bypass` with
+the complete `self.scale * multiplier` factor exactly once. The efficient
+path remains equivalent to the
+official regular forward without materializing a full DiT-sized delta.
+
+## LyCORIS 4.0 fused kernels
+
+`lokr_backend` explicitly selects `torch` (default) or `triton` for the
+adapter forward/backward, including dimension-from-checkpoint training.
+The WebUI exposes it under Architecture. It is independent of
+`torch_compile` and `LYCORIS_KERNEL_BACKEND`; an unsupported explicit
+selection fails instead of switching implementations.
+
+The Triton bypass requires CUDA and reconstructed Kronecker factors whose
+power-of-two padded axes are all at most 128. Configuration/prelaunch checks
+cover the targeted Anima attention and MLP shapes; module assembly checks
+the actual dimensions again. Standard Anima attention and MLP projections
+fit with `lokr_factor=64`, while `8` exceeds the limit. Rank and image
+resolution do not change the reconstructed factor dimensions.
+
+Input and factors use the base linear output's compute dtype. Factor
+reconstruction runs with autocast disabled after this conversion, keeping
+the Triton forward and backward operands consistent even when AdaLN supplies
+FP32 input under BF16/FP16 autocast. Protected V100 FP32 adapter training
+requires `lokr_backend="torch"`. Merge/bake retains the upstream rebuild
+backend policy.
+
+`bypass`, `ypass`, `use_triton`, and `apply_bypass` are rejected with migration
+instructions: remove them and set `lokr_backend`. Linear LoKr always uses
+bypass mode.
+
+## AnimaLoraToolkit comparison
+
+AnimaLoraToolkit commit `c6bd6b644e4cd31fe0f98ba563a5856c88413e4e`
+does not use LyCORIS in its main `anima_train.py` path. It injects a local
+`LoKrLayer` into q/k/v/output and MLP projections, evaluates
+`F.linear(dropout(x), kron(w1, w2)) * (alpha / rank)`, and optimizes all adapter
+parameters with AdamW through the normal flow-matching MSE loss. Its checkpoint
+metadata names `lycoris.kohya`, but the layer itself is custom. The separate
+`utils/model_utils.py` LyCORIS branch is an unused example/fallback and is not
+called by the main trainer. MonadForge-Kohaku therefore follows the official library
+rather than copying that simplified full-factor layer.
+
+## Full-factor training
+
+Use the dedicated switch when both Kronecker factors should remain complete:
+
+```toml
+network_dim = 32
+network_alpha = 32
+use_lokr = true
+lokr_factor = 8
+decompose_both = false
+lokr_full_factor = true
+```
+
+`lokr_full_factor` is the compatibility name for LyCORIS `full_matrix`.
+LyCORIS produces full `lokr_w1` and `lokr_w2` parameters and forces
+`alpha=network_dim`, so the effective training scale is always 1. The
+`decompose_both` flag is ignored while full-matrix mode is active.
+
+`network_dim = 114514` is accepted for compatibility with LyCORIS-era configs.
+Once both factors become full, official LyCORIS also forces unit scale; it does
+not retain `network_alpha / 114514`. Prefer the explicit flag because it states
+the intended layout without an opaque sentinel.
+
+Full-factor LoKr still has Kronecker structure. It can reach the maximum rank
+allowed by the two factors, but it is not equivalent to unrestricted full
+fine-tuning of the base weight.
+
+## V100 eager memory
+
+On V100/fp16, MonadForge-Kohaku keeps the LoKr bypass arithmetic in FP32 for numerical
+stability. Two eager-autograd effects otherwise exhaust a 16 GiB card:
+
+1. Official LoKr bypass autograd retains the converted full FP32 input and a
+   grouped projection that is close to the base layer's output width.
+2. Anima's bounded eager GELU MLP originally recognized plain LoRA modules
+   only. Switching the same configuration to LoKr silently restored the
+   ordinary `layer1 -> GELU -> layer2` graph and retained full `d_ff`
+   activations for every block.
+
+LyCORIS does not materialize `kron(w1, w2)` in this path. The OOM is caused by
+retained eager activations, not construction of a full Kronecker delta.
+
+When `torch_compile=false`, the V100 compatibility resolver automatically
+enables `use_custom_down_autograd` together with `lora_fp32_compute`. For LoKr,
+that switch now uses a chunked bypass that saves the original FP16 input and
+factor storage, then rematerializes each FP32 chunk in backward. Full-factor
+`w1`/`w2`, decomposed `w2`, and `decompose_both` layouts are supported. The
+LoKr-specific default is 1024 rows because its intermediate is much wider than
+a normal LoRA rank projection. The same switch also enables a LoKr-aware,
+two-linear GELU MLP Function that saves only the original `d_model` input and
+rematerializes the base and LoKr work per row chunk.
+
+LoRA down/up weight gradients use one full reduction GEMM so their FP32
+parameters match standard autograd exactly. LoKr factor gradients deliberately
+retain row-chunked FP32 accumulation: replacing that reduction with one full
+LoKr backward would reconstruct the hundreds-of-MiB grouped workspace this
+path is designed to avoid. The changed summation order can differ from the
+official eager bypass at about `1e-4` relative scale. The production-sized
+regression fixture locks both relative and absolute tolerances rather than
+claiming a universal absolute bound. Forward values and activation gradients
+remain within FP16 rounding tolerance relative to the reference; with the V100
+FP32 adapter policy, the merged public activation itself remains FP32.
+
+On July 25, 2026, the unchanged 1024px V100 16 GiB configuration OOMed on its
+first forward before the LoKr-aware MLP path was added: PyTorch had 15.30 GiB
+allocated, 31.44 MiB free, and failed a 64 MiB allocation in the frozen MLP
+`layer1` linear. With both rematerialization paths enabled, the same
+configuration completed 6/6 steps twice, saved all 280 native LoKr modules,
+and measured a PyTorch peak of 14.2324 GiB allocated and 14.3164 GiB reserved.
+The instrumented run averaged 10.93 seconds per optimizer step. Under the
+save policy used for that historical run, its 27,543,320-parameter BF16
+checkpoint was 55,186,240 bytes (52.63 MiB), so checkpoint parameter volume
+was not the dominant source of the original OOM. On the V100/sm_70 FP16
+protection path, effective `lora_fp32_compute=true` now also forces FP32
+checkpoint storage; the same payload is therefore approximately 105.26 MiB.
+Other GPU and precision paths retain their requested save dtype.
+
+The corresponding wide-FFN microbenchmark (`4200 x 3072 -> 9216`, full-factor
+LoKr, V100) reduced saved tensors from 198.6 MiB to 25.5 MiB. At the default
+1024-row chunk, peak reserved workspace fell from 814 MiB to 382 MiB. These
+numbers isolate one adapter projection; the full-training peak above includes
+the model, optimizer, all activations, and CUDA allocator state.
+
+The cross-cutting `bench/v100_eager/run_bench.py --cases lokr_mlp` comparison
+also covers the complete two-linear GELU path. A final 4200-row
+`2048 -> 8192 -> 2048` RTX 4060 regression reduced saved tensors from 459.8 MiB
+to 81.4 MiB, peak allocated workspace from 841.2 MiB to 330.6 MiB, and peak
+reserved workspace from 898 MiB to 374 MiB. These are allocator regression
+numbers for the final implementation, not V100 end-to-end results.
+
+For the reported 1024px eager configuration, use:
+
+```toml
+use_lokr = true
+lokr_factor = 8
+network_dim = 32
+network_alpha = 32
+lokr_full_factor = true
+
+torch_compile = false
+mixed_precision = "fp16"
+use_custom_down_autograd = true
+use_timestep_mask = false
+```
+
+`use_timestep_mask` must be false for every LoKr layout. T-LoRA masks a shared
+`network_dim` bottleneck, while LoKr has separate Kronecker factors and
+full-matrix mode has no rank axis at all. MonadForge-Kohaku rejects the combination
+instead of silently training unmasked LoKr.
+
+Full-factor parameters and optimizer state still consume more memory than some
+decomposed LoKr layouts. If a particular dataset bucket remains too large after
+the eager rematerialization path is active, the next memory controls are
+`torch_compile=true` with its activation-memory budget, gradient checkpointing,
+or a lower resolution.
+
+## Legacy states
+
+Historical snapshots containing `lokr_allow_legacy_dim=true` still parse. The
+backend no longer requires it; the WebUI retains it only as an escape hatch for
+its explicit-configuration migration prompt. Canonical decomposed keys are
+`lokr_w1_a` / `lokr_w1_b` and `lokr_w2_a` / `lokr_w2_b`; the loader accepts
+older MonadForge-Kohaku `w1a` / `w1b` / `w2a` / `w2b` keys at the boundary.

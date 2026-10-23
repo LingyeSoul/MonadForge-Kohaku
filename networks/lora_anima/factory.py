@@ -1,0 +1,1372 @@
+# Build a LoRANetwork from create_network kwargs (fresh training) or from a
+# saved checkpoint's tensors (warm-start / inference). Centralises the kwarg
+# parsing and checkpoint key-sniffing.
+
+import json
+import logging
+import os
+import re
+from dataclasses import replace
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import torch
+
+from library.config.lokr import parse_lokr_backend, validate_lokr_legacy_options
+from library.env import resolve_under_home
+from library.log import setup_logging
+from networks import NETWORK_REGISTRY, resolve_network_spec
+from networks.lora_anima.config import _DEFAULT_EXCLUDE, LoRANetworkCfg, _as_str_list
+from networks.lora_anima.loading import (
+    _normalize_native_lokr_keys,
+    _refuse_split_chimera_keys,
+    _refuse_split_hydra_keys,
+    _refuse_split_stacked_experts_keys,
+    _refuse_unfused_attn_lora_keys,
+    _stack_chimera_lora_ups,
+    _stack_lora_ups,
+    _warn_legacy_fused_lokr_keys,
+)
+from networks.lora_anima.network import LoRANetwork
+
+setup_logging()
+logger = logging.getLogger(__name__)
+
+
+# Vendored SmoothQuant-style calibration — ships in-tree (~3.5 MB) so deploys
+# (including custom_nodes/*/_vendor/ trees) work without a separate download.
+# Regenerate via `scripts/calibration/analyze_lora_input_channels.py`.
+_CHANNEL_STATS_PATH = (
+    Path(__file__).resolve().parent.parent / "calibration" / "channel_stats.safetensors"
+)
+_CHANNEL_STATS_40_PATH = _CHANNEL_STATS_PATH.with_name(
+    "channel_stats_anima40.safetensors"
+)
+_STATS_BLOCK_RE = re.compile(r"^lora_unet_blocks_(\d+)_")
+_TARGET_BLOCK_RE = re.compile(r"blocks\.(\d+)\.")
+
+
+def _channel_stats_target_filter(kwargs: dict[str, object]):
+    """Build the same name filters used by ``LoRANetwork.create_modules``."""
+
+    exclude_patterns = _as_str_list(kwargs.get("exclude_patterns")) or []
+    exclude_patterns.append(_DEFAULT_EXCLUDE)
+    include_patterns = _as_str_list(kwargs.get("include_patterns")) or []
+
+    def compile_patterns(patterns: list[str]) -> list[re.Pattern]:
+        compiled = []
+        for pattern in patterns:
+            try:
+                compiled.append(re.compile(pattern))
+            except re.error as exc:
+                logger.error("Invalid pattern %r: %s", pattern, exc)
+        return compiled
+
+    exclude_re_patterns = compile_patterns(exclude_patterns)
+    include_re_patterns = compile_patterns(include_patterns)
+    layer_start = kwargs.get("layer_start")
+    layer_start = int(layer_start) if layer_start is not None else None
+    layer_end = kwargs.get("layer_end")
+    layer_end = int(layer_end) if layer_end is not None else None
+
+    def is_target(original_name: str) -> bool:
+        excluded = any(
+            pattern.fullmatch(original_name) for pattern in exclude_re_patterns
+        )
+        included = any(
+            pattern.fullmatch(original_name) for pattern in include_re_patterns
+        )
+        if excluded and not included:
+            return False
+
+        block_match = _TARGET_BLOCK_RE.match(original_name)
+        if block_match:
+            block_idx = int(block_match.group(1))
+            if layer_start is not None and block_idx < layer_start:
+                return False
+            if layer_end is not None and block_idx >= layer_end:
+                return False
+        return True
+
+    return is_target
+
+
+def _infer_lokr_factor(state_dict: Dict[str, torch.Tensor], stem: str = "lokr") -> int:
+    """Infer one factor that reconstructs every canonical LoKr module.
+
+    A single module can be ambiguous: an explicit factor may produce the same
+    split as LyCORIS' default factorization for one shape but not for another.
+    Unstamped checkpoints therefore need a network-wide consistency check.
+
+    ``stem`` selects the key family — ``"lokr"`` (LyCORIS wrapper) or
+    ``"glokr"`` (native Kronecker+BoRA); both share the factorization math.
+    """
+    from lycoris.functional import factorization
+
+    prefixes = sorted(
+        {
+            key.rsplit(".", 1)[0]
+            for key in state_dict
+            if key.endswith(
+                (
+                    f".{stem}_w1",
+                    f".{stem}_w1_a",
+                    f".{stem}_w2",
+                    f".{stem}_w2_a",
+                )
+            )
+        }
+    )
+    if not prefixes:
+        return -1
+
+    layouts: list[tuple[str, tuple[int, int], tuple[int, int], tuple[int, int]]] = []
+    candidates = {-1}
+    for prefix in prefixes:
+        w1 = state_dict.get(f"{prefix}.{stem}_w1")
+        w1a = state_dict.get(f"{prefix}.{stem}_w1_a")
+        w1b = state_dict.get(f"{prefix}.{stem}_w1_b")
+        w2 = state_dict.get(f"{prefix}.{stem}_w2")
+        w2a = state_dict.get(f"{prefix}.{stem}_w2_a")
+        w2b = state_dict.get(f"{prefix}.{stem}_w2_b")
+
+        if w1 is None and (w1a is None or w1b is None):
+            raise RuntimeError(
+                f"LoKr checkpoint has an incomplete w1 factor at {prefix!r}"
+            )
+        if w2 is None and (w2a is None or w2b is None):
+            raise RuntimeError(
+                f"LoKr checkpoint has an incomplete w2 factor at {prefix!r}"
+            )
+
+        w1_shape = tuple(w1.shape) if w1 is not None else (w1a.size(0), w1b.size(1))
+        w2_shape = tuple(w2.shape) if w2 is not None else (w2a.size(0), w2b.size(1))
+        full_shape = (
+            w1_shape[0] * w2_shape[0],
+            w1_shape[1] * w2_shape[1],
+        )
+        layouts.append((prefix, w1_shape, w2_shape, full_shape))
+        candidates.update((max(w1_shape), max(w2_shape)))
+
+    def matches_factor(
+        layout: tuple[str, tuple[int, int], tuple[int, int], tuple[int, int]],
+        factor: int,
+    ) -> bool:
+        _, w1_shape, w2_shape, full_shape = layout
+        out_a, out_b = factorization(full_shape[0], factor)
+        in_a, in_b = factorization(full_shape[1], factor)
+        return w1_shape == (out_a, in_a) and w2_shape == (out_b, in_b)
+
+    for candidate in sorted(candidates):
+        if all(matches_factor(layout, candidate) for layout in layouts):
+            return candidate
+
+    details = ", ".join(
+        f"{prefix}: w1={w1_shape}, w2={w2_shape}"
+        for prefix, w1_shape, w2_shape, _ in layouts
+    )
+    raise RuntimeError(
+        "LoKr checkpoint factor layouts are inconsistent across modules; " + details
+    )
+
+
+def _load_channel_scales(
+    kwargs: Dict[str, object],
+    unet=None,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Load per-channel input pre-scaling stats, gated on ``channel_scaling_alpha``.
+
+    SmoothQuant-style. ``channel_scaling_alpha`` is the sole user knob:
+    0.0 disables (the kwarg fallback when unset); base.toml ships 0.5 = sqrt
+    balance, so it is ON by default; 1.0 fully flattens. The calibration file
+    is vendored at ``networks/calibration/channel_stats.safetensors``;
+    regenerate it with ``scripts/calibration/analyze_lora_input_channels.py``.
+    Only rebalances variants whose down-projection is trainable — exactly
+    inert on frozen-basis ortho variants (see
+    ``docs/optimizations/channel_scaling.md`` §Liveness).
+    See ``_archive/bench/channel_stats/channel_dominance_analysis.md`` for motivation.
+    """
+    raw_alpha = kwargs.get("channel_scaling_alpha", 0.0)
+    channel_scaling_alpha = float(raw_alpha) if raw_alpha is not None else 0.0
+    if channel_scaling_alpha == 0.0:
+        return None
+
+    num_blocks = int(getattr(unet, "num_blocks", 28) or 28)
+    stats_path = _CHANNEL_STATS_40_PATH if num_blocks == 40 else _CHANNEL_STATS_PATH
+    if not stats_path.is_file():
+        raise FileNotFoundError(
+            f"vendored channel stats missing at {stats_path}. "
+            f"Regenerate with:\n"
+            f"  python scripts/calibration/analyze_lora_input_channels.py "
+            f"--per_artist --dump_channel_stats {stats_path}"
+        )
+    from safetensors.torch import load_file as _load_channel_stats_file
+
+    if num_blocks == 40:
+        from safetensors import safe_open
+
+        with safe_open(str(stats_path), framework="pt") as handle:
+            metadata = dict(handle.metadata() or {})
+        expected_metadata = {
+            "anima_stats_schema": "1",
+            "anima_arch": "anima-2048-40",
+            "anima_num_blocks": "40",
+            "anima_model_channels": "2048",
+        }
+        mismatches = [
+            f"{key}={metadata.get(key)!r} (expected {value!r})"
+            for key, value in expected_metadata.items()
+            if metadata.get(key) != value
+        ]
+        source_hash = metadata.get("anima_base_sha256")
+        current_hash = getattr(unet, "anima_base_sha256", None)
+        if not source_hash:
+            mismatches.append("anima_base_sha256 is missing")
+        elif not current_hash:
+            mismatches.append("current DiT is missing anima_base_sha256 identity")
+        elif source_hash.lower() != str(current_hash).lower():
+            mismatches.append(
+                f"anima_base_sha256={source_hash!r} (expected {current_hash!r})"
+            )
+        if mismatches:
+            raise ValueError(
+                f"invalid 40-block channel stats metadata in {stats_path}: "
+                + "; ".join(mismatches)
+            )
+
+    raw_stats = _load_channel_stats_file(str(stats_path))
+    if num_blocks == 40:
+        block_indices = {
+            int(match.group(1))
+            for key in raw_stats
+            if (match := _STATS_BLOCK_RE.match(key)) is not None
+        }
+        if block_indices != set(range(40)):
+            raise ValueError(
+                "40-block channel stats must cover exactly blocks 0..39; "
+                f"found {sorted(block_indices)}"
+            )
+
+        expected_shapes: dict[str, int] = {}
+        is_target = _channel_stats_target_filter(kwargs)
+        target_classes = set(LoRANetwork.ANIMA_TARGET_REPLACE_MODULE)
+        for name, module in unet.named_modules():
+            if module.__class__.__name__ not in target_classes:
+                continue
+            for child_name, child in module.named_modules():
+                if not isinstance(child, torch.nn.Linear):
+                    continue
+                original_name = ((name + ".") if name else "") + child_name
+                original_name = original_name.replace("_orig_mod.", "")
+                if not is_target(original_name):
+                    continue
+                lora_name = "lora_unet_" + original_name.replace(".", "_")
+                expected_shapes[lora_name] = int(child.in_features)
+        missing = sorted(set(expected_shapes) - set(raw_stats))
+        malformed = sorted(
+            key
+            for key, in_features in expected_shapes.items()
+            if key in raw_stats
+            and (
+                raw_stats[key].ndim != 1
+                or raw_stats[key].numel() != in_features
+                or not torch.isfinite(raw_stats[key]).all()
+            )
+        )
+        if missing or malformed:
+            raise ValueError(
+                "40-block channel stats do not cover the actual LoRA targets: "
+                f"missing={missing[:5]}, malformed={malformed[:5]}"
+            )
+
+    out: Dict[str, torch.Tensor] = {}
+    for _lora_name, _mean_abs in raw_stats.items():
+        _s = _mean_abs.float().clamp_min(1e-6).pow(channel_scaling_alpha)
+        _s = _s / _s.mean().clamp_min(1e-12)
+        out[_lora_name] = _s
+    logger.info(
+        f"channel_scaling: alpha={channel_scaling_alpha}, "
+        f"stats={stats_path.name} ({len(out)} calibrated modules)"
+    )
+    return out
+
+
+def _load_grad_basis(
+    kwargs: Dict[str, object],
+    unet,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Load the gradient-SVD ``lora_down`` basis, gated on ``down_init``.
+
+    Both gradient modes read the same artifact: ``basis_file`` points at a
+    shipped/universal basis, and ``grad_svd`` points at the per-run sketch
+    ``train.py`` wrote just before the network was built. Depth is validated in
+    ``grad_basis.load_basis`` — a basis is per checkpoint arch.
+    """
+    down_init = str(kwargs.get("down_init", "kaiming") or "kaiming")
+    if down_init not in ("grad_svd", "basis_file"):
+        return None
+
+    basis_file = kwargs.get("grad_basis_file")
+    if not basis_file:
+        raise ValueError(
+            f"down_init={down_init!r} needs network_args grad_basis_file=<path>. "
+            "For 'grad_svd' that path is written by train.py's own sketch pass — "
+            "seeing this means the network was built outside train.py."
+        )
+    from networks.grad_basis import dit_num_blocks, load_basis
+
+    basis, meta = load_basis(
+        resolve_under_home(str(basis_file)),
+        num_blocks=dit_num_blocks(unet) if unet is not None else None,
+    )
+    logger.info(
+        f"down_init={down_init}: gradient basis {Path(str(basis_file)).name} "
+        f"({len(basis)} layers, rank={meta.get('rank', '?')})"
+    )
+    return basis
+
+
+def create_network(
+    multiplier: float,
+    network_dim: Optional[int],
+    network_alpha: Optional[float],
+    vae,
+    text_encoders: list,
+    unet,
+    neuron_dropout: Optional[float] = None,
+    **kwargs,
+):
+    spec = resolve_network_spec(kwargs)
+
+    # Reintroduced narrowly for eager V100/fp16 training. Rank GEMMs remain
+    # fp32 while custom Functions bound the large eager LoRA/MLP intermediates.
+    # Under torch.compile these paths are bypassed so Dynamo fusion plus
+    # AOTAutograd/activation_memory_budget retain control.
+    if str(kwargs.get("use_custom_down_autograd", "false")).strip().lower() in (
+        "true",
+        "1",
+    ):
+        logger.info(
+            "use_custom_down_autograd enabled: bounded eager FP32 LoRA/LoKr "
+            "and MLP intermediates (compile path unchanged)"
+        )
+
+    channel_scales_dict = _load_channel_scales(kwargs, unet)
+
+    # LoKR/LoHa + channel_scaling is incompatible: LoKR's Kronecker
+    # factorization can't absorb a full-length channel_scale (lokr.py:126),
+    # and neither native on-disk format (lokr_w* / hada_*) has an inv_scale
+    # slot ComfyUI-side loaders would honor. create_modules skips the
+    # injection for both module classes; warn here so users know to drop the
+    # config knob rather than discover it via a black-image checkpoint.
+    if (
+        spec.name in ("lokr", "glokr", "loha")
+        and channel_scales_dict
+        and float(kwargs.get("channel_scaling_alpha", 0.0) or 0.0) > 0
+    ):
+        logger.warning(
+            "%s + channel_scaling_alpha>0 is incompatible — the per-channel "
+            "scale cannot be absorbed/saved in the native %s format, so "
+            "channel scaling is auto-disabled for these modules. Set "
+            "channel_scaling_alpha=0 to silence this. The checkpoint will "
+            "save in native format.",
+            spec.name.upper(),
+            spec.name,
+        )
+    grad_basis_dict = _load_grad_basis(kwargs, unet)
+
+    cfg = LoRANetworkCfg.from_kwargs(
+        kwargs,
+        network_dim=network_dim,
+        network_alpha=network_alpha,
+        neuron_dropout=neuron_dropout,
+        module_class=spec.module_class,
+        channel_scales_dict=channel_scales_dict,
+        grad_basis_dict=grad_basis_dict,
+    )
+
+    if cfg.router_lr_scale != 1.0:
+        logger.info(
+            f"HydraLoRA router LR scale: {cfg.router_lr_scale}x unet_lr (applies to .router.* params — σ features live in router.weight columns)"
+        )
+
+    network = LoRANetwork(text_encoders, unet, cfg, multiplier=multiplier)
+
+    # Variant-specific defaults — overridden by spec.post_init for the matching variant.
+    network._use_hydra = False
+    network._balance_loss_weight = 0.0
+
+    # save_weights keys off the resolved spec to pick the save pipeline.
+    network._network_spec = spec
+    if spec.post_init is not None:
+        spec.post_init(network, kwargs)
+
+    # REPA v2 aux alignment loss (off unless use_repa). Config stashed on the
+    # network so REPAMethodAdapter + losses._repa_loss read it without new args;
+    # head built for absolute mode only (relational/Gram has none). See
+    # library/training/repa.py.
+    from networks.lora_anima.config import _as_bool
+
+    if _as_bool(kwargs.get("use_repa")):
+        network._repa_mode = str(kwargs.get("repa_mode", "relational")).lower()
+        network._repa_weight = float(kwargs.get("repa_weight", 0.05) or 0.0)
+        network._repa_layer = int(kwargs.get("repa_layer", 8))
+        network._repa_encoder = str(kwargs.get("repa_encoder", "pe_spatial"))
+        network._repa_lr_scale = float(kwargs.get("repa_lr_scale", 1.0) or 1.0)
+        network._repa_anneal_steps = float(kwargs.get("repa_anneal_steps", 0.0) or 0.0)
+        network._repa_spatial_norm = _as_bool(kwargs.get("repa_spatial_norm"))
+        network._repa_timestep_weighting = float(
+            kwargs.get("repa_timestep_weighting", 0.0) or 0.0
+        )
+        network._repa_grad_heatmap = float(kwargs.get("repa_grad_heatmap", 0) or 0)
+        # REPA-DoG target band-pass (_archive/proposals/repa_dog_target.md): when on
+        # replaces the spatial_norm block in relational target preprocess (no head).
+        network._repa_target_dog = _as_bool(kwargs.get("repa_target_dog"), default=True)
+        network._repa_dog_sigma1_div = float(
+            kwargs.get("repa_dog_sigma1_div", 16.0) or 16.0
+        )
+        network._repa_dog_sigma2_div = float(
+            kwargs.get("repa_dog_sigma2_div", 0.0) or 0.0
+        )
+        network._repa_dog_norm_std = float(kwargs.get("repa_dog_norm_std", 0.0) or 0.0)
+        from library.vision.encoders import get_encoder_info
+
+        enc_dim = get_encoder_info(network._repa_encoder).d_enc
+        dit_dim = int(unet.model_channels)
+        if network._repa_mode == "absolute":
+            from library.training.repa import REPAHead
+
+            network.repa_head = REPAHead(dit_dim, dit_dim, enc_dim)
+            # Training-only: save_weights strips registered prefixes.
+            network._training_only_prefixes.add("repa_head.")
+        logger.info(
+            f"REPA[{network._repa_mode}]: weight={network._repa_weight}, "
+            f"layer={network._repa_layer}, encoder={network._repa_encoder}, "
+            f"anneal_steps={network._repa_anneal_steps:g}, "
+            f"spatial_norm={network._repa_spatial_norm}, "
+            f"target_dog={network._repa_target_dog}"
+        )
+    else:
+        network._repa_weight = 0.0
+
+    if cfg.use_timestep_mask:
+        logger.info(
+            f"Timestep-dependent rank masking: min_rank={cfg.min_rank}, alpha={cfg.alpha_rank_scale}"
+        )
+    if cfg.router_source == "sigma" and network._global_router_hits > 0:
+        logger.info(
+            f"GlobalRouter (σ) → Hydra: {network._global_router_hits} "
+            f"shared-A modules consume gates from the network-level router "
+            f"on sinusoidal(σ) (feat={cfg.sigma_feature_dim}). Per-layer "
+            f"routers are disabled; balance loss is inert in this mode."
+        )
+    elif cfg.router_source == "sigma" and network._sigma_router_hits > 0:
+        logger.info(
+            f"σ-conditional HydraLoRA router: {network._sigma_router_hits} modules "
+            f"with sinusoidal(σ) concatenated to router input (feat={cfg.sigma_feature_dim}), "
+            f"per-bucket balance w={cfg.per_bucket_balance_weight}, buckets={cfg.num_sigma_buckets}"
+        )
+    elif cfg.router_source == "sigma":
+        logger.warning(
+            "router_source='sigma' but no modules matched router_targets "
+            f"regex {cfg.router_targets!r} — σ-routing is inactive"
+        )
+    routing_aware_count = len(getattr(network, "_routing_aware_loras", []))
+    if cfg.router_source == "fei" and network._global_router_hits > 0:
+        logger.info(
+            f"GlobalRouter (FEI) → Hydra: {network._global_router_hits} "
+            f"shared-A modules consume gates from the network-level router "
+            f"on FEI ({cfg.fei_feature_dim}-band simplex, σ_low_div={cfg.fei_sigma_low_div}). "
+            f"Per-layer routers are disabled; balance loss is inert in this "
+            f"mode (gates arrive detached)."
+        )
+    elif cfg.router_source == "fei" and network._fei_router_hits > 0:
+        logger.info(
+            f"FEI-conditional HydraLoRA router: {network._fei_router_hits} modules "
+            f"with FEI ({cfg.fei_feature_dim}-band simplex) concatenated to router input "
+            f"(σ_low_div={cfg.fei_sigma_low_div}). FeRA-style content-aware routing."
+        )
+    elif (
+        cfg.router_source == "fei"
+        and cfg.use_moe_style == "independent_A"
+        and routing_aware_count > 0
+    ):
+        logger.info(
+            f"GlobalRouter (FEI) → StackedExperts: {routing_aware_count} "
+            f"independent-A modules consume gates from the network-level router "
+            f"on FEI ({cfg.fei_feature_dim}-band simplex, σ_low_div={cfg.fei_sigma_low_div})."
+        )
+    elif cfg.router_source == "fei":
+        logger.warning(
+            "router_source='fei' but no modules matched router_targets "
+            f"regex {cfg.router_targets!r} — FEI-routing is inactive"
+        )
+    if cfg.specialize_experts_by_sigma_buckets:
+        experts_per_band = cfg.num_experts // cfg.num_sigma_buckets
+        edges_str = (
+            f"custom edges {cfg.sigma_bucket_boundaries}"
+            if cfg.sigma_bucket_boundaries is not None
+            else "uniform edges"
+        )
+        logger.info(
+            f"Hard σ-band expert partition ON: {cfg.num_experts} experts split "
+            f"into {cfg.num_sigma_buckets} bands of {experts_per_band} experts "
+            f"(interleaved layout, {edges_str}). "
+            "Out-of-band logits are masked to -inf before softmax — soft routing "
+            "operates only within each σ band."
+        )
+    if spec.name == "ortho_hydra":
+        logger.info(
+            f"OrthoHydraLoRA: Cayley + MoE, num_experts={cfg.num_experts}, "
+            f"balance_loss_weight={network._balance_loss_weight}"
+        )
+    elif spec.name == "chimera_hydra":
+        logger.info(
+            f"ChimeraHydra: dual-pool additive, K_c={cfg.num_experts_content}, "
+            f"K_f={cfg.num_experts_freq}, balance(w_c={network._balance_w_content}, "
+            f"w_f={network._balance_w_freq}), outer={network._balance_loss_weight}"
+        )
+    elif spec.name == "ortho":
+        logger.info("OrthoLoRA: Cayley parameterization + SVD-informed init")
+    elif spec.name == "hydra":
+        logger.info(
+            f"HydraLoRA: num_experts={cfg.num_experts}, balance_loss_weight={network._balance_loss_weight}"
+        )
+    if spec.name in ("hydra", "ortho_hydra") and (
+        network._hydra_router_re is not None or network._hydra_router_names is not None
+    ):
+        fallback_name = "OrthoLoRA" if spec.name == "ortho_hydra" else "LoRA"
+        logger.info(
+            f"HydraLoRA layer filter: {network._hydra_router_hits} MoE modules, "
+            f"{network._hydra_router_misses} fell back to plain {fallback_name} "
+            f"(regex={cfg.router_targets!r})"
+        )
+        if network._hydra_router_hits == 0:
+            logger.warning(
+                "router_targets regex matched zero modules — no MoE routing "
+                "is active, every target became plain LoRA."
+            )
+    if cfg.layer_start is not None or cfg.layer_end is not None:
+        logger.info(
+            f"Layer range: training blocks [{cfg.layer_start or 0}, {cfg.layer_end or '...'})"
+        )
+
+    loraplus_lr_ratio = kwargs.get("loraplus_lr_ratio", None)
+    loraplus_unet_lr_ratio = kwargs.get("loraplus_unet_lr_ratio", None)
+    loraplus_text_encoder_lr_ratio = kwargs.get("loraplus_text_encoder_lr_ratio", None)
+    loraplus_lr_ratio = (
+        float(loraplus_lr_ratio) if loraplus_lr_ratio is not None else None
+    )
+    loraplus_unet_lr_ratio = (
+        float(loraplus_unet_lr_ratio) if loraplus_unet_lr_ratio is not None else None
+    )
+    loraplus_text_encoder_lr_ratio = (
+        float(loraplus_text_encoder_lr_ratio)
+        if loraplus_text_encoder_lr_ratio is not None
+        else None
+    )
+    if (
+        loraplus_lr_ratio is not None
+        or loraplus_unet_lr_ratio is not None
+        or loraplus_text_encoder_lr_ratio is not None
+    ):
+        network.set_loraplus_lr_ratio(
+            loraplus_lr_ratio, loraplus_unet_lr_ratio, loraplus_text_encoder_lr_ratio
+        )
+
+    return network
+
+
+def create_network_from_weights(
+    multiplier,
+    file,
+    ae,
+    text_encoders,
+    unet,
+    weights_sd=None,
+    for_inference=False,
+    metadata: Optional[Dict[str, str]] = None,
+    **kwargs,
+):
+    validate_lokr_legacy_options(kwargs)
+    # Metadata flows independently of tensors: ``load_file()`` drops safetensors
+    # ``__metadata__``, so a caller passing ``weights_sd=`` would lose the
+    # three-axis stamps and trip from_weights' "missing stamps" raise (blaming the
+    # checkpoint, not the call site). Precedence: explicit ``metadata=`` wins;
+    # else read from ``file`` if .safetensors; else ``{}``.
+    file_metadata: Dict[str, str] = dict(metadata) if metadata else {}
+    if weights_sd is None:
+        if os.path.splitext(file)[1] == ".safetensors":
+            from safetensors.torch import load_file
+            from safetensors import safe_open
+
+            weights_sd = load_file(file)
+            if not file_metadata:
+                with safe_open(file, framework="pt") as f:
+                    file_metadata = dict(f.metadata() or {})
+        else:
+            weights_sd = torch.load(file, map_location="cpu")
+    elif (
+        file and not file_metadata and os.path.splitext(str(file))[1] == ".safetensors"
+    ):
+        # Tensors supplied directly, but stamps can still be recovered from the
+        # on-disk file the caller named alongside them.
+        from safetensors import safe_open
+
+        with safe_open(file, framework="pt") as f:
+            file_metadata = dict(f.metadata() or {})
+
+    # Strip torch.compile '_orig_mod_' from old checkpoint keys
+    weights_sd = LoRANetwork._strip_orig_mod_keys(weights_sd)
+
+    raw_network_args = file_metadata.get("ss_network_args", "")
+    network_args_metadata: Dict[str, object] = {}
+    if raw_network_args:
+        try:
+            parsed_network_args = json.loads(raw_network_args)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Ignoring malformed ss_network_args metadata")
+        else:
+            if isinstance(parsed_network_args, dict):
+                network_args_metadata = parsed_network_args
+
+    # Canonical keys pass through; only old shortened MonadForge-Kohaku factor names
+    # are rewritten to the official LyCORIS/ComfyUI layout.
+    weights_sd = _normalize_native_lokr_keys(weights_sd)
+    # Detect legacy fused-projection LoKR (pre-split-layout) checkpoints so
+    # the user gets an actionable warning instead of silent key drops.
+    _warn_legacy_fused_lokr_keys(weights_sd)
+
+    # Pre-official MonadForge-Kohaku could store a full-input ``inv_scale`` alongside
+    # LoKr factors. LyCORIS has no representation for that extra transform, so
+    # preserve the exact delta by materializing it into standard LoRA at the
+    # compatibility boundary. New LoKr training never creates inv_scale.
+    has_legacy_lokr_scale = any(k.endswith(".inv_scale") for k in weights_sd)
+    has_lokr_factors = any(".lokr_w" in k for k in weights_sd)
+    if has_legacy_lokr_scale and has_lokr_factors:
+        from networks.lora_save import _convert_lokr_to_standard_lora
+
+        raw_dim = file_metadata.get("ss_network_dim")
+        legacy_network_dim = int(float(raw_dim)) if raw_dim else None
+        _convert_lokr_to_standard_lora(
+            weights_sd,
+            dtype=None,
+            lora_rank=0,
+            network_dim=legacy_network_dim,
+        )
+        logger.warning(
+            "Converted legacy LoKr+inv_scale checkpoint to standard LoRA "
+            "during load; official LyCORIS LoKr cannot represent inv_scale"
+        )
+
+    # MoE files: stack per-expert ups (and downs, for StackedExperts) and fuse
+    # split q/k/v first so the attention refuser + detection loop see fused
+    # runtime keys. Chimera dual-A files have their own per-pool ups
+    # (.lora_ups_{c,f}.{i}) handled by a separate stack/refuse pair.
+    # ComfyUI-native adaln LoRAs carry keys in the comfy layout
+    # (adaln_modulation_{br}_2); rename to runtime names (adaln_up_{br}) so
+    # create_modules attaches them. Presence-gated. See adaln.md.
+    from networks.lora_utils import (
+        has_comfy_adaln_keys,
+        relayout_adaln_comfy_to_runtime,
+    )
+
+    if has_comfy_adaln_keys(weights_sd):
+        weights_sd = relayout_adaln_comfy_to_runtime(weights_sd)
+        logger.info(
+            "Renamed ComfyUI-layout adaln LoRA keys to in-repo runtime names "
+            "(adaln_modulation_{br}_2 → adaln_up_{br}) for loading."
+        )
+
+    weights_sd = _stack_lora_ups(weights_sd)
+    weights_sd = _stack_chimera_lora_ups(weights_sd)
+    weights_sd = _refuse_split_stacked_experts_keys(weights_sd)
+    weights_sd = _refuse_split_hydra_keys(weights_sd)
+    weights_sd = _refuse_split_chimera_keys(weights_sd)
+    # Refuse unfused attn projections so modules_dim reflects the runtime (qkv/kv fused).
+    weights_sd = _refuse_unfused_attn_lora_keys(weights_sd)
+
+    modules_dim = {}
+    modules_alpha = {}
+    train_llm_adapter = False
+    has_ortho = False
+    has_ortho_hydra = False
+    has_hydra = False
+    # StackedExperts (independent-A): per-expert ``lora_down_weight`` (E, r, in)
+    # AND ``lora_up_weight`` (E, out, r) — discriminated from Hydra by the 3-D
+    # down (Hydra's is the 2-D shared ``lora_down.weight``). The plan-2 stamps
+    # are canonical; this key-sniff is a fallback for unstamped/legacy artifacts.
+    has_stacked_experts = False
+    has_lokr = False
+    has_glokr = False
+    has_loha = False
+    hydra_num_experts = 0
+    # Which lora_names were MoE (Hydra) vs plain, passed as `hydra_router_names`
+    # so create_modules picks the right class per module in mixed checkpoints.
+    hydra_module_names: set[str] = set()
+    plain_module_names: set[str] = set()
+    # Any module with ``.lora_up_c_weight`` is a chimera Linear, NOT plain Hydra.
+    chimera_dual_a_modules: set[str] = set()
+    for key, value in weights_sd.items():
+        if "." not in key:
+            continue
+
+        lora_name = key.split(".")[0]
+
+        # Old global HydraLoRA router — incompatible with per-module routing.
+        if key.startswith("_hydra_router"):
+            raise RuntimeError(
+                "This checkpoint uses the old global HydraLoRA router "
+                "(_hydra_router.*). The router is now per-module and layer-local; "
+                "the old format cannot be loaded. Retrain the LoRA to get the new "
+                "per-module router weights."
+            )
+
+        if "alpha" in key:
+            modules_alpha[lora_name] = value
+        elif key.endswith((".lokr_w1_a", ".lokr_w2_a")):
+            has_lokr = True
+            # Official LyCORIS stores decomposed A as (factor_out, rank).
+            modules_dim[lora_name] = value.size(1)
+        elif key.endswith((".lokr_w1_b", ".lokr_w2_b")):
+            has_lokr = True
+            # B is (rank, factor_in). Prefer an A-derived rank when present.
+            modules_dim.setdefault(lora_name, value.size(0))
+        elif key.endswith((".lokr_w1", ".lokr_w2")):
+            has_lokr = True
+            # A full-full checkpoint has no rank-shaped tensor. Its canonical
+            # alpha is the LyCORIS lora_dim because full matrices force scale=1.
+            modules_dim.setdefault(lora_name, 0)
+        elif key.endswith((".glokr_w1_a", ".glokr_w2_a")):
+            has_glokr = True
+            # Same layout as LoKR: decomposed A is (factor_out, rank).
+            modules_dim[lora_name] = value.size(1)
+        elif key.endswith((".glokr_w1_b", ".glokr_w2_b")):
+            has_glokr = True
+            modules_dim.setdefault(lora_name, value.size(0))
+        elif key.endswith((".glokr_w1", ".glokr_w2")):
+            has_glokr = True
+            # Full-full layout: no rank-shaped tensor; alpha carries lora_dim.
+            modules_dim.setdefault(lora_name, 0)
+        elif key.endswith((".bora_m_row", ".bora_m_col")):
+            # BoRA magnitudes ride alongside glokr factors; dim comes from those.
+            has_glokr = True
+        elif key.endswith((".hada_w1_a", ".hada_w2_a")):
+            has_loha = True
+            # LyCORIS LoHa A factors are (out, rank).
+            modules_dim[lora_name] = value.size(1)
+        elif key.endswith((".hada_w1_b", ".hada_w2_b")):
+            has_loha = True
+            # B factors are (rank, in). Prefer an A-derived rank when present.
+            modules_dim.setdefault(lora_name, value.size(0))
+        elif key.endswith((".hada_t1", ".hada_t2")):
+            # Tucker cores exist only for conv LoHa upstream; Anima adapts
+            # Linears exclusively, and a rebuilt non-tucker module would
+            # silently drop these keys under the non-strict load.
+            raise RuntimeError(
+                f"LoHa checkpoint carries a Tucker core ({key!r}); "
+                "tucker/conv LoHa is not supported by the Anima DiT "
+                "(Linear-only adapters)."
+            )
+        elif key.endswith(".dora_scale"):
+            # LyCORIS weight_decompose (DoRA) renormalizes the merged weight
+            # per row (W' = dora_scale * (W+ΔW)/||W+ΔW||) — the MonadForge-Kohaku
+            # LoKr/LoHa wrappers carry no dora_scale slot, so a non-strict
+            # load would silently drop the key and produce materially wrong
+            # deltas. Fail loudly like the tucker branch above.
+            raise RuntimeError(
+                f"Checkpoint carries a DoRA weight-decompose key ({key!r}); "
+                "LyCORIS weight_decompose/DoRA checkpoints are not supported "
+                "— the decompose renormalization cannot be reproduced by the "
+                "MonadForge-Kohaku LoKr/LoHa wrappers. Retrain without "
+                "weight_decompose, or merge the file with official LyCORIS "
+                "tooling first."
+            )
+        elif key.endswith(".vera_d"):
+            modules_dim[lora_name] = value.size(0)
+        elif key.endswith(".lora_up_c_weight") or key.endswith(".lora_up_f_weight"):
+            # Chimera dual-A per-pool stacked ups; modules_dim filled by the
+            # matching ``.lora_down_{c,f}.weight`` branch below.
+            chimera_dual_a_modules.add(lora_name)
+        elif key.endswith(".lora_down_c.weight") or key.endswith(".lora_down_f.weight"):
+            # Chimera dual-A per-pool down (both keys overwrite modules_dim with
+            # the same r → safe).
+            chimera_dual_a_modules.add(lora_name)
+            modules_dim[lora_name] = value.size(0)
+        elif key.endswith(".lora_down_weight") and value.dim() == 3:
+            # StackedExperts (independent-A) per-expert down (E, r, in) —
+            # discriminator vs Hydra, flips the spec to stacked_experts_global_fei.
+            has_stacked_experts = True
+            hydra_num_experts = max(hydra_num_experts, value.size(0))
+            modules_dim[lora_name] = value.size(1)
+            hydra_module_names.add(lora_name)
+        elif "lora_up_weight" in key:
+            # Stacked-3-D in both Hydra and SE; the down discriminates (above for
+            # SE, below for Hydra). Defer the has_hydra decision until after loop.
+            hydra_num_experts = max(hydra_num_experts, value.size(0))
+            hydra_module_names.add(lora_name)
+        elif key.endswith(".lora_up.weight"):
+            # Plain LoRA up — vanilla, or the plain-fallback leg of a mixed
+            # router_targets checkpoint.
+            plain_module_names.add(lora_name)
+        elif "lora_down" in key:
+            dim = value.size()[0]
+            modules_dim[lora_name] = dim
+        elif key.endswith(".S_p"):
+            if value.dim() == 3:
+                # OrthoHydraLoRA: S_p is (num_experts, r, r)
+                has_ortho_hydra = True
+                hydra_num_experts = max(hydra_num_experts, value.size(0))
+                modules_dim[lora_name] = value.size(1)
+                hydra_module_names.add(lora_name)
+            else:
+                # OrthoLoRA: S_p is (r, r) — pure ortho or the plain-fallback
+                # leg of a mixed ortho_hydra checkpoint.
+                has_ortho = True
+                modules_dim[lora_name] = value.size(0)
+                plain_module_names.add(lora_name)
+        if "llm_adapter" in lora_name:
+            train_llm_adapter = True
+
+    # LoKR: decomposed checkpoints derive rank from their canonical A/B shapes;
+    # only full-full layouts fall back to alpha. Also detect decompose_both and
+    # the Kronecker factor from checkpoint keys.
+    lokr_decompose_both = False
+    lokr_detected_factor = -1
+    lokr_full_factor = False
+    if has_lokr:
+        metadata_factor = network_args_metadata.get(
+            "lokr_factor", network_args_metadata.get("factor")
+        )
+        if metadata_factor is not None:
+            lokr_detected_factor = int(metadata_factor)
+        for name in list(modules_dim.keys()):
+            if modules_dim[name] == 0 and name in modules_alpha:
+                modules_dim[name] = int(modules_alpha[name])
+        metadata_decompose_both = network_args_metadata.get("decompose_both")
+        if metadata_decompose_both is not None:
+            lokr_decompose_both = str(metadata_decompose_both).strip().lower() in (
+                "true",
+                "1",
+            )
+        else:
+            lokr_decompose_both = any(k.endswith(".lokr_w1_a") for k in weights_sd)
+        has_full_w2 = any(k.endswith(".lokr_w2") for k in weights_sd)
+        has_decomposed_w1 = any(
+            k.endswith(".lokr_w1_a") or k.endswith(".lokr_w1_b") for k in weights_sd
+        )
+        has_decomposed_w2 = any(
+            k.endswith(".lokr_w2_a") or k.endswith(".lokr_w2_b") for k in weights_sd
+        )
+        stamped_full_factor = file_metadata.get("ss_lokr_full_factor")
+        if stamped_full_factor is None:
+            stamped_full_factor = network_args_metadata.get(
+                "lokr_full_factor", network_args_metadata.get("full_matrix")
+            )
+        if stamped_full_factor is not None:
+            lokr_full_factor = str(stamped_full_factor).strip().lower() == "true"
+            if lokr_full_factor and (has_decomposed_w1 or has_decomposed_w2):
+                raise RuntimeError(
+                    "LoKR checkpoint is stamped ss_lokr_full_factor=true but "
+                    "contains decomposed factor keys."
+                )
+        else:
+            # Legacy full-factor checkpoints have no stamp. Full w2 factors on
+            # every module are sufficient to reconstruct the intended layout.
+            lokr_full_factor = (
+                has_full_w2 and not has_decomposed_w1 and not has_decomposed_w2
+            )
+        if metadata_factor is None:
+            lokr_detected_factor = _infer_lokr_factor(weights_sd)
+
+    # GLoKr: same shape-recovery story as LoKR (factor + rs_lora ride metadata,
+    # decompose/full layouts are key-sniffed, bora from magnitude keys).
+    glokr_detected_factor = -1
+    glokr_decompose_both = False
+    glokr_full_factor = False
+    glokr_rs_lora = False
+    glokr_bora = True
+    if has_glokr:
+        _glokr_meta_factor = file_metadata.get(
+            "ss_glokr_factor", network_args_metadata.get("glokr_factor")
+        )
+        if _glokr_meta_factor is not None:
+            glokr_detected_factor = int(_glokr_meta_factor)
+        else:
+            glokr_detected_factor = _infer_lokr_factor(weights_sd, stem="glokr")
+        for name in list(modules_dim.keys()):
+            if modules_dim[name] == 0 and name in modules_alpha:
+                modules_dim[name] = int(modules_alpha[name])
+        glokr_decompose_both = any(k.endswith(".glokr_w1_a") for k in weights_sd)
+        _glokr_full_stamp = file_metadata.get(
+            "ss_glokr_full_factor", network_args_metadata.get("glokr_full_factor")
+        )
+        if _glokr_full_stamp is not None:
+            glokr_full_factor = str(_glokr_full_stamp).strip().lower() == "true"
+        else:
+            glokr_full_factor = all(
+                not k.endswith(
+                    (".glokr_w1_a", ".glokr_w1_b", ".glokr_w2_a", ".glokr_w2_b")
+                )
+                for k in weights_sd
+                if ".glokr_w" in k
+            )
+        # rs_lora is NOT recovered: the module pre-folds sqrt(r) into the
+        # persisted alpha buffer (LyCORIS convention), so rebuilding with
+        # rs_lora=False + the stored alpha reproduces the training scale
+        # exactly — even on metadata-stripped checkpoints. The
+        # ss_glokr_rs_lora stamp is provenance only.
+        glokr_bora = any(k.endswith(".bora_m_row") for k in weights_sd)
+
+    # Finalize the MoE shape post-scan: up_weight (3-D) with no matching
+    # down_weight (3-D) is Hydra (shared down); both 3-D means StackedExperts.
+    if not has_stacked_experts and hydra_module_names and not has_ortho_hydra:
+        has_hydra = True
+
+    # De-footgun: MoE keys but no metadata usually means a caller pre-loaded via
+    # load_file() (drops __metadata__) and passed weights_sd= without file=/
+    # metadata=. The three-axis stamps live only there, so from_weights is about
+    # to raise an error blaming the checkpoint — surface the real cause here.
+    if (has_hydra or has_ortho_hydra or has_stacked_experts) and not file_metadata:
+        logger.warning(
+            "MoE checkpoint keys detected but no safetensors metadata was "
+            "available — the three-axis routing stamps (ss_use_moe_style / "
+            "ss_route_per_layer / ss_router_source) live in __metadata__, which "
+            "load_file() drops. If you passed a pre-loaded weights_sd=, also "
+            "pass file=<path> or metadata=<dict> to create_network_from_weights "
+            "so the stamps survive; otherwise loading will fail."
+        )
+
+    # MoE wins over for_inference: the router is sample-dependent and can't fold
+    # into a static merge; the dynamic forward-hook path works in eval too.
+    if has_stacked_experts:
+        spec = NETWORK_REGISTRY["stacked_experts_global_fei"]
+        module_class = spec.module_class
+    elif has_ortho_hydra:
+        spec = NETWORK_REGISTRY["ortho_hydra"]
+        module_class = spec.module_class
+    elif has_hydra:
+        spec = NETWORK_REGISTRY["hydra"]
+        module_class = spec.module_class
+
+    # Legacy σ-router refusal: the additive-bias sigma_mlp design is gone (σ is
+    # now a direct concat into a wider router); .sigma_mlp.* can't be reshaped.
+    _legacy_sigma_keys = [k for k in weights_sd if ".sigma_mlp." in k]
+    if _legacy_sigma_keys:
+        raise RuntimeError(
+            f"Checkpoint contains {len(_legacy_sigma_keys)} legacy σ-router "
+            f"keys (sigma_mlp.*). The σ-conditional router is now a direct "
+            f"concat of sinusoidal(σ) into the router input; the old "
+            f"additive-bias MLP path is unsupported. Retrain the LoRA to "
+            f"produce the new router shape. First legacy key: "
+            f"{_legacy_sigma_keys[0]!r}."
+        )
+
+    # Current router is Linear(lora_dim + sigma_feature_dim + fei_feature_dim, E);
+    # excess over lora_dim splits between σ + FEI. The FEI slice is stamped
+    # (``ss_fei_feature_dim``); subtract it to recover the σ slice. Old broken
+    # shape (width ≈ in_dim) is caught by a sanity cap on excess width.
+    # ``ss_router_source`` is the sole discriminator (legacy fallback retired).
+    new_router_source = str(file_metadata.get("ss_router_source", "")).strip()
+    use_fei_router_meta = new_router_source == "fei"
+    fei_feature_dim_detected: Optional[int] = (
+        int(file_metadata["ss_fei_feature_dim"])
+        if use_fei_router_meta and "ss_fei_feature_dim" in file_metadata
+        else None
+    )
+    fei_sigma_low_div_meta: Optional[float] = (
+        float(file_metadata["ss_fei_sigma_low_div"])
+        if use_fei_router_meta and "ss_fei_sigma_low_div" in file_metadata
+        else None
+    )
+    sigma_feature_dim_detected: Optional[int] = None
+    if has_hydra or has_ortho_hydra:
+        _SIGMA_FEATURE_CAP = 1024
+        fei_slice = int(fei_feature_dim_detected or 0)
+        for k, v in weights_sd.items():
+            if not k.endswith(".router.weight"):
+                continue
+            lora_name = k[: -len(".router.weight")]
+            expected_rank = modules_dim.get(lora_name)
+            if expected_rank is None or v.ndim != 2:
+                continue
+            width = v.size(1)
+            if width < expected_rank:
+                raise RuntimeError(
+                    f"router.weight at {k!r} has width {width} < expected "
+                    f"rank {expected_rank}; checkpoint is malformed."
+                )
+            extra = width - expected_rank - fei_slice
+            if extra < 0:
+                raise RuntimeError(
+                    f"router.weight at {k!r} has width {width}; expected "
+                    f"rank {expected_rank} + fei_feature_dim {fei_slice}. "
+                    "Metadata fei_feature_dim does not match the saved router "
+                    "shape — checkpoint is malformed."
+                )
+            if extra == 0:
+                continue
+            if extra > _SIGMA_FEATURE_CAP:
+                raise RuntimeError(
+                    f"router.weight at {k!r} has shape {tuple(v.shape)}; "
+                    f"expected rank {expected_rank} with optional σ features "
+                    f"appended (≤ {_SIGMA_FEATURE_CAP}). The excess width "
+                    f"{extra} is most likely an old-format router trained "
+                    "on raw layer input (see docs/methods/hydra-lora.md "
+                    "§Fixes). There is no salvage path — retrain the LoRA."
+                )
+            if sigma_feature_dim_detected is None:
+                sigma_feature_dim_detected = extra
+            elif sigma_feature_dim_detected != extra:
+                raise RuntimeError(
+                    f"Inconsistent σ-feature dims across modules: expected "
+                    f"{sigma_feature_dim_detected}, found {extra} at {k!r}."
+                )
+    elif has_lokr:
+        spec = NETWORK_REGISTRY["lokr"]
+        module_class = spec.module_class
+    elif has_glokr:
+        # Must resolve BEFORE the for_inference flatten: GLoKr's merged weight
+        # is not expressible as flat down/up, and its merge_to (weight
+        # replacement + multiplier lerp) is what the bake path needs.
+        spec = NETWORK_REGISTRY["glokr"]
+        module_class = spec.module_class
+    elif has_loha:
+        # Must sit before the ``for_inference`` fallback — a plain LoRAModule
+        # cannot consume hada_* keys, and LoHaModule.merge_to handles the
+        # static-merge path with official Hadamard math.
+        spec = NETWORK_REGISTRY["loha"]
+        module_class = spec.module_class
+    elif any(k.endswith(".vera_d") for k in weights_sd):
+        spec = NETWORK_REGISTRY["vera"]
+        module_class = spec.module_class
+    elif str(file_metadata.get("ss_network_spec", "")).strip() == "dylora":
+        spec = NETWORK_REGISTRY["dylora"]
+        module_class = spec.module_class
+    elif for_inference:
+        # Force plain LoRA spec even for ortho — merge_to/fuse_weight wants flat
+        # down/up, and ortho checkpoints are distilled to LoRA shape at save.
+        spec = NETWORK_REGISTRY["lora"]
+        module_class = spec.module_class
+    elif has_ortho:
+        spec = NETWORK_REGISTRY["ortho"]
+        module_class = spec.module_class
+    else:
+        spec = NETWORK_REGISTRY["lora"]
+        module_class = spec.module_class
+
+    # Detect baked-in per-channel input scaling. Pass a placeholder ones tensor
+    # so each module registers the `inv_scale` buffer at init; load_state_dict
+    # then overwrites it (absorption with s=ones is a no-op).
+    channel_scales_dict: Optional[Dict[str, torch.Tensor]] = None
+    _scale_keys = [k for k in weights_sd.keys() if k.endswith(".inv_scale")]
+    if _scale_keys:
+        channel_scales_dict = {}
+        for _k in _scale_keys:
+            _lora_name = _k.rsplit(".inv_scale", 1)[0]
+            channel_scales_dict[_lora_name] = torch.ones_like(weights_sd[_k])
+        logger.info(
+            f"Detected per-channel input scaling in checkpoint: "
+            f"{len(channel_scales_dict)} modules with baked-in inv_scale"
+        )
+
+    # σ-router names: a module has σ routing iff router.weight width > rank (the
+    # excess is the σ feature slice). Empty when sigma_feature_dim_detected is None.
+    sigma_router_names: List[str] = []
+    if (has_hydra or has_ortho_hydra) and sigma_feature_dim_detected is not None:
+        for k, v in weights_sd.items():
+            if not k.endswith(".router.weight") or v.ndim != 2:
+                continue
+            lora_name = k[: -len(".router.weight")]
+            expected_rank = modules_dim.get(lora_name)
+            if expected_rank is None:
+                continue
+            if v.size(1) - expected_rank == sigma_feature_dim_detected:
+                sigma_router_names.append(lora_name)
+
+    # Per-module Hydra selection: if the file has BOTH hydra and plain leaves,
+    # it's a mixed router_targets result — build each leaf with its original
+    # class. All-hydra → None (apply hydra everywhere). For chimera dual-A, use
+    # ``chimera_dual_a_modules`` so unrouted (OrthoLoRA-fallback) Linears aren't
+    # mis-typed as chimera.
+    _is_chimera_meta = (
+        str(file_metadata.get("ss_use_chimera_hydra", "")).strip().lower() == "true"
+    )
+    if _is_chimera_meta and chimera_dual_a_modules:
+        hydra_router_names = sorted(chimera_dual_a_modules)
+    else:
+        hydra_router_names = (
+            sorted(hydra_module_names)
+            if (
+                (has_hydra or has_ortho_hydra)
+                and plain_module_names
+                and hydra_module_names
+            )
+            else None
+        )
+
+    # Hard σ-band partition is non-persistent at the tensor level (`_expert_band`
+    # is registered persistent=False; `_sigma_band_partition` is a Python attr).
+    # Recover it from the metadata stamped by `LoRANetwork.save_weights`. Older
+    # checkpoints lack the metadata and stay on the soft-routing path.
+    band_partition_on = (
+        str(file_metadata.get("ss_specialize_experts_by_sigma_buckets", "")).lower()
+        == "true"
+    )
+    band_num_buckets = (
+        int(file_metadata["ss_num_sigma_buckets"])
+        if band_partition_on and "ss_num_sigma_buckets" in file_metadata
+        else 0
+    )
+    if band_partition_on and not (has_hydra or has_ortho_hydra):
+        logger.warning(
+            "Checkpoint metadata declares specialize_experts_by_sigma_buckets "
+            "but no Hydra/OrthoHydra keys were detected — ignoring."
+        )
+        band_partition_on = False
+        band_num_buckets = 0
+    if band_partition_on and hydra_num_experts % band_num_buckets != 0:
+        raise RuntimeError(
+            "Checkpoint metadata declares "
+            f"specialize_experts_by_sigma_buckets with num_sigma_buckets="
+            f"{band_num_buckets}, but the Hydra stack has "
+            f"num_experts={hydra_num_experts} which is not divisible. "
+            "Checkpoint is malformed."
+        )
+    band_boundaries: Optional[List[float]] = None
+    if band_partition_on and "ss_sigma_bucket_boundaries" in file_metadata:
+        try:
+            parsed = json.loads(file_metadata["ss_sigma_bucket_boundaries"])
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError(
+                "ss_sigma_bucket_boundaries metadata is malformed: "
+                f"{file_metadata['ss_sigma_bucket_boundaries']!r} ({exc})"
+            ) from exc
+        if not isinstance(parsed, list) or len(parsed) != band_num_buckets + 1:
+            raise RuntimeError(
+                "ss_sigma_bucket_boundaries metadata length does not match "
+                f"num_sigma_buckets+1={band_num_buckets + 1}: {parsed!r}"
+            )
+        band_boundaries = [float(v) for v in parsed]
+
+    # FEI router presence is metadata-stamped; per-module activation list falls
+    # back to the σ-router set (or all hydra modules) — hydralora_fei uses the
+    # same regex as σ. StackedExperts uses a network-level router (no list).
+    fei_router_names: Optional[List[str]] = None
+    if use_fei_router_meta and (has_hydra or has_ortho_hydra):
+        fei_router_names = sigma_router_names or sorted(hydra_module_names) or None
+
+    # Three-axis stamps from save_weights. All three required for MoE checkpoints
+    # (Hydra/OrthoHydra/StackedExperts); from_weights raises otherwise.
+    new_use_moe_style: Optional[str] = file_metadata.get("ss_use_moe_style") or None
+    raw_route_per_layer = file_metadata.get("ss_route_per_layer")
+    new_route_per_layer: Optional[bool] = (
+        (str(raw_route_per_layer).strip().lower() == "true")
+        if raw_route_per_layer is not None
+        else None
+    )
+    new_router_source_stamp: Optional[str] = (
+        new_router_source if new_router_source else None
+    )
+    # OrthoHydra centered-gate: threaded into the runtime combine so the
+    # distilled ``_moe`` form subtracts ``1/E`` like training.
+    ortho_centered_gate: bool = (
+        str(file_metadata.get("ss_ortho_centered_gate", "")).strip().lower() == "true"
+    )
+
+    # ChimeraHydra stamps. ``ss_use_chimera_hydra="true"`` flips to the chimera
+    # spec. FreqRouter input dim needs the chimera-specific FEI/σ stamps —
+    # ``router_source="input"`` for chimera so the standard ss_fei_feature_dim
+    # stamp doesn't fire.
+    is_chimera_hydra = (
+        str(file_metadata.get("ss_use_chimera_hydra", "")).strip().lower() == "true"
+    )
+    chimera_num_experts_content: Optional[int] = (
+        int(file_metadata["ss_num_experts_content"])
+        if is_chimera_hydra and "ss_num_experts_content" in file_metadata
+        else None
+    )
+    chimera_num_experts_freq: Optional[int] = (
+        int(file_metadata["ss_num_experts_freq"])
+        if is_chimera_hydra and "ss_num_experts_freq" in file_metadata
+        else None
+    )
+    chimera_fei_feature_dim: Optional[int] = (
+        int(file_metadata["ss_chimera_fei_feature_dim"])
+        if is_chimera_hydra and "ss_chimera_fei_feature_dim" in file_metadata
+        else None
+    )
+    chimera_sigma_feature_dim: Optional[int] = (
+        int(file_metadata["ss_chimera_sigma_feature_dim"])
+        if is_chimera_hydra and "ss_chimera_sigma_feature_dim" in file_metadata
+        else None
+    )
+    chimera_fei_sigma_low_div: Optional[float] = (
+        float(file_metadata["ss_chimera_fei_sigma_low_div"])
+        if is_chimera_hydra and "ss_chimera_fei_sigma_low_div" in file_metadata
+        else None
+    )
+    # Default false when absent — pre-LN checkpoints trained on raw concat(FEI,σ);
+    # rebuilding with LN on would feed the trained MLP different statistics.
+    chimera_freq_router_layer_norm: bool = (
+        is_chimera_hydra
+        and str(file_metadata.get("ss_chimera_freq_router_layer_norm", ""))
+        .strip()
+        .lower()
+        == "true"
+    )
+    # Freq routing mode. Absent ⇒ "learned" (pre-2026-05-27 ckpts carry
+    # FreqRouter weights). "fei" rebuilds the hardwired path (no FreqRouter).
+    chimera_freq_router_mode: str = (
+        str(file_metadata.get("ss_chimera_freq_router_mode", "learned")).strip().lower()
+        if is_chimera_hydra
+        else "learned"
+    ) or "learned"
+    chimera_freq_router_tau: float = (
+        float(file_metadata.get("ss_chimera_freq_router_tau", 1.0))
+        if is_chimera_hydra
+        else 1.0
+    )
+    # Content routing is always the network-level ContentRouter on pooled
+    # crossattn_emb; the retired per-Linear ("input") path is rejected rather
+    # than silently mis-loaded. content_router_layer_norm is the only varying
+    # stamp (parameterless LN, no tensor footprint).
+    if is_chimera_hydra:
+        _content_src = (
+            str(file_metadata.get("ss_chimera_content_router_source", "input"))
+            .strip()
+            .lower()
+        )
+        if _content_src not in ("crossattn", "crossattn_emb"):
+            raise RuntimeError(
+                "Chimera checkpoint uses the retired per-Linear content router "
+                f"(ss_chimera_content_router_source={_content_src!r}); only the "
+                "network-level crossattn_emb ContentRouter is supported now. "
+                "Retrain to produce a crossattn_emb chimera checkpoint."
+            )
+    chimera_content_router_layer_norm: bool = (
+        is_chimera_hydra
+        and str(file_metadata.get("ss_chimera_content_router_layer_norm", ""))
+        .strip()
+        .lower()
+        == "true"
+    )
+    if is_chimera_hydra:
+        # On-disk: per-pool distilled chimera (lora_down_{c,f} + stacked
+        # lora_up_{c,f}_weight + content router), q/k/v defused, top-level
+        # freq_router.*. The 1-A legacy fallback was removed.
+        if not chimera_dual_a_modules:
+            raise RuntimeError(
+                "Checkpoint is stamped ss_use_chimera_hydra=true but contains "
+                "no dual-A chimera keys (.lora_up_c_weight / .lora_up_f_weight). "
+                "The 1-A chimera format is no longer supported — retrain to "
+                "produce the dual-A format."
+            )
+        spec = NETWORK_REGISTRY["chimera_hydra"]
+        from networks.lora_modules import ChimeraHydraInferenceModule
+
+        module_class = ChimeraHydraInferenceModule
+        # Chimera dual-A keys are NOT Hydra; clear the auto-set has_hydra so
+        # from_weights doesn't demand the three-axis stamps via the MoE branch.
+        has_hydra = False
+        # hydra_num_experts is only for the chimera K_c+K_f==E check.
+        if (
+            chimera_num_experts_content is not None
+            and chimera_num_experts_freq is not None
+        ):
+            hydra_num_experts = chimera_num_experts_content + chimera_num_experts_freq
+        # Surface chimera σ/FEI dims into the cfg slots the FreqRouter reads;
+        # without these the loader falls back to sigma_feature_dim_detected
+        # (default 128) and the FreqRouter gets the wrong input width →
+        # load_state_dict shape mismatch.
+        if chimera_sigma_feature_dim is not None:
+            sigma_feature_dim_detected = chimera_sigma_feature_dim
+        if chimera_fei_feature_dim is not None:
+            fei_feature_dim_detected = chimera_fei_feature_dim
+        if chimera_fei_sigma_low_div is not None:
+            fei_sigma_low_div_meta = chimera_fei_sigma_low_div
+
+    # Read DyLoRA params from checkpoint metadata.
+    dylora_unit = int(file_metadata.get("ss_dylora_unit", 1))
+    dylora_algo = str(file_metadata.get("ss_dylora_algo", ""))
+    # ``spec`` was resolved above (vera/dylora/lora/…). Thread the selector so
+    # warm-started DyLoRA checkpoints route ``unit``/``algo`` into each module
+    # (network.py keys the extra_kwargs injection off ``cfg.use_dylora``).
+    use_dylora = spec.name == "dylora"
+
+    cfg = LoRANetworkCfg.from_weights(
+        modules_dim=modules_dim,
+        modules_alpha=modules_alpha,
+        module_class=module_class,
+        train_llm_adapter=train_llm_adapter,
+        is_hydra_or_ortho_hydra=has_hydra or has_ortho_hydra,
+        hydra_num_experts=hydra_num_experts,
+        sigma_feature_dim_detected=sigma_feature_dim_detected,
+        sigma_router_names=sigma_router_names or None,
+        hydra_router_names=hydra_router_names,
+        channel_scales_dict=channel_scales_dict,
+        specialize_experts_by_sigma_buckets=band_partition_on,
+        num_sigma_buckets=band_num_buckets if band_partition_on else None,
+        sigma_bucket_boundaries=band_boundaries if band_partition_on else None,
+        fei_feature_dim=int(fei_feature_dim_detected or 0),
+        fei_sigma_low_div=fei_sigma_low_div_meta,
+        fei_router_names=fei_router_names,
+        is_stacked_experts=has_stacked_experts,
+        new_use_moe_style=new_use_moe_style,
+        new_route_per_layer=new_route_per_layer,
+        new_router_source=new_router_source_stamp,
+        ortho_centered_gate=ortho_centered_gate,
+        is_chimera_hydra=is_chimera_hydra,
+        num_experts_content=chimera_num_experts_content,
+        num_experts_freq=chimera_num_experts_freq,
+        freq_router_layer_norm=chimera_freq_router_layer_norm,
+        freq_router_mode=chimera_freq_router_mode,
+        freq_router_tau=chimera_freq_router_tau,
+        content_router_layer_norm=chimera_content_router_layer_norm,
+        is_lokr=has_lokr,
+        lokr_factor=lokr_detected_factor,
+        decompose_both=lokr_decompose_both or glokr_decompose_both,
+        lokr_full_factor=lokr_full_factor,
+        is_glokr=has_glokr,
+        glokr_factor=glokr_detected_factor,
+        glokr_full_factor=glokr_full_factor,
+        glokr_rs_lora=glokr_rs_lora,
+        glokr_bora=glokr_bora,
+        is_loha=has_loha,
+        dylora_unit=dylora_unit,
+        dylora_algo=dylora_algo,
+        use_dylora=use_dylora,
+    )
+
+    cfg = replace(
+        cfg, lokr_backend=parse_lokr_backend(kwargs.get("lokr_backend", "torch"))
+    )
+    network = LoRANetwork(text_encoders, unet, cfg, multiplier=multiplier)
+    # Mirror create_network: defaults first, then spec.post_init overrides.
+    network._use_hydra = False
+    network._balance_loss_weight = 0.0
+    network._network_spec = spec
+    # Inject vera_seed from checkpoint metadata if not already in kwargs.
+    if spec.name == "vera" and "vera_seed" not in kwargs:
+        meta_seed = file_metadata.get("ss_vera_seed")
+        if meta_seed is not None:
+            kwargs["vera_seed"] = int(meta_seed)
+
+    if spec.post_init is not None:
+        spec.post_init(network, kwargs)
+
+    if band_partition_on:
+        experts_per_band = hydra_num_experts // band_num_buckets
+        edges_str = (
+            f"custom edges {band_boundaries}"
+            if band_boundaries is not None
+            else "uniform edges"
+        )
+        logger.info(
+            f"Hard σ-band expert partition reconstructed from metadata: "
+            f"{hydra_num_experts} experts / {band_num_buckets} bands "
+            f"({experts_per_band} per band, interleaved layout, {edges_str}) "
+            "— out-of-band logits masked at inference."
+        )
+
+    return network, weights_sd

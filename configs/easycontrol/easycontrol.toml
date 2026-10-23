@@ -1,0 +1,43 @@
+network_module = "networks.methods.easycontrol"
+
+network_dim = 32
+network_alpha = 32
+
+train_adaln = true
+adaln_rank = 16
+
+network_args = [
+    "b_cond_init=-10.0",
+    "cond_scale=1.0",
+    "apply_ffn_lora=1",
+    "cond_res_scale=1.0",
+]
+
+output_name = "anima_easycontrol"
+
+learning_rate = 5e-5
+max_train_epochs = 6
+save_every_n_epochs = 3
+checkpointing_epochs = 3
+
+cache_llm_adapter_outputs = true
+
+use_easycontrol = true
+easycontrol_drop_p = 0.1
+caption_dropout_rate = 0.1
+
+easycontrol_cond_noise_max = 0.3
+
+activation_memory_budget = 0.3
+
+[general]
+caption_extension = '.txt'
+
+[[datasets]]
+batch_size = 1
+validation_seed = 42
+
+  [[datasets.subsets]]
+  image_dir = 'easycontrol-dataset'
+  cache_dir = 'post_image_dataset/i2i'
+  num_repeats = 1

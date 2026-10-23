@@ -1,0 +1,560 @@
+"""Spectral Progressive Diffusion (SPD) — training-free inference acceleration.
+
+Xiao et al., arXiv:2605.18736. Grow spatial resolution along the denoising
+trajectory: run early (noise-dominated) steps at low resolution, then inject
+high-frequency detail via *spectral noise expansion* only when finer
+frequencies emerge from noise. The latent power spectrum decays as a power law
+(`P_ω ∝ |ω|^{-β}`, β=2.26 on Anima — `bench/spd/`), so HF carries far less
+signal and is cheap to defer.
+
+SPD is inference-only: the bare DiT (or any existing LoRA checkpoint) runs the
+multi-resolution trajectory through the standard inference path.
+
+Architecturally this mirrors ``networks/spectrum.py``: a sampler-level runner
+that *replaces* the denoise loop and self-registers with
+``library.inference.generation`` at import time, so ``library.inference`` keeps
+no hard edge into ``networks/``. Dispatched from ``generate_body`` on
+``--spd``.
+
+Scope:
+  * **Euler only.** Spectral expansion re-spaces the remaining σ schedule
+    mid-loop (Sec 4.3); ``ERSDESampler``/``LCMSampler`` precompute their
+    coefficients from the *full* schedule at construction, so they are
+    incompatible with re-spacing. If a stochastic sampler is requested we fall
+    back to Euler with a one-time warning.
+  * **No SMC-CFG composition.** It operates at the sampler boundary on the
+    (re-spaced) σ and is unvalidated against the mid-loop reshape; passing it
+    with ``--spd`` warns and ignores.
+  * **Composes with LoRA / Hydra / soft-tokens / P-GRAFT** — the per-step
+    adapter setters are mirrored from the standard loop, and the per-Linear
+    LoRA delta is token-count-agnostic so it runs at any stage resolution.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from typing import List
+
+import torch
+from tqdm import tqdm
+
+from library.inference.adapters import (
+    compute_and_set_hydra_fei,
+    set_hydra_crossattn,
+    set_hydra_sigma,
+    set_xattn_boost_state,
+)
+from library.inference.sampler_context import SamplerSideChannels
+
+# DCT helpers + SPD spectral primitives (2D separable type-II DCT, paper T_Φ +
+# Eq. i–iii + Eq. 5–6) are pure compute and live in the shared core (also
+# vendored verbatim into the ComfyUI SPEED node). Edit the math in spd_core.py,
+# not here.
+from networks.spd_core import dct2, idct2, dct_lowpass_init, spectral_expand
+
+log = logging.getLogger(__name__)
+
+
+# MonadForge-Kohaku compatibility: training-target helpers use the shared SPD core.
+def _aligned_sigma(scale_lo: float, scale_hi: float, sigma_val: float) -> float:
+    """Timestep after spectral expansion (Eq. 5–6 / spectral_expand's t̃)."""
+    r = scale_hi / scale_lo
+    return (r * sigma_val) / (1.0 + (r - 1.0) * sigma_val)
+
+
+def spd_schedule_bands(
+    stages: List[float], transition_sigmas: List[float]
+) -> List[tuple[float, float]]:
+    """Per-stage query-σ band ``(t_lo, t_hi)`` for an SPD schedule.
+
+    Stage ``i`` (ascending resolution) is queried over ``t ∈ (t_lo, t_hi)``:
+
+      * ``t_lo`` = the transition to the *next* stage (0 for the final
+        full-res stage).
+      * ``t_hi`` = 1.0 for stage 0 (pure-noise entry); for later stages the
+        **aligned** σ̃ the expansion lands at (``> t_{i-1}`` for r>1), because
+        that is the σ the model is actually queried at post-expansion at
+        inference (``spd_denoise`` re-spaces the schedule to σ̃).
+
+    Bands are data-independent (functions of the schedule only), so the loop
+    precomputes them once and weights stage sampling by band width to keep the
+    marginal over ``t`` uniform (matches the paper's ``U(0,1)``).
+    """
+    S = len(stages)
+    assert len(transition_sigmas) == S - 1, "transition_sigmas must be len(stages)-1"
+    bands: list[tuple[float, float]] = []
+    for i in range(S):
+        t_lo = transition_sigmas[i] if i < S - 1 else 0.0
+        if i == 0:
+            t_hi = 1.0
+        else:
+            t_hi = _aligned_sigma(stages[i - 1], stages[i], transition_sigmas[i - 1])
+        bands.append((float(t_lo), float(t_hi)))
+    return bands
+
+
+@torch.no_grad()
+def spd_stage_target(
+    x0_full: torch.Tensor,  # (B, C, 1, H, W) clean full-res VAE latent
+    stage_idx: int,
+    stages: List[float],
+    transition_sigmas: List[float],
+    patch: int,
+    gen: torch.Generator,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Construct ``(x0^{s_i}, ε^{s_i})`` for an SPD stage (paper Eq. 11–12).
+
+    Returns the clean latent low-passed to the stage scale and the *effective*
+    noise field for that stage. Ordinary flow-matching at scale ``s_i`` with
+    this noise field reproduces the §4.3 trajectory segment exactly: the
+    straight-line velocity target is ``ε^{s_i} − x0^{s_i}`` and the training
+    sample at any σ is ``(1−σ)·x0^{s_i} + σ·ε^{s_i}`` (Eq. 13 collapses to this
+    because the segment velocity is constant — see the proposal derivation).
+
+    For stage 0 the noise is plain ``N(0,I)`` at the low-res grid (the entry is
+    pure noise at σ=1). For stage ``i>0`` the entry state ``x̃`` is built by
+    spectrally expanding the previous stage's FM state at the transition σ —
+    *via the sampler's own ``spectral_expand``* — and the effective noise is
+    recovered from it: ``ε^{s_i} = (x̃ − (1−σ̃)·x0^{s_i}) / σ̃``. Its low-freq
+    block carries the coherent (carried) noise; its high-freq block holds the
+    κ-scaled fresh fill minus the true HF detail, so the velocity target there
+    points the model toward revealing the deferred high frequencies — which is
+    the train–inference gap the LoRA exists to close.
+    """
+    s_hi = stages[stage_idx]
+    H_full, W_full = int(x0_full.shape[-2]), int(x0_full.shape[-1])
+    x0_si = dct_lowpass_init(x0_full, s_hi, patch) if s_hi < 1.0 else x0_full
+
+    if stage_idx == 0:
+        eps_si = torch.randn(
+            x0_si.shape, generator=gen, device=x0_si.device, dtype=torch.float32
+        ).to(x0_si.dtype)
+        return x0_si, eps_si
+
+    s_lo = stages[stage_idx - 1]
+    t_trans = float(transition_sigmas[stage_idx - 1])
+    x0_lo = dct_lowpass_init(x0_full, s_lo, patch)
+    eps_lo = torch.randn(
+        x0_lo.shape, generator=gen, device=x0_lo.device, dtype=torch.float32
+    ).to(x0_lo.dtype)
+    x_entry_lo = (1.0 - t_trans) * x0_lo + t_trans * eps_lo
+    x_tilde, t_tilde = spectral_expand(
+        x_entry_lo, t_trans, s_lo, s_hi, H_full, W_full, patch, gen
+    )
+    # Recover the FM-consistent effective noise at scale s_i. The §4.3 κ +
+    # alignment make x̃ a valid FM state at σ̃, so this inversion is exact.
+    eps_si = (x_tilde.float() - (1.0 - t_tilde) * x0_si.float()) / t_tilde
+    return x0_si, eps_si.to(x0_si.dtype)
+
+
+# SNR-gated velocity loss (information-aware fine-tune objective).
+# The paper's fine-tune (Eq. 14) is a plain per-sample velocity MSE. At the
+# post-expansion entry the HF block of x_t is *fresh noise* — zero mutual
+# information with this image's true HF — so the MSE-optimal prediction there is
+# the dataset-conditional-mean detail, i.e. blur. The paper never feeds its own
+# Prop. 1 machinery back into the loss; we do: per-frequency SNR (Eq. 15)
+#
+#     SNR_ω(t) = ((1−t)²/t²) · P_ω
+#
+# gives the per-band R² of the clean coefficient given x_t (the fraction of the
+# target the input actually determines — Eq. 23). Weighting the DCT-domain
+# velocity error by w_ω(t) = SNR/(1+SNR) (soft) or 1[t ≤ t_ω] (hard, Eq. 9)
+# zeroes exactly the demands-clairvoyance gradients whose minimizer is HF
+# attenuation, while keeping full supervision on the bands the input determines.
+# P_ω is measured from the training latents (orthonormal DCT ⇒ ε per-coefficient
+# variance is exactly 1, so no further normalization), not the power-law fit —
+# anime latents have line-art HF quirks a 2-parameter fit smooths over.
+
+
+def _radial_bin_index(
+    h: int, w: int, H_full: int, W_full: int, n_bins: int, device
+) -> torch.Tensor:
+    """(h, w) long tensor: radial-frequency bin of each DCT coefficient.
+
+    Normalized radius u = sqrt((ky/H_full)² + (kx/W_full)²) ∈ [0, √2), binned
+    uniformly over [0, √2]. Indices are taken relative to the FULL-res grid:
+    ``dct_lowpass_init`` truncation preserves coefficients, so index ky on a
+    stage-s grid is the same frequency as index ky at full res — one shared
+    binning serves every stage and the profile measurement.
+    """
+    ky = torch.arange(h, device=device, dtype=torch.float32) / float(H_full)
+    kx = torch.arange(w, device=device, dtype=torch.float32) / float(W_full)
+    u = torch.sqrt(ky[:, None] ** 2 + kx[None, :] ** 2)
+    return (u / math.sqrt(2.0) * n_bins).long().clamp_(max=n_bins - 1)
+
+
+@torch.no_grad()
+def measure_dct_power_profile(latents, n_bins: int = 128) -> torch.Tensor:
+    """Radially-binned per-coefficient orthonormal-DCT power of clean latents.
+
+    ``latents``: iterable of (C, H, W) float tensors (clean full-res VAE
+    latents, the same x0 the distill trains on). Returns a (n_bins,) float32
+    profile P_ω — mean squared DCT coefficient per normalized-radial-frequency
+    bin, averaged over channels and images. In the orthonormal DCT basis
+    ε ~ N(0, I) has per-coefficient variance exactly 1, so this P_ω plugs
+    straight into SNR_ω(t) = ((1−t)/t)² · P_ω with no unit conversion.
+    Empty bins (none on realistic grids) are forward-filled from the previous
+    non-empty bin.
+    """
+    sums = None
+    cnts = None
+    for lat in latents:
+        x = lat.float().unsqueeze(0)  # (1, C, H, W)
+        if sums is None:
+            sums = torch.zeros(n_bins, device=x.device)
+            cnts = torch.zeros(n_bins, device=x.device)
+        power = dct2(x).square().sum(dim=(0, 1))  # (H, W), summed over C
+        idx = _radial_bin_index(
+            x.shape[-2], x.shape[-1], x.shape[-2], x.shape[-1], n_bins, x.device
+        )
+        sums.scatter_add_(0, idx.reshape(-1), power.reshape(-1))
+        cnts.scatter_add_(
+            0,
+            idx.reshape(-1),
+            torch.full(
+                (idx.numel(),), float(x.shape[1]), device=x.device
+            ),  # C coeffs per cell
+        )
+    if sums is None:
+        raise ValueError("measure_dct_power_profile: empty latents iterable")
+    profile = sums / cnts.clamp(min=1.0)
+    # Forward-fill empty bins so lookups never hit a zero hole.
+    last = profile[0]
+    for i in range(n_bins):
+        if cnts[i] > 0:
+            last = profile[i]
+        else:
+            profile[i] = last
+    return profile.cpu()
+
+
+class SpdSnrGate:
+    """Per-frequency loss gate for the SPD fine-tune (see module note above).
+
+    ``mode='soft'``: w_ω(t) = SNR_ω(t) / (1 + SNR_ω(t)) — the per-band fraction
+    of clean-coefficient variance recoverable from x_t. ``mode='hard'``:
+    w_ω(t) = 1[t ≤ t_ω] with the Prop.-1 activation time
+    t_ω = 1 / (1 + sqrt(δ / (P_ω (1 + P_ω − δ)))).
+    """
+
+    def __init__(self, profile: torch.Tensor, mode: str = "soft", delta: float = 0.01):
+        if mode not in ("soft", "hard"):
+            raise ValueError(f"SpdSnrGate mode must be 'soft' or 'hard', got {mode!r}")
+        self.profile = profile.float()
+        self.n_bins = int(profile.numel())
+        self.mode = mode
+        self.delta = float(delta)
+        # (h, w, H_full, W_full, device) → per-coefficient P_ω grid (h, w).
+        self._p_grids: dict[tuple, torch.Tensor] = {}
+
+    def _p_grid(self, h: int, w: int, H_full: int, W_full: int, device):
+        key = (h, w, H_full, W_full, str(device))
+        p = self._p_grids.get(key)
+        if p is None:
+            idx = _radial_bin_index(h, w, H_full, W_full, self.n_bins, device)
+            p = self.profile.to(device)[idx]
+            self._p_grids[key] = p
+        return p
+
+    def weights(
+        self, t: torch.Tensor, h: int, w: int, H_full: int, W_full: int
+    ) -> torch.Tensor:
+        """(B, 1, h, w) float32 gate for query times ``t`` (B,)."""
+        p = self._p_grid(h, w, H_full, W_full, t.device)  # (h, w)
+        tt = t.float().clamp(min=1e-4, max=1.0).view(-1, 1, 1, 1)
+        if self.mode == "soft":
+            snr = ((1.0 - tt) / tt).square() * p
+            return snr / (1.0 + snr)
+        d = self.delta
+        t_act = 1.0 / (1.0 + torch.sqrt(d / (p * (1.0 + p - d)).clamp(min=1e-12)))
+        return (tt <= t_act).float()
+
+    def gated_mse(
+        self,
+        pred: torch.Tensor,  # (B, C, 1, h, w) velocity prediction
+        target: torch.Tensor,  # same shape, float
+        t: torch.Tensor,  # (B,) query σ
+        full_hw: tuple[int, int],  # full-res latent (H, W) of this bucket
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Weighted velocity MSE in the orthonormal DCT domain.
+
+        Normalized by Σw so the magnitude stays comparable to the plain MSE it
+        replaces (w ≡ 1 reproduces the spatial MSE exactly — Parseval).
+        Returns (loss, detached mean gate weight) — the latter is the effective
+        supervised fraction, worth logging per interval.
+        """
+        err = (pred.float() - target.float()).squeeze(2)  # (B, C, h, w)
+        e = dct2(err)
+        wgt = self.weights(t, e.shape[-2], e.shape[-1], *full_hw)
+        num = (wgt * e.square()).sum()
+        den = (wgt.sum() * e.shape[1]).clamp(min=1e-8)
+        return num / den, wgt.mean().detach()
+
+
+@torch.no_grad()
+def spd_rollout_to_stage(
+    velocity_fn,
+    init_noise_full: torch.Tensor,  # (B, C, 1, H, W) σ=1 full-res white noise
+    stages: List[float],
+    transition_sigmas: List[float],
+    *,
+    infer_steps: int,
+    flow_shift: float,
+    patch: int,
+    gen: torch.Generator,
+    stop_stage: int,
+) -> tuple[torch.Tensor, float, float]:
+    """SPD Euler prefix rollout from σ=1 down to the entry of ``stop_stage``.
+
+    Mirrors ``spd_denoise``'s prefix *exactly* — DCT-lowpass init, Euler
+    velocity steps, mid-loop ``spectral_expand`` + schedule re-spacing — but
+    conditional-only (no CFG, no side-channels) and **stops just before
+    expanding into ``stop_stage``**, returning the prefix's own low-res state at
+    that transition. This is the on-policy counterpart of the *analytic*
+    stage-entry ``spd_stage_target`` builds: instead of
+    ``(1−t_trans)·x0_lo + t_trans·ε`` from the true clean LL, it returns the
+    state the trained (or bare) prefix actually rolls to from pure noise.
+
+    ``velocity_fn(x5, sigma_scalar) -> v`` is the per-step denoiser at the
+    current resolution (e.g. ``forward_mini_train_dit`` with the adapter
+    enabled). The σ schedule is built identically to inference
+    (``sampling.get_timesteps_sigmas``) so the rollout sees the same grid the
+    deployed sampler does.
+
+    Returns ``(x_entry_lo, sigma_cross, scale_lo)``: the (B,C,1,h,w) pre-expansion
+    low-res state, the live σ at the crossing into ``stop_stage``, and the
+    current resolution scale. The caller applies
+    ``spectral_expand(x_entry_lo, sigma_cross, scale_lo, stages[stop_stage], …)``
+    to get the on-policy stage entry x̃ — the same primitive both the sampler
+    and ``spd_stage_target`` use, keeping train/infer geometry bit-for-bit.
+    """
+    assert 1 <= stop_stage < len(stages), "stop_stage must index a non-first stage"
+    H_full, W_full = int(init_noise_full.shape[-2]), int(init_noise_full.shape[-1])
+
+    # σ schedule identical to inference (sampling.get_timesteps_sigmas).
+    sigmas = torch.linspace(
+        1.0, 0.0, infer_steps + 1, device=init_noise_full.device, dtype=torch.float32
+    )
+    sigmas = (flow_shift * sigmas) / (1.0 + (flow_shift - 1.0) * sigmas)
+
+    cur_scale = stages[0]
+    x5 = (
+        dct_lowpass_init(init_noise_full, cur_scale, patch)
+        if cur_scale < 1.0
+        else init_noise_full
+    )
+    stage_idx = 0
+    n = len(sigmas) - 1
+    for i in range(n):
+        sigma = float(sigmas[i])
+        # Expand through any intermediate stage *strictly before* stop_stage.
+        while (
+            stage_idx < len(transition_sigmas) and sigma <= transition_sigmas[stage_idx]
+        ):
+            if stage_idx + 1 >= stop_stage:
+                # Reached the transition into stop_stage — return pre-expansion.
+                return x5, sigma, cur_scale
+            nxt = stages[stage_idx + 1]
+            if nxt > cur_scale:
+                orig = float(sigmas[i])
+                x5, sigma_new = spectral_expand(
+                    x5, sigma, cur_scale, nxt, H_full, W_full, patch, gen
+                )
+                cur_scale = nxt
+                if orig > 0 and sigma_new != orig:  # re-space remaining σ (Sec 4.3)
+                    sigmas[i + 1 :] = sigma_new * (sigmas[i + 1 :] / orig)
+                sigma = sigma_new
+            stage_idx += 1
+        v = velocity_fn(x5, sigma).float()
+        dt = float(sigmas[i + 1]) - sigma
+        x5 = (x5.float() + v * dt).to(x5.dtype)
+
+    # Schedule ended before crossing into stop_stage (transition σ below σ_min):
+    # return the final low-res state at the last σ.
+    return x5, float(sigmas[-1]), cur_scale
+
+
+@torch.no_grad()
+def spd_denoise(
+    anima,
+    latents: torch.Tensor,
+    timesteps: torch.Tensor,  # unused (SPD builds its own t from the live σ); kept for runner-signature parity
+    sigmas: torch.Tensor,
+    embed: torch.Tensor,
+    negative_embed: torch.Tensor,
+    padding_mask: torch.Tensor,
+    guidance_scale: float,
+    sampler,  # ERSDESampler / LCMSampler / None — SPD forces Euler (see module docstring)
+    device: torch.device,
+    ctx: SamplerSideChannels,
+    *,
+    stages: List[float],
+    transition_sigmas: List[float],
+    seed: int = 0,
+) -> torch.Tensor:
+    """Multi-resolution SPD denoising loop.
+
+    ``stages`` is ascending resolution scales (e.g. ``[0.5, 1.0]``);
+    ``transition_sigmas`` (len = len(stages)-1) are the σ thresholds at which to
+    spectral-expand to the next stage. ``stages=[1.0]`` + ``[]`` is the plain
+    full-res baseline.
+
+    The first stage starts from a DCT low-pass of the full-res init latent; each
+    transition fills the newly representable HF slots with σ-scaled noise and
+    re-spaces the remaining σ schedule (Sec 4.3). ``padding_mask`` is rebuilt at
+    each stage to match the new token grid.
+
+    ``ctx`` carries the shared conditioning side-channels (see
+    ``library.inference.sampler_context``). SPD honors soft-tokens / P-GRAFT /
+    pooled-text but ignores SMC-CFG (it acts on the re-spaced σ boundary,
+    unvalidated against the mid-loop reshape).
+    """
+    pgraft_network = ctx.pgraft_network
+    lora_cutoff_step = ctx.lora_cutoff_step
+    pooled_text_pos = ctx.pooled_text_pos
+    pooled_text_neg = ctx.pooled_text_neg
+    soft_tokens_net = ctx.soft_tokens_net
+    soft_tokens_embed_seqlens = ctx.soft_tokens_embed_seqlens
+    soft_tokens_neg_seqlens = ctx.soft_tokens_neg_seqlens
+    # --xattn_boost: cond-forward-only cross-attn gain at σ ≥ band. The gate
+    # reads the (possibly re-spaced) per-step σ, so the boost window tracks
+    # SPD's mid-loop σ reshaping.
+    xattn_boost = ctx.xattn_boost
+    xattn_boost_band = ctx.xattn_boost_band
+    xattn_renorm = ctx.xattn_boost_renorm
+    xattn_renorm_frac = ctx.xattn_boost_renorm_frac
+
+    if sampler is not None:
+        log.warning(
+            "--spd forces Euler; the requested stochastic sampler is ignored "
+            "(spectral expansion re-spaces σ mid-loop, which precomputed "
+            "ER-SDE/LCM coefficients cannot follow)."
+        )
+    if ctx.smc_cfg is not None:
+        log.warning(
+            "--spd v0 does not compose with SMC-CFG (it acts on the "
+            "re-spaced σ boundary and is unvalidated against the mid-loop "
+            "reshape); ignoring. See docs/inference/spd.md."
+        )
+
+    do_cfg = guidance_scale != 1.0
+    patch = anima.patch_spatial
+    H_full, W_full = latents.shape[-2], latents.shape[-1]
+    sigmas = sigmas.clone().float()
+    gen = torch.Generator(device=device).manual_seed(int(seed) + 10_000)
+
+    cur_scale = stages[0]
+    x5 = latents
+    if cur_scale < 1.0:
+        x5 = dct_lowpass_init(x5, cur_scale, patch)
+    stage_idx = 0
+
+    def _padding_mask_for(x: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(
+            x.shape[0], 1, x.shape[-2], x.shape[-1], dtype=torch.bfloat16, device=device
+        )
+
+    pad = _padding_mask_for(x5)
+
+    def velocity(
+        x: torch.Tensor, sigma_scalar: float, pad_mask: torch.Tensor
+    ) -> torch.Tensor:
+        # timestep == σ in [0,1] for Anima flow-matching (the DiT's time arg is
+        # σ directly — get_timesteps_sigmas / generation.py feed it unscaled).
+        t = x.new_full((x.shape[0],), float(sigma_scalar))
+        set_hydra_sigma(anima, t)
+        compute_and_set_hydra_fei(anima, x)
+        set_hydra_crossattn(anima, embed)
+        if soft_tokens_net is not None:
+            soft_tokens_net.append_postfix(
+                embed, soft_tokens_embed_seqlens, timesteps=t
+            )
+        _pos_kw = (
+            {"pooled_text_override": pooled_text_pos}
+            if pooled_text_pos is not None
+            else {}
+        )
+        _boost_step = (
+            xattn_boost is not None and float(sigma_scalar) >= xattn_boost_band
+        )
+        if _boost_step:
+            set_xattn_boost_state(
+                anima, xattn_boost, renorm_mode=xattn_renorm, frac=xattn_renorm_frac
+            )
+        try:
+            v_c = anima(x, t, embed, padding_mask=pad_mask, **_pos_kw)
+        finally:
+            if _boost_step:
+                set_xattn_boost_state(anima, 1.0)  # uncond runs at identity
+        if not do_cfg:
+            return v_c
+        set_hydra_crossattn(anima, negative_embed)
+        if soft_tokens_net is not None:
+            soft_tokens_net.append_postfix(
+                negative_embed, soft_tokens_neg_seqlens, timesteps=t
+            )
+        _neg_kw = (
+            {"pooled_text_override": pooled_text_neg}
+            if pooled_text_neg is not None
+            else {}
+        )
+        v_u = anima(x, t, negative_embed, padding_mask=pad_mask, **_neg_kw)
+        return v_u + guidance_scale * (v_c - v_u)
+
+    n = len(sigmas) - 1
+    with tqdm(total=n, desc=f"SPD denoising ({x5.shape[0]}x)") as pbar:
+        for i in range(n):
+            # P-GRAFT: disable LoRA at cutoff step (reference model takes over).
+            if (
+                pgraft_network is not None
+                and lora_cutoff_step is not None
+                and i == lora_cutoff_step
+            ):
+                pgraft_network.set_enabled(False)
+                log.info("P-GRAFT: Disabled LoRA at step %d/%d", i, n)
+
+            sigma = float(sigmas[i])
+            # Expand through any stage whose transition σ we've crossed.
+            while (
+                stage_idx < len(transition_sigmas)
+                and sigma <= transition_sigmas[stage_idx]
+            ):
+                nxt = stages[stage_idx + 1]
+                if nxt > cur_scale:
+                    orig = float(sigmas[i])
+                    x5, sigma_new = spectral_expand(
+                        x5, sigma, cur_scale, nxt, H_full, W_full, patch, gen
+                    )
+                    pad = _padding_mask_for(x5)
+                    cur_scale = nxt
+                    if orig > 0 and sigma_new != orig:  # re-space remaining σ (Sec 4.3)
+                        sigmas[i + 1 :] = sigma_new * (sigmas[i + 1 :] / orig)
+                    sigma = sigma_new
+                stage_idx += 1
+
+            v = velocity(x5, sigma, pad).float()
+            dt = float(sigmas[i + 1]) - sigma
+            x5 = (x5.float() + v * dt).to(torch.bfloat16)
+            pbar.update(1)
+
+    if cur_scale < 1.0:  # never handed off to full res — bicubic rescue so decode works
+        import torch.nn.functional as F
+
+        x5 = (
+            F.interpolate(
+                x5.squeeze(2).float(),
+                size=(H_full, W_full),
+                mode="bicubic",
+                align_corners=False,
+            )
+            .unsqueeze(2)
+            .to(torch.bfloat16)
+        )
+    return x5
+
+
+# Side-effect registration (mirrors the register_spectrum_runner call in networks/spectrum.py).
+from library.inference.generation import register_spd_runner  # noqa: E402
+
+register_spd_runner(spd_denoise)

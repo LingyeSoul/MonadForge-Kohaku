@@ -1,0 +1,193 @@
+import { defineStore } from 'pinia'
+import { shallowRef, ref } from 'vue'
+
+export interface SampleInfo {
+  caption?: string
+  attempt_id: string | null
+  path: string         // absolute on-disk path emitted by the training process
+  filename: string     // basename used for the FileResponse URL
+  step: number | null
+  epoch: number | null
+  prompt: string | null
+  ts: number | null
+  received_at: number  // client wall-clock ms when the event arrived
+}
+
+export interface TrainingMetrics {
+  step: number
+  total_steps: number
+  epoch: number
+  total_epochs: number
+  avr_loss: number
+  loss_history: number[]
+  step_history: number[]
+  lr: number
+  lr_history: number[]
+  speed: string
+  elapsed: string
+  eta: string
+  router_h: number | null
+  keys_scaled: number | null
+  avg_key_norm: number | null
+  checkpoint_saved: boolean
+  events: TrainingEvent[]
+  wandb_run_url: string | null
+  sample_history: SampleInfo[]
+  latest_sample: SampleInfo | null
+  sampling_enabled: boolean
+}
+
+export interface TrainingEvent {
+  type: 'epoch' | 'checkpoint'
+  step: number
+  epoch: number
+  elapsed: string
+  total_epochs?: number
+  detail?: string
+}
+
+const emptyMetrics: TrainingMetrics = {
+  step: 0,
+  total_steps: 0,
+  epoch: 0,
+  total_epochs: 0,
+  avr_loss: 0,
+  loss_history: [],
+  step_history: [],
+  lr: 0,
+  lr_history: [],
+  speed: '',
+  elapsed: '',
+  eta: '',
+  router_h: null,
+  keys_scaled: null,
+  avg_key_norm: null,
+  checkpoint_saved: false,
+  events: [],
+  wandb_run_url: null,
+  sample_history: [],
+  latest_sample: null,
+  sampling_enabled: false,
+}
+
+// Hard cap on the client-side gallery so a long run doesn't accumulate
+// thousands of thumbnails. Older entries are dropped FIFO; the on-disk
+// directory keeps the full set and can be browsed via the REST API.
+const MAX_SAMPLE_HISTORY = 240
+
+function basename(path: string): string {
+  const i = path.lastIndexOf('/')
+  const j = path.lastIndexOf('\\')
+  return path.substring(Math.max(i, j) + 1)
+}
+
+export const useTrainingStore = defineStore('training', () => {
+  // shallowRef: metrics carries loss/step/lr history arrays (up to 2000
+  // points each, replaced on every commit). Deep reactivity would proxy
+  // every element on every commit for data nobody mutates in place —
+  // commits replace the whole object instead.
+  const metrics = shallowRef<TrainingMetrics>({ ...emptyMetrics })
+  const connected = ref(false)
+  const done = ref(false)
+  let generation = 0
+
+  // Attempt + path is the durable key: resumed attempts use independent
+  // sample directories and may legitimately emit the same basename.
+  const seenSamplePaths = new Set<string>()
+
+  function recordSample(info: Omit<SampleInfo, 'filename' | 'received_at'>) {
+    if (!info.path) return
+    const sampleKey = `${info.attempt_id || ''}\u0000${info.path}`
+    if (seenSamplePaths.has(sampleKey)) return
+    seenSamplePaths.add(sampleKey)
+
+    const sample: SampleInfo = {
+      ...info,
+      filename: basename(info.path),
+      received_at: Date.now(),
+    }
+    const history = [...metrics.value.sample_history, sample]
+    let trimmed = history
+    const overflow = history.length - MAX_SAMPLE_HISTORY
+    if (overflow > 0) {
+      trimmed = history.slice(overflow)
+      for (const d of history.slice(0, overflow)) {
+        seenSamplePaths.delete(`${d.attempt_id || ''}\u0000${d.path}`)
+      }
+    }
+    metrics.value = { ...metrics.value, sample_history: trimmed, latest_sample: sample }
+  }
+
+  function updateFromWs(data: Partial<TrainingMetrics>) {
+    metrics.value = { ...metrics.value, ...data }
+  }
+
+  function reset() {
+    generation++
+    metrics.value = {
+      ...emptyMetrics,
+      events: [],
+      loss_history: [],
+      step_history: [],
+      lr_history: [],
+      sample_history: [],
+    }
+    seenSamplePaths.clear()
+    connected.value = false
+    done.value = false
+  }
+
+  async function loadFromRest(taskId: string, isCurrent: () => boolean = () => true) {
+    const requestGeneration = generation
+    const active = () => generation === requestGeneration && isCurrent()
+    try {
+      const res = await fetch(`/api/tasks/${taskId}/metrics`)
+      if (res.ok) {
+        const data = await res.json()
+        if (!active()) return
+        metrics.value = { ...metrics.value, ...data }
+      }
+    } catch {
+      // ignore — WS will catch up
+    }
+
+    if (!active()) return
+
+    // Backfill the sample history from disk so a late-joining viewer (or
+    // a page reload) sees previews that were generated before the WS
+    // connection was opened.
+    try {
+      const res = await fetch(
+        `/api/preview/runs/${taskId}/samples?page=1&page_size=${MAX_SAMPLE_HISTORY}`,
+      )
+      if (!res.ok) return
+      const data = await res.json()
+      if (!active()) return
+      const items: any[] = data?.items || []
+      // REST returns newest-first; reverse so sample_history is oldest-first
+      // and ``latest_sample`` ends up pointing at the newest file.
+      for (const it of items.slice().reverse()) {
+        recordSample({
+          attempt_id: it.attempt_id || null,
+          path: it.path,
+          step: null,
+          epoch: null,
+          prompt: null,
+          ts: it.mtime_unix ? it.mtime_unix * 1000 : null,
+        })
+      }
+    } catch {
+      // ignore — gallery is best-effort
+    }
+  }
+
+  return {
+    metrics,
+    connected,
+    done,
+    updateFromWs,
+    recordSample,
+    reset,
+    loadFromRest,
+  }
+})

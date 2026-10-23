@@ -1,0 +1,12 @@
+[general]
+caption_extension = '.txt'
+
+[[datasets]]
+batch_size = 1
+validation_split_num = 0
+
+  [[datasets.subsets]]
+  image_dir = 'post_image_dataset/resized/aak'
+  cache_dir = 'post_image_dataset/lora/aak'
+  num_repeats = 1
+  recursive = false
