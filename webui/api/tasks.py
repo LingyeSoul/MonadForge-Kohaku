@@ -310,6 +310,31 @@ async def resume_task(task_id: str):
     return task.info()
 
 
+@router.post("/{task_id}/pause")
+async def pause_task(task_id: str):
+    """Freeze a running task (SIGSTOP); unpause resumes the same process."""
+    try:
+        task = await task_service.pause_task(task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except DaemonError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    return task.info()
+
+
+@router.post("/{task_id}/unpause")
+async def unpause_task(task_id: str):
+    try:
+        task = await task_service.resume_task(task_id)
+    except DaemonError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    return task.info()
+
+
 @router.delete("/{task_id}/history")
 async def delete_history(task_id: str):
     try:

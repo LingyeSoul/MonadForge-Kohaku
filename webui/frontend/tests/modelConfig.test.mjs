@@ -196,3 +196,22 @@ test('method choices come from the schema without replacing or normalizing API v
   assert.deepEqual(modelAlgorithmItems(null), [])
   assert.deepEqual(groupModelConfigFields(null), [])
 })
+
+test('the MOSS tune section renders in its own panel, not under training', () => {
+  const swapGrid = field('swap_grid', '8,12', [], { group: 'Training', advanced: true })
+  const modelDir = field('model_dir', '', [], { group: 'Paths', advanced: true })
+  const schema = {
+    train: [
+      field('epochs', 8, [], { group: 'Training', advanced: true }),
+      field('lr', 1e-4, [], { group: 'Training' }),
+    ],
+    cache: [],
+    generate: [],
+    tune: [swapGrid, modelDir],
+  }
+  const groups = groupModelConfigFields(schema, null, 'moss')
+  assert.deepEqual(groups.map(group => group.id), [BASIC_GROUP_ID, 'training', 'tune'])
+  assert.deepEqual(groups.find(group => group.id === 'tune').sections, [
+    { section: 'tune', fields: [swapGrid] },
+  ])
+})

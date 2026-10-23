@@ -26,6 +26,8 @@ from library.config.lokr import (
     LOKR_BACKENDS,
 )
 from webui.explanations import (
+    KNOWN_METHODS as _KNOWN_GUIDE_METHODS,
+    NOT_MERGEABLE as _NOT_MERGEABLE,
     field_help_lang as _field_help_lang,
     preprocess_field_help_lang as _pre_field_help_lang,
     _read_fields,
@@ -335,6 +337,68 @@ _GROUPS = {
         "save_state_on_train_end",
     },
 }
+# Later additions: method families that grew after the first grouping pass.
+# Without these, whole feature sets (σ-demote, REPA, AdaIN, ChimeraHydra) render
+# under "Other" instead of their own section.
+_GROUPS["Architecture"] |= {
+    "sigma_lowres",
+    "sigma_lowres_route",
+    "sigma_lowres_threshold",
+    "sigma_lowres_span",
+    "sigma_lowres_route2",
+    "sigma_lowres_threshold2",
+    "sigma_lowres_threshold2_max",
+    "sigma_lowres_span2",
+    "use_repa",
+    "repa_mode",
+    "repa_weight",
+    "repa_layer",
+    "repa_encoder",
+    "repa_target_dog",
+    "train_adaln",
+    "adaln_rank",
+    "use_chimera_hydra",
+    "num_experts_content",
+    "num_experts_freq",
+    "content_router_layer_norm",
+    "freq_router_mode",
+    "freq_router_tau",
+    "freq_router_layer_norm",
+    "freq_router_init_std",
+    "balance_w_content",
+    "balance_w_freq",
+    "network_content_router_lr_scale",
+    "network_freq_router_lr_scale",
+    "fei_feature_dim",
+    "fei_sigma_low_div",
+    "use_ortho_init",
+    "down_init",
+    "use_easycontrol",
+    "easycontrol_drop_p",
+    "easycontrol_cond_noise_max",
+    "use_controlnet",
+    "controlnet_drop_p",
+}
+_GROUPS["Training"] |= {
+    "artists_shard",
+    "sigmoid_bias",
+    "lr_warmup_steps",
+    "log_with",
+    "log_every_n_steps",
+    "training_comment",
+    "save_precision",
+}
+_GROUPS["Performance"] |= {
+    "activation_memory_budget",
+    "use_vae_cache",
+    "use_text_cache",
+    "dataloader_pin_memory",
+    "persistent_data_loader_workers",
+    "max_data_loader_n_workers",
+}
+_GROUPS["Paths"].add("logging_dir")
+_GROUPS["Preview Sampling"] |= {"test_prompt", "test_negative_prompt"}
+
 _K2G = {k: g for g, ks in _GROUPS.items() for k in ks}
 _SKIP = {"base_config", "dataset_config", "general", "datasets", "variant", "gui"}
 _VIRTUAL_KEYS = {
@@ -2066,23 +2130,6 @@ def get_field_help_data(variant: str, lang: str = "cn") -> dict:
 
 
 _GUIDES_DIR = Path(__file__).resolve().parent.parent / "explanations" / "guides"
-_NOT_MERGEABLE = frozenset({"postfix", "hydralora", "reft", "fera"})
-_KNOWN_GUIDE_METHODS = frozenset(
-    {
-        "lora",
-        "tlora",
-        "postfix",
-        "hydralora",
-        "reft",
-        "fera",
-        "chimera",
-        "soft_tokens",
-        "easycontrol",
-        "colorize",
-        "turbo",
-        "spd",
-    }
-)
 
 
 def _read_guide(name: str, lang: str) -> str:

@@ -132,6 +132,8 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 # ── Defaults ─────────────────────────────────────────────────────
 
+_CAPTION_AUTOTAG_MODES = ("missing", "merge", "overwrite")
+
 DEFAULTS = {
     "sam_prompts": ["speech bubble", "text bubble"],
     "sam_threshold": 0.5,
@@ -150,6 +152,14 @@ DEFAULTS = {
     # consumes (saved to configs/preprocess.toml).
     "target_res": [1024],
     "multires_per_image": False,
+    # In-pipeline caption autotag stage (runs right after resize). Off by
+    # default; the stage itself lives in scripts/tasks/preprocess.py.
+    "caption_autotag": False,
+    "caption_autotag_mode": "missing",
+    "caption_autotag_min_confidence": 0.0,
+    # σ-demote routes ("1024:896" or "1024:896,1280:1024"), consumed by the
+    # preprocess chain and the standalone preprocess-demote task.
+    "sigma_demote": "",
 }
 
 
@@ -252,6 +262,43 @@ def get_multires_per_image() -> bool:
     return bool(raw)
 
 
+def _preprocess_setting(key: str):
+    """Read one non-path preprocess knob from the config chain."""
+    from library.config.io import load_path_overrides
+
+    overrides = load_path_overrides(
+        preset="default",
+        method=os.environ.get("METHOD") or None,
+        methods_subdir="gui-methods" if os.environ.get("METHOD") else "methods",
+    )
+    return overrides.get(key, DEFAULTS[key])
+
+
+def get_caption_autotag() -> bool:
+    raw = _preprocess_setting("caption_autotag")
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(raw)
+
+
+def get_caption_autotag_mode() -> str:
+    raw = str(_preprocess_setting("caption_autotag_mode") or "missing").strip().lower()
+    return raw if raw in _CAPTION_AUTOTAG_MODES else "missing"
+
+
+def get_caption_autotag_min_confidence() -> float:
+    raw = _preprocess_setting("caption_autotag_min_confidence")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(DEFAULTS["caption_autotag_min_confidence"])
+    return min(max(value, 0.0), 1.0)
+
+
+def get_sigma_demote() -> str:
+    return str(_preprocess_setting("sigma_demote") or "").strip()
+
+
 def save_target_res(edges: list[int]) -> list[int]:
     """Persist the free-fit tier set to ``configs/custom/preprocess.toml``.
 
@@ -321,7 +368,33 @@ def get_settings() -> dict:
         # not webui_settings.json — it's the value resize actually uses.
         "target_res": target_res,
         "multires_per_image": multires_per_image,
+        "caption_autotag": get_caption_autotag(),
+        "caption_autotag_mode": get_caption_autotag_mode(),
+        "caption_autotag_min_confidence": get_caption_autotag_min_confidence(),
+        "sigma_demote": get_sigma_demote(),
     }
+
+
+def _normalize_sigma_demote(raw: str) -> str:
+    """Validate and canonicalize ``"1024:896"`` / ``"1024:896,1280:1024"``."""
+    routes: list[str] = []
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        native, sep, demote = part.partition(":")
+        try:
+            native_edge, demote_edge = int(native), int(demote)
+        except ValueError as exc:
+            raise ValueError(
+                f"sigma_demote route {part!r} must be <native>:<demote>"
+            ) from exc
+        if not sep or not (0 < demote_edge < native_edge <= 1536):
+            raise ValueError(
+                f"sigma_demote route {part!r} must satisfy 0 < demote < native <= 1536"
+            )
+        routes.append(f"{native_edge}:{demote_edge}")
+    return ",".join(routes)
 
 
 def save_settings(data: dict) -> dict:
@@ -349,6 +422,30 @@ def _save_settings(data: dict) -> dict:
     )
     if multires_per_image and len(target_res) < 2:
         raise ValueError("multires_per_image requires at least two target_res tiers")
+
+    caption_autotag = (
+        bool(data["caption_autotag"]) if "caption_autotag" in data else get_caption_autotag()
+    )
+    caption_autotag_mode = str(
+        data.get("caption_autotag_mode", get_caption_autotag_mode())
+    ).strip().lower()
+    if caption_autotag_mode not in _CAPTION_AUTOTAG_MODES:
+        raise ValueError(
+            f"caption_autotag_mode must be one of {', '.join(_CAPTION_AUTOTAG_MODES)}"
+        )
+    if "caption_autotag_min_confidence" in data:
+        try:
+            caption_autotag_min_confidence = float(data["caption_autotag_min_confidence"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("caption_autotag_min_confidence must be a number") from exc
+        if not 0.0 <= caption_autotag_min_confidence <= 1.0:
+            raise ValueError("caption_autotag_min_confidence must be between 0 and 1")
+    else:
+        caption_autotag_min_confidence = get_caption_autotag_min_confidence()
+    if "sigma_demote" in data:
+        sigma_demote = _normalize_sigma_demote(str(data["sigma_demote"] or ""))
+    else:
+        sigma_demote = get_sigma_demote()
 
     sam = data.get("sam", {})
     sam_yaml = (
@@ -384,7 +481,15 @@ def _save_settings(data: dict) -> dict:
         if key in data:
             gui[key] = data[key]
     contents = {SAM_YAML: text, SETTINGS_FILE: json.dumps(gui, indent=2)}
-    if "target_res" in data or "multires_per_image" in data:
+    preprocess_keys = (
+        "target_res",
+        "multires_per_image",
+        "caption_autotag",
+        "caption_autotag_mode",
+        "caption_autotag_min_confidence",
+        "sigma_demote",
+    )
+    if any(key in data for key in preprocess_keys):
         preprocess = (
             toml.loads(PREPROCESS_TOML.read_text(encoding="utf-8"))
             if PREPROCESS_TOML.exists()
@@ -394,6 +499,14 @@ def _save_settings(data: dict) -> dict:
             preprocess["target_res"] = target_res
         if "multires_per_image" in data:
             preprocess["multires_per_image"] = multires_per_image
+        if "caption_autotag" in data:
+            preprocess["caption_autotag"] = caption_autotag
+        if "caption_autotag_mode" in data:
+            preprocess["caption_autotag_mode"] = caption_autotag_mode
+        if "caption_autotag_min_confidence" in data:
+            preprocess["caption_autotag_min_confidence"] = caption_autotag_min_confidence
+        if "sigma_demote" in data:
+            preprocess["sigma_demote"] = sigma_demote
         contents[PREPROCESS_TOML] = toml.dumps(preprocess)
     atomic_write_many(contents)
     return get_settings()

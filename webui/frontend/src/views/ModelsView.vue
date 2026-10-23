@@ -23,6 +23,16 @@
         clearable
         max-width="320"
       />
+      <v-select
+        v-model="familyFilter"
+        :items="familyItems"
+        :label="t('mmFamily')"
+        variant="outlined"
+        density="compact"
+        hide-details
+        max-width="220"
+        data-testid="models-family-filter"
+      />
       <v-chip v-if="models.length > 0" size="small" variant="tonal" color="primary">
         {{ t('mmTotalCount', { n: String(models.length), size: totalSize }) }}
       </v-chip>
@@ -49,9 +59,12 @@
               <div class="text-caption text-medium-emphasis">{{ m.directory }}</div>
             </td>
             <td>
-              <v-chip size="small" variant="tonal" :color="typeColor(m.spec)">
-                {{ m.type_label }}
-              </v-chip>
+              <div class="d-flex align-center ga-2 flex-wrap">
+                <v-chip size="x-small" variant="outlined">{{ FAMILY_LABELS[m.family] || m.family }}</v-chip>
+                <v-chip size="small" variant="tonal" :color="typeColor(m.spec)">
+                  {{ m.type_label }}
+                </v-chip>
+              </div>
             </td>
             <td class="text-body-2 text-no-wrap">{{ rankText(m) }}</td>
             <td class="text-body-2 text-no-wrap">{{ m.size_human }}</td>
@@ -167,6 +180,7 @@ import { useNotifyStore } from '../stores/notify'
 import WorkspaceHeading from '../components/WorkspaceHeading.vue'
 
 interface ModelEntry {
+  family: string
   name: string
   path: string
   directory: string
@@ -200,6 +214,7 @@ const models = ref<ModelEntry[]>([])
 const loading = ref(false)
 const loadError = ref('')
 const search = ref('')
+const familyFilter = ref('all')
 const deletingPath = ref('')
 const detailsOpen = ref(false)
 const details = ref<ModelMetadata | null>(null)
@@ -223,15 +238,29 @@ const TYPE_COLORS: Record<string, string> = {
   stacked_experts_global_fei: 'light-green',
 }
 
+const FAMILY_LABELS: Record<string, string> = {
+  anima: 'Anima',
+  qwen21: 'Qwen-Image 2.1',
+  moss: 'MOSS',
+}
+
+const familyItems = computed(() => [
+  { title: t('mmFamilyAll'), value: 'all' },
+  ...Object.entries(FAMILY_LABELS).map(([value, title]) => ({ title, value })),
+])
+
 const filteredModels = computed(() => {
   const q = (search.value ?? '').trim().toLowerCase()
-  if (!q) return models.value
-  return models.value.filter(
-    (m) =>
+  return models.value.filter((m) => {
+    if (familyFilter.value !== 'all' && m.family !== familyFilter.value) return false
+    if (!q) return true
+    return (
       m.name.toLowerCase().includes(q) ||
       m.directory.toLowerCase().includes(q) ||
-      m.type_label.toLowerCase().includes(q),
-  )
+      m.type_label.toLowerCase().includes(q) ||
+      m.family.toLowerCase().includes(q)
+    )
+  })
 })
 
 const totalSize = computed(() => {

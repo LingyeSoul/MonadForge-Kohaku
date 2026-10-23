@@ -26,28 +26,10 @@ def get_runtimes():
     return {"runtimes": list_runtime_profiles(ROOT / "configs")}
 
 
-# Model groups — the anima group reads the effective model config; others are fixed.
+# Model groups — the anima group reads the effective model config; every other
+# group is derived from ``library.downloads`` so the status list can never fall
+# behind the catalog again.
 _ANIMA_PATH_KEYS = [(key, default) for key, default in MODEL_CONFIG_DEFAULTS.items()]
-_STATIC_GROUPS: list[dict] = [
-    {
-        "id": "sam3",
-        "files": [
-            "models/sam3/sam3.pt",
-        ],
-    },
-    {
-        "id": "mit",
-        "files": [
-            "models/mit/model.pth",
-        ],
-    },
-    {
-        "id": "pe",
-        "files": [
-            "models/pe/PE-Core-L14-336.pt",
-        ],
-    },
-]
 
 
 def _resolve_path(path_str: str) -> Path:
@@ -63,25 +45,64 @@ def _check_anima_group() -> dict:
         resolved = _resolve_path(raw)
         files_info.append({"path": raw, "exists": resolved.is_file()})
     installed = all(f["exists"] for f in files_info)
-    return {"id": "anima", "installed": installed, "files": files_info}
-
-
-def _check_group(group: dict) -> dict:
-    paths = [ROOT / f for f in group["files"]]
-    installed = all(p.is_file() for p in paths)
     return {
-        "id": group["id"],
+        "id": "anima",
+        "title": "Anima base",
         "installed": installed,
-        "files": [{"path": f, "exists": (ROOT / f).is_file()} for f in group["files"]],
+        "files": files_info,
     }
+
+
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _asset_files(asset) -> list[dict]:
+    """One ``{path, exists}`` row per required/optional file of a catalog asset."""
+    missing = set(asset.missing())
+    rows: list[dict] = []
+    for name in asset.files:
+        if asset.dest is None:
+            rows.append({"path": f"{asset.repo}/{name}", "exists": not missing})
+            continue
+        path = asset.dest / Path(name).name
+        rows.append({"path": _display_path(path), "exists": path.exists()})
+    for name in asset.optional:
+        if asset.dest is None:
+            continue
+        path = asset.dest / Path(name).name
+        if path.exists():
+            rows.append({"path": _display_path(path), "exists": True})
+    return rows
+
+
+def _catalog_groups() -> list[dict]:
+    """Download packs from the canonical catalog, minus the dynamic anima group."""
+    from library import downloads
+
+    groups: list[dict] = []
+    for pack_id, assets in downloads.by_pack().items():
+        if pack_id == "anima":
+            continue
+        pack = downloads.PACK_BY_ID[pack_id]
+        groups.append(
+            {
+                "id": pack_id,
+                "title": pack.title,
+                "installed": all(not asset.missing() for asset in assets),
+                "files": [row for asset in assets for row in _asset_files(asset)],
+            }
+        )
+    return groups
 
 
 @router.get("/models")
 def get_model_groups():
-    """Check installation status of each model group."""
-    groups = [_check_anima_group()]
-    groups.extend(_check_group(g) for g in _STATIC_GROUPS)
-    return {"groups": groups}
+    """Check installation status of every downloadable pack."""
+    return {"groups": [_check_anima_group(), *_catalog_groups()]}
 
 
 # ── Model paths (configurable from System page) ────────────────

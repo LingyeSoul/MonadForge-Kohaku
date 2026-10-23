@@ -44,8 +44,35 @@ _SKIP_METADATA_KEYS = frozenset(
 )
 
 
+# Every model line writes its final adapter somewhere else. Keep this list in
+# sync with ``library/<line>/requests.py``'s output defaults; the Models page is
+# the shared weight manager, not an Anima-only view.
+LINE_OUTPUT_DIRS: tuple[tuple[str, str], ...] = (
+    ("anima", "output/ckpt"),
+    ("qwen21", "output/qwen21"),
+    ("moss", "output/ckpt_moss"),
+)
+
+# Cache trees live inside a line's output root (Qwen's ``output/qwen21/cache``
+# is the default) and hold latents/TE embeddings, not adapters.
+_NON_WEIGHT_DIRS = frozenset({"cache", "crops", "test"})
+_NON_WEIGHT_SUFFIXES = (".te.safetensors", ".latent.safetensors")
+
+
 def default_output_dir() -> Path:
     return ROOT / "output" / "ckpt"
+
+
+def model_roots() -> tuple[tuple[str, Path], ...]:
+    """``(family, directory)`` for every model line's final-weight root."""
+    return tuple((family, ROOT / rel) for family, rel in LINE_OUTPUT_DIRS)
+
+
+def _is_cached_pair(path: Path) -> bool:
+    """Whether *path* is a Qwen cache file rather than a trained adapter."""
+    if path.name.endswith(_NON_WEIGHT_SUFFIXES):
+        return True
+    return any(parent.name in _NON_WEIGHT_DIRS for parent in path.parents)
 
 
 def read_weight_header(path: Path) -> dict:
@@ -101,40 +128,53 @@ def _iso(ts: float) -> str:
 
 
 def list_models() -> list[dict]:
-    """List every final adapter weight below the default output directory."""
+    """List every final adapter weight across all model lines.
+
+    Anima, Qwen-Image 2.1 and MOSS write under different roots; each entry
+    carries its ``family`` so the page can label and filter them.
+    """
     from library.io.output_layout import discover_weights
 
-    base = default_output_dir()
-    if not base.exists():
-        return []
-
     models: list[dict] = []
-    for p in discover_weights(base):
-        stat = p.stat()
-        metadata = read_weight_header(p)
-        spec = classify_spec(metadata)
-        try:
-            directory = str(p.parent.relative_to(ROOT))
-        except ValueError:
-            directory = str(p.parent)
-        models.append(
-            {
-                "name": p.name,
-                "path": str(p),
-                "directory": directory,
-                "size": stat.st_size,
-                "size_human": _human_size(stat.st_size),
-                "mtime": _iso(stat.st_mtime),
-                "created": _iso(stat.st_ctime),
-                "spec": spec,
-                "type_label": type_label(spec),
-                "dim": metadata.get("ss_network_dim", ""),
-                "alpha": metadata.get("ss_network_alpha", ""),
-                "base_model": metadata.get("ss_base_model_version")
-                or metadata.get("ss_sd_model_name", ""),
-                "output_name": metadata.get("ss_output_name", ""),
-            }
-        )
+    seen: set[str] = set()
+    for family, base in model_roots():
+        if not base.exists():
+            continue
+        for p in discover_weights(base):
+            key = str(p.resolve())
+            if key in seen or _is_cached_pair(p):
+                continue
+            seen.add(key)
+            stat = p.stat()
+            metadata = read_weight_header(p)
+            spec = classify_spec(metadata)
+            try:
+                directory = str(p.parent.relative_to(ROOT))
+            except ValueError:
+                directory = str(p.parent)
+            models.append(
+                {
+                    "family": family,
+                    "name": p.name,
+                    "path": str(p),
+                    "directory": directory,
+                    "size": stat.st_size,
+                    "size_human": _human_size(stat.st_size),
+                    "mtime": _iso(stat.st_mtime),
+                    "created": _iso(stat.st_ctime),
+                    "spec": spec,
+                    "type_label": type_label(spec),
+                    "dim": metadata.get("ss_network_dim", "")
+                    or metadata.get("rank", ""),
+                    "alpha": metadata.get("ss_network_alpha", "")
+                    or metadata.get("alpha", ""),
+                    "base_model": metadata.get("ss_base_model_version")
+                    or metadata.get("ss_sd_model_name", "")
+                    or metadata.get("base_model", ""),
+                    "output_name": metadata.get("ss_output_name", ""),
+                }
+            )
+    models.sort(key=lambda m: (m["mtime"], m["path"]), reverse=True)
     return models
 
 

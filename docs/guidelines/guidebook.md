@@ -11,7 +11,7 @@ A complete guide to the Anima LoRA training/inference pipeline: install → data
 3. [Hugging Face Sign-in and Model Download](#3-hugging-face-sign-in-and-model-download)
 4. [Dataset Preparation](#4-dataset-preparation)
 5. [Preprocessing](#5-preprocessing)
-6. [Using the WebUI](#6-using-the-gui)
+6. [Using the WebUI](#6-using-the-webui)
 7. [Training](#7-training)
 8. [Adapter Variant Selection Guide](#8-adapter-variant-selection-guide)
 9. [Inference](#9-inference)

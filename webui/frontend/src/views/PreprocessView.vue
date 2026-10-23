@@ -268,6 +268,66 @@
             </v-col>
           </v-row>
 
+          <v-row class="preprocess-settings-grid mt-1">
+            <v-col cols="12" md="6">
+              <div class="text-subtitle-2 mb-2">{{ t('ppCaptionPipelineGroup') }}</div>
+              <v-switch
+                v-model="settings.caption_autotag"
+                :label="t('ppCaptionAutotag')"
+                :hint="t('ppCaptionAutotagHint')"
+                persistent-hint
+                density="compact"
+                class="mb-2"
+                data-testid="preprocess-caption-autotag"
+              />
+              <v-select
+                v-model="settings.caption_autotag_mode"
+                :items="autotagModes"
+                item-title="label"
+                item-value="value"
+                :label="t('ppCaptionAutotagMode')"
+                :disabled="!settings.caption_autotag"
+                density="compact"
+                hide-details
+                class="mb-2"
+                data-testid="preprocess-caption-autotag-mode"
+              />
+              <v-text-field
+                v-model.number="settings.caption_autotag_min_confidence"
+                :label="t('ppCaptionAutotagMinConfidence')"
+                type="number"
+                step="0.05"
+                min="0"
+                max="1"
+                :disabled="!settings.caption_autotag"
+                density="compact"
+                hide-details
+                data-testid="preprocess-caption-autotag-confidence"
+              />
+            </v-col>
+            <v-col cols="12" md="6">
+              <div class="text-subtitle-2 mb-2">{{ t('ppSigmaDemoteGroup') }}</div>
+              <v-text-field
+                v-model="settings.sigma_demote"
+                :label="t('ppSigmaDemote')"
+                :hint="t('ppSigmaDemoteHint')"
+                persistent-hint
+                density="compact"
+                placeholder="1024:896"
+                data-testid="preprocess-sigma-demote"
+              />
+              <v-btn
+                class="mt-3"
+                size="small"
+                variant="outlined"
+                :loading="isRunning('preprocess-demote')"
+                @click="runTask('preprocess-demote')"
+              >
+                {{ t('ppSigmaDemoteRun') }}
+              </v-btn>
+            </v-col>
+          </v-row>
+
           <div class="d-flex flex-wrap ga-2 mt-3">
             <v-btn data-testid="anima-settings-save" color="primary" size="small" prepend-icon="mdi-content-save" :loading="settingsSaving" :disabled="!settingsDirty || Boolean(submitting)" @click="saveSettings">
               {{ t('ppSaveSettings') }}
@@ -500,7 +560,7 @@ function errorMessage(error: unknown): string { return error instanceof Error ? 
 const preprocessCommands = [
   'preprocess', 'preprocess-resize', 'preprocess-vae', 'preprocess-te',
   'preprocess-pe', 'preprocess-cond-resize', 'preprocess-cond-vae',
-  'mask', 'mask-clean',
+  'preprocess-demote', 'mask', 'mask-clean',
 ]
 
 interface PreprocessRunSummary {
@@ -596,6 +656,12 @@ const defaultSettings = () => ({
   // no-op under free-fit. Persisted to configs/preprocess.toml.
   target_res: [1024] as number[],
   multires_per_image: false,
+  // In-pipeline caption autotag stage; off by default.
+  caption_autotag: false,
+  caption_autotag_mode: 'missing' as 'missing' | 'merge' | 'overwrite',
+  caption_autotag_min_confidence: 0,
+  // σ-demote routes emitted by the preprocess chain ("1024:896").
+  sigma_demote: '',
 })
 
 const settings = reactive(defaultSettings())
@@ -609,6 +675,12 @@ let settingsHydrating = false
 
 // Allowed free-fit tier edges (mirror of ALLOWED_TARGET_RES in the backend).
 const TARGET_RES_OPTIONS = [512, 768, 896, 1024, 1280, 1536]
+
+const autotagModes = computed(() => [
+  { value: 'missing', label: t('ppCaptionAutotagModeMissing') },
+  { value: 'merge', label: t('ppCaptionAutotagModeMerge') },
+  { value: 'overwrite', label: t('ppCaptionAutotagModeOverwrite') },
+])
 
 function toggleTier(edge: number) {
   const idx = settings.target_res.indexOf(edge)
@@ -641,6 +713,10 @@ async function fetchSettings() {
       ? data.target_res
       : [1024]
     settings.multires_per_image = data.multires_per_image ?? false
+    settings.caption_autotag = data.caption_autotag ?? false
+    settings.caption_autotag_mode = data.caption_autotag_mode ?? 'missing'
+    settings.caption_autotag_min_confidence = data.caption_autotag_min_confidence ?? 0
+    settings.sigma_demote = data.sigma_demote ?? ''
     savedSettings.value = JSON.stringify(settings)
   } catch (error) { loadError.value = errorMessage(error) }
   finally { settingsHydrating = false }
@@ -838,6 +914,7 @@ async function submitTask(command: string) {
     'mask',
     'preprocess-te',
     'preprocess',
+    'preprocess-demote',
   ]
   if (settingsConsumers.includes(command)) {
     if (!(await saveSettings())) return
@@ -879,6 +956,11 @@ async function submitTask(command: string) {
   if (['preprocess-te', 'preprocess'].includes(command)) {
     env.CAPTION_SHUFFLE_VARIANTS = String(settings.caption_shuffle_variants)
     env.CAPTION_TAG_DROPOUT_RATE = String(settings.caption_tag_dropout_rate)
+    env.CAPTION_AUTOTAG = settings.caption_autotag ? '1' : '0'
+    if (settings.caption_autotag) {
+      env.CAPTION_AUTOTAG_MODE = settings.caption_autotag_mode
+      env.CAPTION_AUTOTAG_MIN_CONFIDENCE = String(settings.caption_autotag_min_confidence)
+    }
   }
   if (['preprocess-cond-resize', 'preprocess-cond-vae'].includes(command)) {
     if (paths.condSource) env.CONDITIONING_DATA_DIR = paths.condSource

@@ -272,6 +272,33 @@ export const useTaskStore = defineStore('task', () => {
     }
   }
 
+  async function pauseTask(taskId: string): Promise<boolean> {
+    let failureDetail = ''
+    try {
+      const res = await fetch(`/api/tasks/${taskId}/pause`, { method: 'POST' })
+      if (!res.ok) {
+        failureDetail = `HTTP ${res.status}`
+        try {
+          const body = await res.json()
+          if (body?.detail) failureDetail = String(body.detail)
+        } catch {
+          // Keep the HTTP status when the response is not JSON.
+        }
+        throw new Error(failureDetail)
+      }
+      await poll()
+      notify.show(t('notifyTaskPaused'), 'success')
+      return true
+    } catch {
+      notify.show(
+        failureDetail ? `${t('notifyTaskPauseFailed')}: ${failureDetail}` : t('notifyTaskPauseFailed'),
+        'error',
+        6000,
+      )
+      return false
+    }
+  }
+
   async function resumeTask(taskId: string, sourceTask?: TaskInfo, confirmed = false): Promise<boolean> {
     const source = sourceTask ?? tasks.value.find((task) => task.task_id === taskId)
     if (source?.legacy && source.state !== 'paused' && !confirmed && !window.confirm(t('taskLegacyResumeConfirm'))) return false
@@ -336,6 +363,7 @@ export const useTaskStore = defineStore('task', () => {
     shutdownDaemon,
     startTask,
     cancelTask,
+    pauseTask,
     resumeTask,
     deleteHistory,
     poll,

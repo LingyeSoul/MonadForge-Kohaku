@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -39,6 +40,16 @@ class PreprocessSettings(BaseModel):
     # so WebUI edits don't dirty the git-tracked repo copy.
     target_res: list[int] = [1024]
     multires_per_image: bool = False
+
+    # In-pipeline caption autotag (runs right after resize). Off by default so
+    # a first run never rewrites hand-written captions.
+    caption_autotag: bool = False
+    caption_autotag_mode: Literal["missing", "merge", "overwrite"] = "missing"
+    caption_autotag_min_confidence: float = Field(
+        default=0.0, ge=0, le=1, allow_inf_nan=False
+    )
+    # σ-demote routes for the preprocess chain ("1024:896" or comma-separated).
+    sigma_demote: str = ""
 
     @field_validator("target_res")
     @classmethod

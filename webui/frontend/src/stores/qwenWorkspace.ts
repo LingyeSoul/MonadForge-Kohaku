@@ -28,6 +28,7 @@ function createModelWorkspace(family: 'qwen21' | 'moss') {
   const cache = ref<CacheStatus | null>(null)
   const legacyAvailable = ref(family === 'qwen21' && localStorage.getItem(draftKey) !== null)
   const dirty = computed(() => draft.value !== null && JSON.stringify(draft.value) !== saved.value)
+  const hasTune = computed(() => Boolean(schema.value?.tune?.length))
   let pending: Promise<void> | null = null
   let loadSeq = 0
   let catalogSeq = 0
@@ -45,15 +46,19 @@ function createModelWorkspace(family: 'qwen21' | 'moss') {
 
   function update(section: QwenSection, name: string, value: Scalar): void {
     if (!draft.value) throw new Error(`${modelLabel(family)} workspace has not loaded`)
+    const current = draft.value[section]
+    if (!current) throw new Error(`${modelLabel(family)} has no ${section} section`)
     if (configProfile.value && section === 'train' && name === 'algo' && value !== configMethod.value) {
       throw new Error('Choose a method before selecting or creating its configuration')
     }
-    draft.value = { ...draft.value, [section]: { ...draft.value[section], [name]: value } }
+    draft.value = { ...draft.value, [section]: { ...current, [name]: value } }
     cache.value = null
   }
   function values(phase: Phase, overrides: Values = {}): Values {
     if (!schema.value || !draft.value) throw new Error(`${modelLabel(family)} workspace has not loaded`)
-    return checkedValues(schema.value[phase], modelActionValues(family, phase, schema.value[phase], {
+    const fields = schema.value[phase]
+    if (!fields) throw new Error(`${modelLabel(family)} has no ${phase} form`)
+    return checkedValues(fields, modelActionValues(family, phase, fields, {
       ...draft.value[phase], ...draft.value.models, ...overrides,
     }))
   }
@@ -209,6 +214,7 @@ function createModelWorkspace(family: 'qwen21' | 'moss') {
     }))
   }
   async function submit(phase: Phase, overrides: Values): Promise<string> {
+    if (family === 'qwen21' && phase === 'tune') throw new Error('Qwen-Image 2.1 has no tune form')
     const runtime_profile = await useModelWorkspace().runtimeForSubmit()
     return jobId(await requestJson(`${apiRoot}/jobs/${phase}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: values(phase, overrides), runtime_profile }),
@@ -229,7 +235,7 @@ function createModelWorkspace(family: 'qwen21' | 'moss') {
     catch (err) { error.value = err instanceof Error ? err.message : String(err) }
     finally { busy.value = false }
   }
-  return { family, apiRoot, label: modelLabel(family), schema, draft, profile, profiles, configMethod, configProfile, profileAlgorithms, dirty, loading, busy, error, cache, legacyAvailable, saved,
+  return { family, apiRoot, label: modelLabel(family), schema, draft, profile, profiles, configMethod, configProfile, profileAlgorithms, dirty, hasTune, loading, busy, error, cache, legacyAvailable, saved,
     update, values, loadProfile, ensureLoaded, save, createProfile, discard, importLegacy, resetDefaults,
     loadProfileCatalog, selectConfigMethod, selectConfigProfile, beginConfigProfile, createConfigProfile,
     inspectCache, preflight, submit, chain, perform }

@@ -626,6 +626,26 @@ class TaskService:
             items = [item for item in items if item.get("state") == "stopping"]
         return items, total
 
+    async def pause_task(self, task_id: str) -> Optional[Task]:
+        """Freeze a running task; the daemon refuses multi-GPU/accelerate runs."""
+        source = self._tasks.get(task_id)
+        if source is None:
+            try:
+                info = await daemon_client.get_job_group(task_id)
+            except DaemonError:
+                return None
+            source = self._task_from_daemon(info)
+            self._tasks[source.id] = source
+        response = await daemon_client.pause_job(source.job_id or task_id)
+        if response.get("error"):
+            raise ValueError(str(response["error"]))
+        info = await daemon_client.get_job_group(
+            str(response.get("root_job_id") or source.id)
+        )
+        self._apply_daemon_state(source, info)
+        self._ensure_monitors(source, info.get("progress_path"))
+        return source
+
     async def resume_task(self, task_id: str) -> Optional[Task]:
         source = self._tasks.get(task_id)
         if source is None:

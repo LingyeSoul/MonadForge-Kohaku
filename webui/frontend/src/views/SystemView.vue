@@ -84,7 +84,7 @@
                 <template #prepend>
                   <v-icon :icon="group.installed ? 'mdi-check-circle' : 'mdi-alert-circle'" :color="group.installed ? 'success' : 'warning'" />
                 </template>
-                <v-list-item-title :title="t(`sysModel_${group.id}`)">{{ t(`sysModel_${group.id}`) }}</v-list-item-title>
+                <v-list-item-title :title="groupLabel(group)">{{ groupLabel(group) }}</v-list-item-title>
                 <v-list-item-subtitle>
                   <v-chip size="x-small" :color="group.installed ? 'success' : 'warning'" variant="tonal">
                     {{ group.installed ? t('sysInstalled') : t('sysMissing') }}
@@ -94,8 +94,9 @@
                   <v-btn
                     size="small"
                     variant="text"
-                    :loading="isRunning(`download-${group.id}`)"
-                    @click="runTask(`download-${group.id}`)"
+                    :loading="downloading === group.id"
+                    :disabled="Boolean(downloading)"
+                    @click="downloadGroup(group)"
                   >
                     {{ group.installed ? t('sysRedownload') : t('sysDownload') }}
                   </v-btn>
@@ -320,6 +321,7 @@ async function cancelTask() {
 
 interface ModelGroup {
   id: string
+  title?: string
   installed: boolean
   files: { path: string; exists: boolean }[]
 }
@@ -331,6 +333,33 @@ async function fetchModelGroups() {
   if (!res.ok) throw new Error(`HTTP ${res.status}`)
   const data = await res.json()
   modelGroups.value = data.groups || []
+}
+
+const downloading = ref('')
+
+// The four groups the UI has always labeled keep their translations; catalog
+// packs added later fall back to the backend's Pack.title.
+const MODEL_GROUP_KEYS: Record<string, string> = {
+  anima: 'sysModel_anima',
+  sam3: 'sysModel_sam3',
+  mit: 'sysModel_mit',
+  pe: 'sysModel_pe',
+}
+
+function groupLabel(group: ModelGroup): string {
+  const key = MODEL_GROUP_KEYS[group.id]
+  return key ? t(key) : (group.title || group.id)
+}
+
+/** Fetch one pack through the catalog resolver (`download-model <pack>`). */
+async function downloadGroup(group: ModelGroup): Promise<void> {
+  if (downloading.value) return
+  downloading.value = group.id
+  try {
+    await runTask('download-model', [group.id])
+  } finally {
+    downloading.value = ''
+  }
 }
 
 // ── Model paths (configurable) ─────────────────────────────────

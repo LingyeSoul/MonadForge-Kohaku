@@ -1,7 +1,7 @@
 /** Runtime-checked Qwen form transport; defaults are owned by the Python requests. */
 export type Scalar = string | number | boolean | null
 export type Values = Record<string, Scalar>
-export type Phase = 'cache' | 'train' | 'generate'
+export type Phase = 'cache' | 'train' | 'generate' | 'tune'
 type Json = Scalar | Json[] | { [key: string]: Json }
 type JsonObject = { [key: string]: Json }
 export interface QwenField {
@@ -120,7 +120,7 @@ export function readDraft(schema: QwenSchema, text: string | null): QwenDraft {
     cache: checkedValues(schema.cache.filter(item => !modelFields.has(item.name)), row.cache),
     train: checkedValues(schema.train.filter(item => !modelFields.has(item.name)), row.train),
     generate: checkedValues(schema.generate.filter(item => !modelFields.has(item.name)), row.generate),
-    ...(schema.tune ? { tune: checkedValues(schema.tune.filter(item => !modelFields.has(item.name)), row.tune) } : {}),
+    ...(schema.tune ? { tune: checkedValues(schema.tune.filter(item => !modelFields.has(item.name)), row.tune ?? {}) } : {}),
   }
 }
 export async function requestJson(path: string, init: RequestInit): Promise<Json> {

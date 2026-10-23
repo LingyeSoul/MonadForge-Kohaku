@@ -68,6 +68,9 @@
         <v-btn color="primary" :disabled="!workspaceReady || toolbarBusy || (isAnima && continuation.active && !continuation.ready)"
           :loading="isAnima ? trainingLaunching : lineLaunching === 'train'" prepend-icon="mdi-play"
           data-testid="config-train" @click="isAnima ? startTraining() : startQwenTraining()">{{ t('cfgTrain') }}</v-btn>
+        <v-btn v-if="!isAnima && qwen.hasTune" variant="outlined" color="primary"
+          :disabled="!workspaceReady || toolbarBusy" :loading="lineLaunching === 'tune'"
+          prepend-icon="mdi-tune-variant" data-testid="config-tune" @click="startQwenTune()">{{ t('cfgTune') }}</v-btn>
         <v-btn variant="outlined" :disabled="!workspaceReady || toolbarBusy" :loading="isAnima ? testLaunching : lineLaunching === 'test'"
           prepend-icon="mdi-test-tube" data-testid="config-test" @click="isAnima ? startTest() : startQwenTest()">{{ t('cfgTest') }}</v-btn>
       </template>
@@ -509,8 +512,8 @@ const qwenCacheDialog = ref(false)
 const cacheProblem = ref('')
 
 const isAnima = computed(() => workspace.family === 'anima')
-const lineLaunching = ref<'train' | 'test' | null>(null)
-const toolbarBusy = computed(() => switching.value || creatingVariant.value || trainingLaunching.value || testLaunching.value || qwen.value.busy || qwen.value.loading || configStore.loading)
+const lineLaunching = ref<'train' | 'test' | 'tune' | null>(null)
+const toolbarBusy = computed(() => switching.value || creatingVariant.value || trainingLaunching.value || testLaunching.value || lineLaunching.value !== null || qwen.value.busy || qwen.value.loading || configStore.loading)
 const workspaceMethod = computed(() => isAnima.value ? selectedMethod.value : qwen.value.configMethod)
 const workspaceVariant = computed(() => isAnima.value ? selectedVariant.value : qwen.value.configProfile)
 const workspaceReady = computed(() => Boolean(workspaceVariant.value) && (isAnima.value
@@ -672,6 +675,14 @@ async function startQwenTest(): Promise<void> {
   try { await qwen.value.perform(async () => {
     if (qwen.value.dirty) await qwen.value.save()
     await openQwenTask(await qwen.value.submit('generate', {}))
+  }) } finally { lineLaunching.value = null }
+}
+async function startQwenTune(): Promise<void> {
+  if (!workspaceReady.value || toolbarBusy.value) return
+  lineLaunching.value = 'tune'
+  try { await qwen.value.perform(async () => {
+    if (qwen.value.dirty) await qwen.value.save()
+    await openQwenTask(await qwen.value.submit('tune', {}))
   }) } finally { lineLaunching.value = null }
 }
 async function chainQwenTraining(): Promise<void> {

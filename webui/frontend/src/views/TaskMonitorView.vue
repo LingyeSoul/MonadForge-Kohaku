@@ -122,6 +122,16 @@
               @click="deleteHistory(task)"
             >{{ t('taskDeleteHistory') }}</v-btn>
             <v-btn
+              v-if="task.state === 'running'"
+              size="x-small"
+              color="primary"
+              variant="text"
+              prepend-icon="mdi-pause"
+              @click="pauseTask(task)"
+            >
+              {{ t('taskPause') }}
+            </v-btn>
+            <v-btn
               v-if="isTaskStoppable(task.state)"
               size="x-small"
               color="error"
@@ -203,6 +213,16 @@
               prepend-icon="mdi-delete-outline"
               @click="deleteHistory(task)"
             >{{ t('taskDeleteHistory') }}</v-btn>
+            <v-btn
+              v-if="task.state === 'running'"
+              size="x-small"
+              color="primary"
+              variant="text"
+              prepend-icon="mdi-pause"
+              @click="pauseTask(task)"
+            >
+              {{ t('taskPause') }}
+            </v-btn>
             <v-btn
               v-if="isTaskStoppable(task.state)"
               size="x-small"
@@ -393,6 +413,10 @@ async function resumeTask(task: TaskInfo) {
 }
 function deleteHistory(task: TaskInfo) { pendingAction.value = { kind: 'delete', task } }
 function cancelTask(task: TaskInfo) { pendingAction.value = { kind: 'cancel', task } }
+
+async function pauseTask(task: TaskInfo) {
+  if (await taskStore.pauseTask(task.task_id)) await loadPage()
+}
 
 async function confirmAction() {
   const action = pendingAction.value

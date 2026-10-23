@@ -290,6 +290,13 @@ class DaemonClient:
     async def resume(self, job_id: str) -> dict:
         return await self._request("POST", f"/jobs/{job_id}/resume")
 
+    async def pause_job(self, job_id: str) -> dict:
+        """Freeze a running job's process tree (daemon SIGSTOP)."""
+        return await self._request("POST", f"/jobs/{job_id}/pause")
+
+    async def unpause_job(self, job_id: str) -> dict:
+        return await self._request("POST", f"/jobs/{job_id}/unpause")
+
     async def continuation_candidates(self, variant: str) -> dict:
         return await self._request("GET", f"/continuation-candidates?variant={urllib.parse.quote(variant)}", timeout=60)
 

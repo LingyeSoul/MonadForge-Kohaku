@@ -1,7 +1,7 @@
 <template>
   <v-row class="model-fields">
     <v-col v-for="field in visibleFields" :key="field.name" cols="12" :sm="field.multiline || section === 'models' ? 12 : 6">
-      <ConfigField :field="metadata(field)" :model-value="qwen.draft?.[section][field.name]"
+      <ConfigField :field="metadata(field)" :model-value="qwen.draft?.[section]?.[field.name]"
         @update="qwen.update(section, field.name, $event as Scalar)" @help-click="emit('help', `${section}.${field.name}`)" />
     </v-col>
   </v-row>
@@ -34,7 +34,7 @@ function metadata(field: QwenField): FieldMeta {
   const path = pathKinds[field.name]
   return {
     key: `${props.section}.${field.name}`, label: modelFieldLabel(qwen.value.family, app.language, field.name, t(`qwenField_${field.name}`)),
-    value: qwen.value.draft?.[props.section][field.name], default_value: field.value,
+    value: qwen.value.draft?.[props.section]?.[field.name], default_value: field.value,
     field_type: path ? 'path' : field.choices.length ? 'select' : field.kind,
     description: field.nullable ? t('qwenAuto') : '', origin: 'method', group: props.section,
     is_virtual: false, read_only: qwen.value.busy, options: field.choices, nullable: field.nullable,

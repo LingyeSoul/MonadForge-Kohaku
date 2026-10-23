@@ -48,6 +48,7 @@ const { t } = useI18n()
 const appStore = useAppStore()
 
 const visible = defineModel<boolean>({ default: false })
+const props = withDefaults(defineProps<{ book?: 'anima' | 'moss' }>(), { book: 'anima' })
 const content = ref('')
 const loading = ref(false)
 const error = ref('')
@@ -88,7 +89,8 @@ async function fetchGuidebook() {
   error.value = ''
   try {
     const lang = appStore.language
-    const res = await fetch(`/api/docs/guidebook?lang=${encodeURIComponent(lang)}`)
+    const bookQuery = props.book === 'moss' ? '&book=moss' : ''
+    const res = await fetch(`/api/docs/guidebook?lang=${encodeURIComponent(lang)}${bookQuery}`)
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
     content.value = data.content || ''

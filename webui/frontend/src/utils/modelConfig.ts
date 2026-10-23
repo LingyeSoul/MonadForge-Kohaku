@@ -1,6 +1,6 @@
 import { modelFields, type Phase, type QwenDraft, type QwenField, type QwenSchema, type Values } from './qwen21.ts'
 
-export type ModelConfigSection = 'models' | 'train' | 'generate'
+export type ModelConfigSection = 'models' | 'train' | 'generate' | 'tune'
 export interface ModelConfigGroup {
   id: string
   titleKey: string
@@ -21,13 +21,14 @@ export const BASIC_GROUP_ID = 'basic'
 // backend (`library.lines.requests.field_group`, shared with the desktop GUI);
 // only the heading and the order are the browser's business. A section added
 // later still renders — after these, under its own name.
-const PANEL_ORDER = ['training', 'performance', 'paths', 'architecture', 'generate', 'other'] as const
+const PANEL_ORDER = ['training', 'performance', 'paths', 'architecture', 'generate', 'tune', 'other'] as const
 const PANEL_TITLE_KEYS: Record<string, string> = {
   training: 'cfgGroupTraining',
   performance: 'cfgGroupPerformance',
   paths: 'cfgGroupPaths',
   architecture: 'cfgGroupArchitecture',
   generate: 'qwTestParameters',
+  tune: 'cfgGroupTune',
   other: 'cfgGroupOther',
 }
 
@@ -124,6 +125,11 @@ export function groupModelConfigFields(schema: QwenSchema | null, draft: Partial
   }
   for (const field of schema.generate) {
     if (!modelFields.has(field.name) && modelFieldActive(family, 'generate', field.name, modelSectionValues(schema, draft, 'generate'))) append(target(field), 'generate', field)
+  }
+  // The MOSS swap-tuning form is its own panel and submit action; its fields
+  // never belong to the training section even when the backend names a group.
+  for (const field of schema.tune ?? []) {
+    if (!modelFields.has(field.name) && modelFieldActive(family, 'tune', field.name, modelSectionValues(schema, draft, 'tune'))) append('tune', 'tune', field)
   }
   return groups.filter(group => group.sections.length > 0)
 }

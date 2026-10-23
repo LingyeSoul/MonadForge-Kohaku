@@ -278,3 +278,71 @@ def test_manifest_paths_reject_incomplete_run(tmp_path):
 
     with pytest.raises(PreprocessRunError, match="Incomplete preprocess manifest"):
         svc.get_paths(manifest=str(run.manifest_path))
+
+# ── Caption autotag + σ-demote settings ────────────────────────
+
+
+def test_normalize_sigma_demote_canonicalizes_and_rejects_bad_routes():
+    assert svc._normalize_sigma_demote("") == ""
+    assert svc._normalize_sigma_demote("1024:896") == "1024:896"
+    assert svc._normalize_sigma_demote(" 1280:1024 ; 1024:896 ") == "1280:1024,1024:896"
+
+    import pytest
+
+    for raw in ("1024", "896:1024", "1024:0", "2048:1024", "abc:def"):
+        with pytest.raises(ValueError):
+            svc._normalize_sigma_demote(raw)
+
+
+def test_get_caption_autotag_reads_the_config_chain(monkeypatch):
+    monkeypatch.setattr(
+        "library.config.io.load_path_overrides",
+        lambda preset, method, methods_subdir: {
+            "caption_autotag": "true",
+            "caption_autotag_mode": "weird",
+            "caption_autotag_min_confidence": "0.35",
+            "sigma_demote": "1024:896",
+        },
+    )
+    assert svc.get_caption_autotag() is True
+    # Unknown modes cannot leak into the stage; the safe default wins.
+    assert svc.get_caption_autotag_mode() == "missing"
+    assert svc.get_caption_autotag_min_confidence() == 0.35
+    assert svc.get_sigma_demote() == "1024:896"
+
+
+def test_save_settings_persists_caption_and_sigma_keys(tmp_path, monkeypatch):
+    pp = tmp_path / "preprocess.toml"
+    pp.write_text("target_res = [1024]\nfreefit_max_ratio = 4.0\n", encoding="utf-8")
+    sam = tmp_path / "sam_mask.yaml"
+    settings = tmp_path / "webui_settings.json"
+    monkeypatch.setattr(svc, "PREPROCESS_TOML", pp)
+    monkeypatch.setattr(svc, "SAM_YAML", sam)
+    monkeypatch.setattr(svc, "SETTINGS_FILE", settings)
+    monkeypatch.setattr(svc, "CONFIGS_DIR", tmp_path)
+    monkeypatch.setattr(
+        "library.config.io.load_path_overrides",
+        lambda preset, method, methods_subdir: toml.loads(
+            pp.read_text(encoding="utf-8")
+        ),
+    )
+
+    result = svc.save_settings(
+        {
+            "caption_autotag": True,
+            "caption_autotag_mode": "merge",
+            "caption_autotag_min_confidence": 0.2,
+            "sigma_demote": "1024:896",
+        }
+    )
+
+    assert result["caption_autotag"] is True
+    assert result["caption_autotag_mode"] == "merge"
+    assert result["caption_autotag_min_confidence"] == 0.2
+    assert result["sigma_demote"] == "1024:896"
+    data = toml.loads(pp.read_text(encoding="utf-8"))
+    assert data["caption_autotag"] is True
+    assert data["caption_autotag_mode"] == "merge"
+    assert data["sigma_demote"] == "1024:896"
+    # Unrelated user-owned keys survive the round-trip.
+    assert data["freefit_max_ratio"] == 4.0

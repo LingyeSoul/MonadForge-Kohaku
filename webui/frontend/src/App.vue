@@ -126,7 +126,7 @@
       </router-view>
     </v-main>
 
-    <GuidebookDialog v-model="showGuidebook" />
+    <GuidebookDialog v-model="showGuidebook" :book="modelWorkspace.family === 'moss' ? 'moss' : 'anima'" />
 
     <v-snackbar
       v-model="snackbarOpen"
