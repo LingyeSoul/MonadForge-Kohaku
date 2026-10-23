@@ -10,7 +10,7 @@
       class="workspace-nav"
     >
       <router-link to="/config" class="workspace-brand" :aria-label="t('appName')">
-        <img src="/logo.svg" alt="" width="32" height="32" />
+        <img src="/logo.svg" alt="" width="28" height="28" />
         <div v-if="mobile || !rail" class="workspace-brand__text">
           <strong>MonadForge-Kohaku</strong>
           <span>{{ t('workspaceStudio') }}</span>

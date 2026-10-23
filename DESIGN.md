@@ -173,7 +173,7 @@ components:
 
 **没有环境阴影。** 深度来自两条轴：炉膛色阶（deep → base → surface → elevated，每层一级灰度）与 1px 描边（subtle/default/strong）。卡片 elevation 0、展开面板阴影移除；悬浮菜单/对话框落在近不透明的 overlay token（#1C1F22）上保证可读性。光晕（glow）是**状态反馈**而非氛围：焦点环 `0 0 0 3px ember@12%`、激活导航项、最新采样样本的 teal 光环（`0 0 0 1px teal, 0 0 12px rgba(199,91,26,0.18)`）。
 
-可选的**磨砂玻璃外观**（`html.forge-glass`）：表面 token 换为半透明值，`backdrop-filter: blur(16px) saturate(1.25)` 只施加于导航与顶栏两个单实例表面（性能与驱动兼容考虑）；浮层保持 ≥90% 不透明的可读性下限。可选**壁纸**画在 `<html>` canvas 上（浏览器最底层绘制），叠加主题化遮罩（暗色 55% / 亮色 +10% 起步）。
+可选的**磨砂玻璃外观**（`html.forge-glass`）：表面 token 换为半透明值，`backdrop-filter: blur(16px) saturate(1.25)` 只施加于导航与顶栏两个单实例表面（性能与驱动兼容考虑）；浮层保持 ≥90% 不透明的可读性下限。卡片、表单字段与面板全部按同一个 `--forge-glass-strength` 缩放（字段始终比卡片实一点：暗色 +6pp、亮色 +16pp），透明度滑杆一动，整页控件同步移动——不存在"绝对下限"造成的实色补丁。只读/禁用控件保留底色，只降低内容对比度，绝不对整个控件施加 32% 透明度（那会让壁纸穿透输入框、把数值抹掉）。可选**壁纸**画在 `<html>` canvas 上（浏览器最底层绘制），叠加主题化遮罩（暗色 55% / 亮色 +10% 起步）。
 
 ### Shadow Vocabulary
 - **Focus Ring**（`box-shadow: 0 0 0 3px rgb(235 163 117 / 12%)`）：字段与键盘焦点（配全局 `:focus-visible` 2px ember 描边、offset 3px）。
@@ -214,7 +214,7 @@ components:
 ### Navigation
 - 左侧 240px / rail 72px；分组标签 11px text-muted；导航项 38px、5px 圆角、13px/500。
 - **默认** text-secondary → **hover** bg-hover + text-primary（140ms）→ **激活** ember 文字 + ember@12% 底 + 左侧 2px inset 余烬条。
-- 品牌区 80px：32px logo（6px 圆角）+ 17px/650 名称 + 11px 副标题。
+- 品牌区 60px（与顶栏同高，共用一个横带）：28px logo（6px 圆角）+ 15px/650 名称 + 11px 副标题；副标题只写工作台定位，不重复产品名。
 
 ### Metric Tile（签名组件）
 标签 12px text-secondary，值 JetBrains Mono 500 20px/1.6，可带语义色（温度阈值、显存警告）。网格 auto-fit 平铺，是"仪表读数"的基本原子。

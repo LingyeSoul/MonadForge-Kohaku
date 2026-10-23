@@ -99,11 +99,35 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 .v-field {
   border-radius: var(--radius-sm) !important;
   font-size: 13px;
-  background: var(--bg-surface);
+  /* Every form control — toolbar selects, search, config fields, path pickers —
+   * paints the same token, so one opacity setting moves all of them together. */
+  background: var(--bg-form-field, var(--bg-surface));
   transition: box-shadow 160ms ease;
 }
 .v-field__outline { --v-field-border-opacity: 0.28; }
 .v-field--focused { box-shadow: 0 0 0 3px var(--glow-ember); }
+/* Read-only and disabled controls keep their surface and mute only their
+ * contents. Vuetify fades the whole field to 32%, which lets the wallpaper
+ * bleed through the box and erases the very value the user is reading. */
+.v-field--disabled { opacity: 1; }
+.v-field--disabled .v-field__input,
+.v-field--disabled .v-select__selection {
+  color: var(--text-secondary) !important;
+}
+.v-field--disabled .v-label {
+  color: var(--text-muted) !important;
+  /* Enabled labels sit at Vuetify's .64 medium emphasis; keep read-only labels
+   * a step below them instead of overriding the whole field's opacity. */
+  opacity: 0.9;
+}
+.v-field--disabled .v-field__outline { --v-field-border-opacity: 0.12; }
+.v-selection-control--disabled { opacity: 1; }
+.v-selection-control--disabled .v-label { color: var(--text-muted); }
+.v-selection-control--disabled .v-switch__track { opacity: 0.6; }
+.v-selection-control--disabled .v-switch__thumb { opacity: 0.6; }
+/* The append slot holds the field help button and the read-only badge — both
+ * stay actionable/relevant on a disabled field, so it must not fade with it. */
+.v-input--disabled .v-input__append { opacity: 1; }
 .v-label { font-size: 13px; }
 .v-switch .v-selection-control:not(.v-selection-control--dirty) {
   .v-switch__track {
@@ -178,19 +202,37 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 .workspace-brand {
   display: flex;
   align-items: center;
-  gap: 11px;
-  height: 80px;
-  padding: 0 21px;
+  gap: 10px;
+  /* Matches the 60px app bar so brand and breadcrumb share one band instead of
+   * stepping at y=80. */
+  height: 60px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--border-subtle);
   color: var(--text-primary);
   text-decoration: none;
-  img { flex: 0 0 32px; border-radius: 6px; }
+  img { flex: 0 0 28px; border-radius: 6px; transition: filter 160ms ease; }
+  &:hover img { filter: drop-shadow(0 0 6px rgb(235 163 117 / 45%)); }
+  &:focus-visible { outline-offset: -2px; }
 }
 .workspace-brand__text {
   display: grid;
-  gap: 3px;
+  gap: 2px;
+  min-width: 0;
   white-space: nowrap;
-  strong { font-size: 17px; font-weight: 650; }
-  span { color: var(--text-muted); font-size: 11px; }
+  strong {
+    font-size: 15px;
+    font-weight: 650;
+    line-height: 1.25;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  span {
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 1.25;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 }
 .nav-group { padding: 8px 0; }
 .nav-group__label { padding: 0 24px 8px; font-size: 11px; font-weight: 500; color: var(--text-muted); }
@@ -283,10 +325,11 @@ html.forge-glass {
   --bg-deep: rgb(17 19 21 / calc(74% * var(--forge-glass-strength, 1)));
   --bg-base: rgb(20 22 24 / calc(62% * var(--forge-glass-strength, 1)));
   --bg-surface: rgb(28 31 34 / calc(82% * var(--forge-glass-strength, 1)));
-  /* Dense forms need a stable reading surface even over bright wallpaper.
-   * Keep the surrounding workbench translucent without per-card blur. */
-  --bg-form-surface: rgb(28 31 34 / max(calc(82% * var(--forge-glass-strength, 1)), 84%));
-  --bg-form-field: rgb(28 31 34 / max(calc(82% * var(--forge-glass-strength, 1)), 88%));
+  /* Dense forms lead the surrounding workbench by a few points so text keeps
+   * its reading surface, but every surface still scales with the one opacity
+   * setting — an absolute floor leaves opaque patches over a translucent page. */
+  --bg-form-surface: rgb(28 31 34 / calc(84% * var(--forge-glass-strength, 1)));
+  --bg-form-field: rgb(28 31 34 / calc(88% * var(--forge-glass-strength, 1)));
   --bg-elevated: rgb(39 43 47 / calc(86% * var(--forge-glass-strength, 1)));
   --bg-hover: rgb(44 49 54 / calc(70% * var(--forge-glass-strength, 1)));
   /* Floating content must stay readable over the page at every glass opacity. */
@@ -313,8 +356,8 @@ html.forge-glass .v-theme--light {
   --bg-deep: rgb(255 255 255 / calc(70% * var(--forge-glass-strength, 1)));
   --bg-base: rgb(246 247 248 / calc(62% * var(--forge-glass-strength, 1)));
   --bg-surface: rgb(255 255 255 / calc(76% * var(--forge-glass-strength, 1)));
-  --bg-form-surface: rgb(255 255 255 / max(calc(76% * var(--forge-glass-strength, 1)), 88%));
-  --bg-form-field: rgb(255 255 255 / max(calc(76% * var(--forge-glass-strength, 1)), 92%));
+  --bg-form-surface: rgb(255 255 255 / calc(88% * var(--forge-glass-strength, 1)));
+  --bg-form-field: rgb(255 255 255 / calc(92% * var(--forge-glass-strength, 1)));
   --bg-elevated: rgb(255 255 255 / calc(86% * var(--forge-glass-strength, 1)));
   --bg-hover: rgb(233 237 240 / calc(70% * var(--forge-glass-strength, 1)));
   --bg-overlay: #fff;

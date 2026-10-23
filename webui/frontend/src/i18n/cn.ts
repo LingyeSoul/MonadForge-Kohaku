@@ -46,7 +46,7 @@ export default {
   cfgTrainingState_error: "失败",
   cfgTrainingState_running: "运行中",
   cfgTrainingState_queued: "排队中",
-  workspaceStudio: 'MonadForge-Kohaku 训练工作台',
+  workspaceStudio: '训练工作台',
   workspaceNavigation: '主导航',
   workspaceTraining: '训练空间',
   workspaceData: '数据准备',
