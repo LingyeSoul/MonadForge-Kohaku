@@ -9,7 +9,7 @@ the repository touches them.
 
 ## Use
 
-Nothing to switch on. `library/moss/ops.fuse(model)` runs from `moss-train`,
+Nothing to switch on. `library/moss/ops.py`'s `fuse(model)` runs from `moss-train`,
 `moss-generate` and `moss-tune` right before the optional `torch.compile`, and prints
 `[kernels] fused block ops on 42 blocks`. It declines (and the model keeps the reference
 branch) when any of these holds:

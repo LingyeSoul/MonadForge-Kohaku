@@ -1,44 +1,23 @@
-import { ref, computed } from 'vue'
+import { computed } from 'vue'
 import { useAppStore } from '../stores/app'
 import { getFrontendTranslations, type TranslationMessages } from '../i18n'
 
-const backendTranslations = ref<TranslationMessages>({})
-const languages = ref<string[]>(['en', 'cn', 'ko', 'ja'])
-const loaded = ref(false)
+/** The Vue app owns every translation; there is no server catalog to fetch. */
+const LANGUAGES = ['en', 'cn', 'ko', 'ja']
 
-export async function initI18n() {
-  const appStore = useAppStore()
-  try {
-    const langRes = await fetch('/api/i18n')
-    const langData = await langRes.json()
-    languages.value = langData.languages || ['en', 'cn', 'ko', 'ja']
-  } catch {
-    // fallback to en/cn/ko/ja
-  }
-  await loadBackendTranslations(appStore.language)
-  loaded.value = true
-}
-
-async function loadBackendTranslations(lang: string) {
-  try {
-    const res = await fetch(`/api/i18n/${lang}`)
-    backendTranslations.value = await res.json()
-  } catch {
-    backendTranslations.value = {}
-  }
-}
+export async function initI18n(): Promise<void> {}
 
 export function useI18n() {
   const appStore = useAppStore()
 
-  const frontend = computed(() => getFrontendTranslations(appStore.language))
+  const frontend = computed<TranslationMessages>(() => getFrontendTranslations(appStore.language))
 
   /**
-   * Translate a key. Frontend translations take priority over backend.
-   * Supports {param} interpolation.
+   * Translate a key from the frontend catalog. Supports {param} interpolation.
+   * A missing key returns the key itself so a missed translation is visible.
    */
   function t(key: string, params?: Record<string, string | number>): string {
-    let text = frontend.value[key] ?? backendTranslations.value[key] ?? key
+    let text = frontend.value[key] ?? key
     if (params) {
       for (const [k, v] of Object.entries(params)) {
         text = text.replace(`{${k}}`, String(v))
@@ -47,10 +26,9 @@ export function useI18n() {
     return text
   }
 
-  async function setLanguage(lang: string) {
+  function setLanguage(lang: string): void {
     appStore.setLanguage(lang)
-    await loadBackendTranslations(lang)
   }
 
-  return { t, setLanguage, languages, loaded }
+  return { t, setLanguage, languages: LANGUAGES, loaded: true }
 }

@@ -56,7 +56,10 @@ def test_split_modules_have_complete_config_and_context_contracts():
     cfg = resolve_config(build_argparser().parse_args([]), {})
     fields = {field.name for field in dataclasses.fields(cfg)}
     root = Path(__file__).resolve().parents[1] / "scripts/distill_turbo"
-    trees = {path.name: ast.parse(path.read_text()) for path in root.glob("*.py")}
+    trees = {
+        path.name: ast.parse(path.read_text(encoding="utf-8"))
+        for path in root.glob("*.py")
+    }
     unresolved = [
         (name, node.lineno, node.attr)
         for name, tree in trees.items()

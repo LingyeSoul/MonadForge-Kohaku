@@ -65,29 +65,18 @@ A second-order bench-gap contribution worth calling out:
 
 ### 4. Translations & localization
 
-Translatable content lives in four places, each with its own contribution shape but all reviewed as Tier 1 (no bench, no test — `python -m webui` walkthrough screenshots in the PR description are the proof). Missing entries in every surface below **fall back to English**, so it's fine to ship an incomplete translation and grow it over time. Currently shipped: `en` (canonical), `ko` (mostly complete), `cn` (machine-translated stub, unproofread).
+Translatable content lives in four places, each with its own contribution shape but all reviewed as Tier 1 (no bench, no test — `python -m webui` walkthrough screenshots in the PR description are the proof). Every surface falls back to English, so it's fine to ship an incomplete translation and grow it over time. The Vue app ships `en`, `cn`, `ko` and `ja`; the backend has no string catalog any more (the Qt-era `STRINGS` modules and `/api/i18n` were retired with the desktop GUI — `webui/i18n/loader.py` now only carries the active language for the field-help/guide resolvers).
 
-**(a) Backend strings — `webui/i18n/strings/<code>.py`.** The FastAPI side's
-public strings (task errors, validation messages, tray-facing text) live here.
-Each module exports `STRINGS: dict[str, str]`; `webui/i18n/loader.py` assembles
-them. Add a language by dropping in a module and registering it in the loader.
+**(a) Frontend strings — `webui/frontend/src/i18n/<code>.ts`.** The Vue app's labels and help text live here; register the language in `webui/frontend/src/i18n/index.ts` and the app store's language list. Keep the same key set as `en.ts` so a missing key falls back cleanly (`useI18n` returns the key when the active locale has no entry, so a missed translation is visible in the UI).
 
-**(b) Frontend strings — `webui/frontend/src/i18n/<code>.ts`.** The Vue app's
-labels and help text live here; register the language in
-`webui/frontend/src/i18n/index.ts` and the app store's language list. Keep the
-same key set as `en.ts` so a missing key falls back cleanly.
+**(b) Field help and guides — `webui/explanations/guides/<lang>/`.** Per-field JSON (`_fields.json`, `_preprocess_fields.json`, `_stage_fields.json`) and the long-form HTML guides. The loader in `webui/explanations/__init__.py` falls back to English. Preserve the `<a>`, `<code>`, and `<span>` markup.
 
-**(c) Field help and guides — `webui/explanations/guides/<lang>/`.** Per-field
-JSON (`_fields.json`, `_preprocess_fields.json`, `_stage_fields.json`) and the
-long-form HTML guides. The loader in `webui/explanations/__init__.py` falls back
-to English. Preserve the `<a>`, `<code>`, and `<span>` markup.
-
-**(d) Docs and structure images — `docs/`.**
-- `docs/guidelines/가이드북.md` is the end-to-end onboarding doc and only exists in Korean. An English translation (or any other language) would significantly widen the audience. The `guidebook_tooltip` string in `webui/i18n/strings/en.py` currently points users at the Korean file — once a translation lands, wire the Guidebook button (in `webui/server.py`) to pick the right file based on `current_language()`.
-- `docs/structure_images_korean/` holds Korean-labeled versions of the architecture diagrams under `docs/structure_images/` (e.g. `animakor.png` ↔ `anima.png`). English/other-language equivalents are welcome under the natural sibling tree (`docs/structure_images/` is the English baseline; e.g. the existing `docs/structure_images_korean/`). Mention which markdown files reference the diagram so the reviewer can update the embed paths.
+**(c) Docs and structure images — `docs/`.**
+- Guidebooks ship per language: `guidebook_en.md` (en), `指南书.md` (cn), `ガイドブック.md` (ja) and `가이드북.md` (ko); `webui/api/docs.py` maps them, and the four `moss-*` editions are served alongside via `?book=moss`. Add a language by dropping in the file and extending `_GUIDEBOOK_FILES` / `_MOSS_GUIDEBOOK_FILES`; the dialog picks the book from the active model line.
+- `docs/structure_images_korean/` holds Korean-labeled versions of the architecture diagrams under `docs/structure_images/` (e.g. `animakor.png` ↔ `anima.png`). English/other-language equivalents are welcome under the natural sibling tree (`docs/structure_images/` is the English baseline). Mention which markdown files reference the diagram so the reviewer can update the embed paths.
 - Method docs under `docs/methods/`, `docs/experimental/`, `docs/proposal/`, and `docs/optimizations/` are **English-only by convention** — translations are welcome as `<name>.<code>.md` siblings, but nothing reads them at runtime yet. If you contribute one, also propose how it should surface (e.g. a language switcher in the README's docs table, or wiring it into a WebUI "Open method doc" button). Don't translate `CLAUDE.md` — that file is consumed by Claude Code and is single-source-of-truth for project conventions.
 
-**(e) Tag knowledge-base descriptions — `models/danbooru_tags_classified.csv` (KR) + `.en.csv` (EN).** The anime_tools panel's tag-explanation view (a KB tooltip with a tag's category and a written description) is powered by these CSVs (`name,category,post_count,description`; loaded by `anime_tools.captions.correction.load_tag_knowledge_base`). The base CSV's `description` column is **Korean** (from `Localsmile/danbooru_KR_wiki_tag_search`); `download-danbooru-tags` also builds an **English** sibling `danbooru_tags_classified.en.csv` (`anime_tools.tagger.cli.build_english_tag_csv`, joining tag names against the `isek-ai/danbooru-wiki-2024` wiki mirror). `find_tag_csv(root, lang)` resolves per UI language: `ko` → Korean base; any other language → same-language sibling `danbooru_tags_classified.<code>.csv` if present, else the English `.en.csv`. To add a fully-translated language, ship `danbooru_tags_classified.<code>.csv` and it's picked up automatically. ~114k rows, so partial coverage is fine — untranslated rows fall back to the name+category head with no description line. *[Tier 1]*
+**(d) Tag knowledge-base descriptions — `models/danbooru_tags_classified.csv` (KR) + `.en.csv` (EN).** The anime_tools panel's tag-explanation view (a KB tooltip with a tag's category and a written description) is powered by these CSVs (`name,category,post_count,description`; loaded by `anime_tools.captions.correction.load_tag_knowledge_base`). The base CSV's `description` column is **Korean** (from `Localsmile/danbooru_KR_wiki_tag_search`); `download-danbooru-tags` also builds an **English** sibling `danbooru_tags_classified.en.csv` (`anime_tools.tagger.cli.build_english_tag_csv`, joining tag names against the `isek-ai/danbooru-wiki-2024` wiki mirror). `find_tag_csv(root, lang)` resolves per UI language: `ko` → Korean base; any other language → same-language sibling `danbooru_tags_classified.<code>.csv` if present, else the English `.en.csv`. To add a fully-translated language, ship `danbooru_tags_classified.<code>.csv` and it's picked up automatically. ~114k rows, so partial coverage is fine — untranslated rows fall back to the name+category head with no description line. *[Tier 1]*
 
 **Parity check (covers both UI surfaces):**
 
