@@ -79,7 +79,7 @@ The op surface is one thing; what the trainer and the pipeline reach is another:
 | `quant_linear` (int8 / e4m3 weights, per-row scales) | `library/moss/quant.py`, `moss-generate --quant {int8,fp8}` | the frozen 5B DiT base at half the VRAM; a LoRA (not LoKr) still applies on top |
 | `AdamW16`, `MuonHybrid` | `library/moss/optim/`, `moss-train --optimizer {adamw16,muon}` | 16-bit optimizer state with fp32 math, or Muon on the LoRA matrices |
 | VAE decode in bf16 / fp16, optionally compiled in channels_last | `loader.load_vae(compile=...)`, `moss-generate --vae_dtype`, `--vae_compile` | ~1.5× decode and ~60% of the fp32 VAE's VRAM upstream |
-| TileLang backend | vendored source; `pip install tilelang` | sm70 / sm75, where Inductor and SDPA are weak |
+| TileLang backend | vendored source; `uv sync --group kernels-tilelang` | sm70 / sm75, where Inductor and SDPA are weak |
 
 ## What is vendored but not wired
 
@@ -90,9 +90,24 @@ are not connected, with what stands between each and this model:
 |---|---|---|
 | `attention_varlen` (non-causal) | available | `forward_batched` still pads text to `s_max`; batch 1 (the trainer) and cond+uncond (`--batched`) do not pay enough to justify the packed `ref_span` / modulation rewrite |
 | `fp8_linear`, `fp8_linear_train`, MXFP8 | available | fp8 compute needs a scaling recipe, fp8 master weights and a scaler; the trainer is bf16 with fp32 masters |
-| `quant_linear_rotated` | available | this repository already ships its own ConvRot (`library/runtime/convrot`, `library/moss/int8.py`); two rotation families on one checkpoint would be a footgun |
+| `quant_linear_rotated` | available, not wired | this repository already ships ConvRot (`library/runtime/convrot`: W8A8 and W8A16, sylvester and regular H, `_int_mm` padding); measured on an RTX 4060 at 4096 tokens, the vendored weight-only kernel was 0.90–1.17× this repository's W8A16 time and plain `quant_linear` was faster still, so a second rotation family buys nothing |
 | fused optimizer bundle (`FusedStep`, `HostAccumulator`, streaming AdamW) | available | the trainer's optimizer surface (`library/training/`) owns grad hooks and the offload engines |
 | TileLang backend | source only | `tilelang` is not a dependency of this project; sm70 / sm75 would need the extra |
+
+Rotated-quant comparison (RTX 4060 Laptop, bf16, 4096 tokens, group 256, best of 50).
+`convrot` is this repository's fused path; `upstream rotated` is the vendored
+`quant_linear_rotated` Triton kernel; `upstream plain` is the vendored `quant_linear`
+(no rotation) that `library/moss/quant.py` uses.
+
+| shape (N × K) | bf16 | convrot W8A16 | convrot W8A8 | upstream rotated | upstream plain |
+|---|---|---|---|---|---|
+| q/o 3072 × 3072 | 3.36 | 3.23 | 6.91 | 3.79 | 2.82 |
+| ffn_up_gate 16384 × 3072 | 13.04 | 14.92 | 31.87 | 13.37 | 13.19 |
+| ffn_down 3072 × 8192 | 6.42 | 7.85 | 15.91 | 7.10 | 6.58 |
+
+ms per forward. Cosines against bf16 are ≥ 0.9999 everywhere. The weight-only paths
+save the weight's bytes, not time, on this card; `_int_mm` (W8A8) has no win at these
+shapes either, which is why the quantized base uses plain per-row `quant_linear`.
 
 ## Layout
 

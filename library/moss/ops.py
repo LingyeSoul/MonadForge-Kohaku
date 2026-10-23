@@ -72,15 +72,15 @@ def bind(op: str, device, dtype: torch.dtype, **static) -> object:
 
 def describe(device, dtype: torch.dtype) -> dict[str, str]:
     """``{op: the backend that would serve it}`` for the block and text-encoder ops."""
+    from library.moss.vendor.kohakumoss_kernels.hardware.arch import arch_of
+
     registry = _registry()
+    arch = arch_of(device).name
+    order = registry.DEFAULT_PRIORITY.get(arch, ("tilelang", "triton", "compile"))
     out: dict[str, str] = {}
     for op in (*BLOCK_OPS, *TEXT_OPS):
         reasons = registry.available(op, device, dtype)
-        ready = [
-            name
-            for name in ("tilelang", "triton", "compile")
-            if reasons.get(name) is None
-        ]
+        ready = [name for name in order if reasons.get(name) is None]
         out[op] = ready[0] if ready else f"eager only ({reasons.get('triton')})"
     return out
 

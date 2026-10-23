@@ -139,7 +139,7 @@ index-strategy = "unsafe-best-match"
 # conflict with rocm-windows and the ROCm command above needs no extra flag.
 # The opt-in stacks carry every platform: `uv sync --no-default-groups --group
 # torch-213` (or torch-212).
-default-groups = ["dev", "torch-214", "cuda-windows", "curation"]
+default-groups = ["dev", "torch-214", "cuda-windows", "curation", "kernels-tilelang"]
 conflicts = [
     [
         { group = "cuda-windows" },
@@ -360,3 +360,7 @@ sr = [
     "scikit-learn",
     "tqdm",
 ]
+# The TileLang backend of the vendored MOSS kernel stack (library/moss/vendor/):
+# it is the sm70 / sm75 path, where Triton and Inductor are weak. Triton stays the
+# default on sm86+; installing this only adds the second backend to the registry.
+kernels-tilelang = ["tilelang>=0.1.15"]

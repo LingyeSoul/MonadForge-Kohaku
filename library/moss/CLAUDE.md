@@ -29,7 +29,7 @@ LoHa). `spectrum.py` re-implements Anima's forecaster rather than importing `net
 | `repa.py` | relational REPA on one block via `layer_hook`; parked (`repa_weight` 0 = off) |
 | `tune.py` | `run_tune(req)`: recommends `--blocks_to_swap` / `--activation_memory_budget` |
 | `scan.py` | **torch-free** cache layout + GUI counts; its stale check (`source_sha256` vs `.txt`) can disagree with `cache.py`'s (`_te_current`) |
-| `ops.py` | the façade over `vendor/`: `fuse(model)` flips the blocks to the fused kernels (`rms_norm_mod`, `qk_norm_rope`, `situ_glu`, `gated_residual`) and the text-encoder ops are exposed for callers that build `cu_seqlens` themselves. `MONADFORGE_MOSS_KERNELS=0` keeps the reference branch |
+| `ops.py` | the façade over `vendor/`: `fuse(model)` flips the blocks to the fused kernels (`rms_norm_mod`, `qk_norm_rope`, `situ_glu`, `gated_residual`) and the text-encoder ops are exposed for callers that build `cu_seqlens` themselves. `MONADFORGE_MOSS_KERNELS=0` keeps the reference branch; the TileLang backend comes from the `kernels-tilelang` dependency group |
 | `text_kernels.py` | the Qwen3.5 text encode on the vendored varlen ops (`causal_conv_varlen`, `gated_delta_rule_varlen`, `rms_norm_gated`, `attention_varlen_causal`); `loader.encode_prompt` uses it when `usable` and `MONADFORGE_MOSS_TEXT_KERNELS` allows, else HF's forward |
 | `quant.py` | int8 / e4m3 per-row DiT base for inference (`QuantLinear`, `quantize_transformer`), read by `quant_linear`; `load_transformer(quant=...)`, `moss-generate --quant` |
 | `optim/` | `AdamW16` (16-bit parameter and moments, fp32 math) and `MuonHybrid` (Muon + AdamW), extracted from KohakuMossTrainer; `moss-train --optimizer` |
