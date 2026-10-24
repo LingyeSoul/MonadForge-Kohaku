@@ -63,6 +63,16 @@ defineSlots<{
 .config-toolbar__actions :deep(.v-btn) {
   flex-shrink: 0;
 }
+.config-toolbar__variant :deep(.v-btn--icon),
+.config-toolbar__preset :deep(.v-btn--icon) {
+  width: 32px;
+  height: 32px;
+}
+.config-toolbar__variant :deep(.v-btn--icon.v-btn--density-compact),
+.config-toolbar__preset :deep(.v-btn--icon.v-btn--density-compact) {
+  width: 32px;
+  height: 32px;
+}
 .config-toolbar__actions {
   flex-wrap: wrap;
   justify-content: flex-start;

@@ -80,8 +80,9 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border-default); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }
+* { scrollbar-width: thin; scrollbar-color: var(--border-default) transparent; }
 
-:focus-visible { outline: 2px solid rgb(var(--v-theme-primary)); outline-offset: 3px; }
+:focus-visible { outline: 2px solid var(--forge-ember); outline-offset: 3px; }
 .v-field input:focus-visible, .v-field textarea:focus-visible { outline: none; }
 .v-btn { text-transform: none !important; font-weight: 500; }
 .v-btn:not(.v-btn--icon) { min-height: 34px; }
@@ -249,6 +250,22 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 }
 .workspace-local { display: flex; align-items: center; gap: 7px; margin-left: 7px; font-size: var(--fs-micro); color: var(--text-muted); }
 .workspace-topbar { background: var(--bg-base) !important; border-bottom: 1px solid var(--border-subtle) !important; }
+.workspace-skip-link {
+  position: fixed;
+  top: 8px;
+  left: 12px;
+  z-index: 3000;
+  padding: 10px 14px;
+  border: 1px solid var(--forge-ember);
+  border-radius: var(--radius-sm);
+  background: var(--bg-overlay);
+  color: var(--text-primary);
+  font-size: var(--fs-small);
+  text-decoration: none;
+  transform: translateY(calc(-100% - 16px));
+  transition: transform var(--dur-fast) ease;
+}
+.workspace-skip-link:focus { transform: translateY(0); }
 .workspace-breadcrumb { display: flex; align-items: center; gap: 14px; font-size: var(--fs-small); font-weight: 500; min-width: 0; }
 .workspace-breadcrumb__group { color: var(--text-muted); font-weight: 400; }
 .workspace-engine {
@@ -271,8 +288,12 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 .workspace-heading p { margin: 6px 0 0; color: var(--text-secondary); font-size: var(--fs-small); }
 .workspace-section-title { margin: 0; font-size: var(--fs-md); font-weight: 600; line-height: 1.5; }
 .workspace-empty { display: grid; align-content: center; justify-items: center; gap: 16px; padding: 48px 20px; text-align: center; }
-.workspace-empty h2 { margin: 0; font-size: var(--fs-lg); font-weight: 500; color: var(--text-secondary); }
+.workspace-empty h2 { margin: 0; font-size: var(--fs-lg); font-weight: 500; color: var(--text-primary); }
+.workspace-empty p { max-width: 480px; margin: -4px 0 0; color: var(--text-secondary); font-size: var(--fs-small); line-height: 1.6; text-wrap: balance; }
 .workspace-empty__mark { width: 72px; height: 72px; display: grid; place-items: center; border: 1px solid var(--border-default); border-radius: 8px; color: var(--text-muted); }
+.workspace-loading { min-height: 280px; flex: 1; }
+.workspace-loading .v-progress-circular { color: var(--forge-ember); }
+.workspace-empty--error .workspace-empty__mark { color: var(--error); border-color: var(--error); }
 .metric-card { padding: 16px; min-width: 0; }
 
 .anim-pulse-glow { animation: shimmer 2s ease-in-out infinite; }
@@ -288,9 +309,26 @@ body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; 
 }
 @media (max-width: 599px) {
   .workspace-breadcrumb__group, .workspace-engine { display: none; }
+  .workspace-heading { gap: 12px; margin-bottom: 16px; }
+  .workspace-heading > .v-spacer { display: none; }
+  .workspace-heading__copy { flex: 1 1 100%; }
+  .workspace-heading h1 { overflow-wrap: anywhere; }
+  .workspace-empty { padding: 32px 16px; }
+  .workspace-empty__mark { width: 64px; height: 64px; }
   .v-dialog .v-card-actions { flex-wrap: wrap; }
   .v-dialog .v-card-title { font-size: var(--fs-lg); }
   .v-application .text-h5 { font-size: 22px !important; }
+}
+@media (pointer: coarse) {
+  .workspace-topbar .v-btn--icon,
+  .workspace-nav__footer .v-btn--icon,
+  .config-toolbar .v-btn,
+  .task-filter .v-btn,
+  .task-card-actions .v-btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .workspace-nav .v-list-item { min-height: 44px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

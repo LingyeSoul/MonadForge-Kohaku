@@ -1,6 +1,8 @@
 <template>
   <v-app class="forge-app">
+    <a class="workspace-skip-link" href="#workspace-main">{{ t('workspaceSkipToContent') }}</a>
     <v-navigation-drawer
+      id="workspace-navigation"
       v-model="drawer"
       :rail="!mobile && rail"
       :permanent="!mobile"
@@ -101,6 +103,7 @@
     <v-app-bar flat height="60" class="workspace-topbar">
       <v-btn :icon="mobile ? 'mdi-menu' : 'mdi-dock-left'" variant="text" size="small" class="ml-3 mr-3"
         :aria-label="t(mobile || rail ? 'workspaceExpandNav' : 'workspaceCollapseNav')"
+        aria-controls="workspace-navigation"
         :aria-expanded="mobile ? drawer : !rail" @click="toggleDrawer">
         <v-icon :icon="mobile ? 'mdi-menu' : 'mdi-dock-left'" />
         <v-tooltip activator="parent" location="bottom">{{ t(mobile || rail ? 'workspaceExpandNav' : 'workspaceCollapseNav') }}</v-tooltip>
@@ -118,7 +121,7 @@
       </v-btn>
     </v-app-bar>
 
-    <v-main id="workspace-main">
+    <v-main id="workspace-main" tabindex="-1">
       <router-view v-slot="{ Component }">
         <Transition :css="false" @enter="enterPage" @enter-cancelled="cancelMotion">
           <component :is="Component" />
@@ -280,6 +283,9 @@ const navGroups = [
 ]
 const currentGroup = computed(() => navGroups.find(group => group.items.some(item => item.to === route.path))?.label ?? 'navSystem')
 const currentPage = computed(() => navGroups.flatMap(group => group.items).find(item => item.to === route.path)?.titleKey ?? 'navSystem')
+watchEffect(() => {
+  document.title = `${t(currentPage.value)} · ${t('appName')}`
+})
 const pageModelLabel = computed(() => {
   if (['/config', '/preprocess'].includes(route.path)) return modelLabel(modelWorkspace.family)
   if (['/adapter', '/distill', '/merge', '/staged-resolution', '/models'].includes(route.path)) return 'Anima'

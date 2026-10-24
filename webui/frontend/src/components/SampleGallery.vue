@@ -205,8 +205,14 @@ function labelFor(s: SampleInfo): string {
   pointer-events: none;
 }
 
-.sample-card:hover .sample-overlay {
+.sample-card:hover .sample-overlay,
+.sample-card:focus-visible .sample-overlay {
   opacity: 1;
+}
+
+@media (hover: none), (pointer: coarse) {
+  .sample-overlay { opacity: 1; }
+  .sample-card:hover { transform: none; }
 }
 
 .sample-overlay-text {

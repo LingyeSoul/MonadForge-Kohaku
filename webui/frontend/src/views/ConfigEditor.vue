@@ -298,24 +298,29 @@
           </v-expansion-panel>
         </v-expansion-panels>
         <div v-if="fieldSearch && !filteredBasic.length && !Object.keys(filteredAdvanced).length" class="workspace-empty" role="status">
-          <v-icon icon="mdi-magnify" size="32" />
+          <div class="workspace-empty__mark"><v-icon icon="mdi-text-search" size="32" /></div>
           <h2>{{ t('cfgNoMatchingFields') }}</h2>
-          <v-btn variant="outlined" @click="fieldSearch = ''">{{ t('cfgClearSearch') }}</v-btn>
+          <p>{{ t('cfgNoMatchingFieldsHint') }}</p>
+          <v-btn variant="outlined" prepend-icon="mdi-close" @click="fieldSearch = ''">{{ t('cfgClearSearch') }}</v-btn>
         </div>
 
         <!-- Extra Args section -->
         <v-card v-if="selectedVariant" class="mt-4 config-section" variant="flat">
-          <v-card-title
-            class="text-subtitle-1 d-flex align-center cursor-pointer"
+          <button
+            type="button"
+            class="config-extra-args-trigger"
+            data-testid="extra-args-toggle"
+            :aria-expanded="showExtraArgs"
+            aria-controls="extra-args-panel"
             @click="showExtraArgs = !showExtraArgs"
           >
-            <v-icon icon="mdi-code-braces" class="mr-2" size="small" />
-            {{ t('cfgExtraArgs') }}
+            <v-icon icon="mdi-code-braces" size="small" />
+            <span>{{ t('cfgExtraArgs') }}</span>
             <v-spacer />
             <v-icon :icon="showExtraArgs ? 'mdi-chevron-up' : 'mdi-chevron-down'" />
-          </v-card-title>
+          </button>
           <v-expand-transition>
-            <v-card-text v-show="showExtraArgs">
+            <v-card-text v-show="showExtraArgs" id="extra-args-panel">
               <v-textarea
                 v-model="extraArgs"
                 :disabled="continuation.active || configStore.loading"
@@ -1478,6 +1483,19 @@ function waitForTask(taskId: string): Promise<void> {
 }
 .config-section > :deep(.v-card-title) { padding: 0 0 22px; }
 .config-section > :deep(.v-card-text) { padding: 0 0 20px; }
+.config-extra-args-trigger {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 48px;
+  gap: 8px;
+  padding: 0;
+  color: var(--text-primary);
+  font-size: var(--fs-md);
+  font-weight: 600;
+  text-align: start;
+  cursor: pointer;
+}
 @media (max-width: 599px) {
   .config-tracking :deep(.v-expansion-panel-title) { padding-inline: 12px; flex-wrap: wrap; gap: 4px; }
 }

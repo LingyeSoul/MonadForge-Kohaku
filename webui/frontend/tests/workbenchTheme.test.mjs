@@ -40,6 +40,10 @@ for (const name of ['dark', 'light']) {
       ['on-primary', 'primary'],
       ['on-secondary', 'secondary'],
       ['primary', 'background'],
+      ['error', 'surface'],
+      ['info', 'surface'],
+      ['success', 'surface'],
+      ['warning', 'surface'],
     ]) {
       const ratio = contrast(colors[foreground], colors[background])
       assert.ok(ratio >= 4.5, `${name} ${foreground}/${background}: ${ratio.toFixed(2)}`)
@@ -54,7 +58,12 @@ test('workbench labels are translated in all four languages', () => {
     'workspaceCollapseNav', 'cfgWorkspaceTitle', 'cfgWorkspaceMeta', 'cfgMethodLibrary',
     'cfgVariantLibrary', 'cfgSearchFields', 'cfgNoMatchingFields', 'cfgClearSearch',
     'cfgPendingChanges', 'cfgParametersCount', 'cfgOpenGuide', 'dashOpenConfig',
-    'dsGridView', 'dsListView', 'dsTreeView',
+    'workspaceSkipToContent', 'cfgNoMatchingFieldsHint', 'dashLoadingTasks',
+    'dashNoTaskDescription', 'taskLoadFailedTitle', 'taskLoading', 'taskFilterLabel',
+    'taskNoHistoryDescription', 'taskNoMatchesDescription', 'taskLogLive',
+    'taskLogComplete', 'taskLogFollow', 'taskState_pending', 'taskState_running',
+    'taskState_paused', 'taskState_stopping', 'taskState_success', 'taskState_failed',
+    'taskState_cancelled', 'dsGridView', 'dsListView', 'dsTreeView',
   ]
   for (const [name, messages] of Object.entries({ en, cn, ja, ko })) {
     for (const key of keys) {

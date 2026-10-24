@@ -29,7 +29,8 @@
         </v-btn>
       </div>
     </WorkspaceHeading>
-    <v-btn-toggle v-model="taskFilter" density="compact" mandatory divided class="task-filter mb-3 align-self-start flex-shrink-0">
+    <v-btn-toggle v-model="taskFilter" density="compact" mandatory divided
+      :aria-label="t('taskFilterLabel')" class="task-filter mb-3 align-self-start flex-shrink-0">
       <v-btn value="all" size="small">{{ t('taskFilterAll') }}</v-btn>
       <v-btn value="active" size="small">{{ t('taskFilterActive') }}</v-btn>
       <v-btn value="success" size="small">{{ t('taskFilterSuccess') }}</v-btn>
@@ -37,62 +38,62 @@
       <v-btn value="cancelled" size="small">{{ t('taskFilterCancelled') }}</v-btn>
     </v-btn-toggle>
 
-    <v-alert
-      v-if="historyError"
-      type="error"
-      variant="tonal"
-      density="compact"
-      class="mb-3"
-      style="flex: 0 0 auto;"
-    >
-      {{ t('taskLoadFailed') }}
-      <template #append><v-btn variant="text" size="small" @click="refreshView">{{ t('ppRefresh') }}</v-btn></template>
-    </v-alert>
+    <section v-if="historyError" class="workspace-empty workspace-empty--error flex-grow-1" role="alert">
+      <div class="workspace-empty__mark"><v-icon icon="mdi-cloud-alert-outline" size="32" /></div>
+      <h2>{{ t('taskLoadFailedTitle') }}</h2>
+      <p>{{ t('taskLoadFailed') }}</p>
+      <v-btn variant="outlined" prepend-icon="mdi-refresh" @click="refreshView">{{ t('ppRefresh') }}</v-btn>
+    </section>
 
-    <div v-if="!historyError && historyLoading && historyTasks.length === 0" class="flex-grow-1 d-flex align-center justify-center">
-      <v-progress-linear indeterminate color="primary" height="2" style="max-width: 320px;" />
-    </div>
+    <section v-else-if="historyLoading && historyTasks.length === 0" class="workspace-empty workspace-loading" role="status" aria-live="polite">
+      <v-progress-circular indeterminate size="28" width="2" />
+      <h2>{{ t('taskLoading') }}</h2>
+    </section>
 
-    <div v-else-if="!historyError && visibleTasks.length === 0" class="workspace-empty flex-grow-1">
-      <div class="workspace-empty__mark"><v-icon icon="mdi-format-list-checks" size="32" /></div>
+    <div v-else-if="visibleTasks.length === 0" class="workspace-empty flex-grow-1">
+      <div class="workspace-empty__mark"><v-icon :icon="taskFilter === 'all' ? 'mdi-format-list-checks' : 'mdi-filter-off-outline'" size="32" /></div>
       <h2>{{ taskFilter === 'all' ? t('taskNoHistory') : t('taskNoMatches') }}</h2>
-      <div v-if="taskFilter !== 'all'">
-        <v-btn variant="outlined" @click="taskFilter = 'all'">{{ t('taskFilterAll') }}</v-btn>
-      </div>
+      <p>{{ t(taskFilter === 'all' ? 'taskNoHistoryDescription' : 'taskNoMatchesDescription') }}</p>
+      <v-btn v-if="taskFilter !== 'all'" variant="outlined" prepend-icon="mdi-filter-off-outline" @click="taskFilter = 'all'">
+        {{ t('taskFilterAll') }}
+      </v-btn>
     </div>
 
     <div
       v-else
       class="d-flex flex-column flex-grow-1"
+      :aria-busy="historyLoading"
       :style="selectedTask ? 'min-height: 0; overflow: hidden;' : 'min-height: 0; overflow-y: auto;'"
     >
+      <v-progress-linear v-if="historyLoading" indeterminate color="primary"
+        height="2" class="task-refresh-progress" :aria-label="t('taskLoading')" />
       <template v-for="task in displayedTasks" :key="task.task_id">
         <!-- Compact card for non-selected tasks -->
         <v-card
           v-if="selectedTask !== task.task_id"
-          class="mb-2 flex-shrink-0"
+          class="task-card mb-2 flex-shrink-0"
           :class="{ 'task-complete': task.state === 'success', 'task-failed': task.state === 'failed', 'task-running': task.state === 'running' || task.state === 'stopping' }"
           variant="tonal"
           :color="stateColor(task.state)"
         >
-          <v-card-title class="text-body-2 d-flex align-center">
-            <v-icon :icon="stateIcon(task.state)" size="small" class="mr-2" />
-            <span class="text-truncate">{{ task.command }}</span>
-            <v-chip v-if="task.command.startsWith('moss-') || task.command.startsWith('qwen21-') || task.category === 'training'" size="x-small" variant="tonal" class="ml-2">{{ task.command.startsWith('moss-') ? 'MOSS' : task.command.startsWith('qwen21-') ? 'Qwen-Image 2.1' : 'Anima' }}</v-chip>
-            <v-spacer />
-            <v-chip
-              v-if="task.state === 'pending' && task.queue_position != null"
-              size="x-small"
-              variant="tonal"
-              color="info"
-              class="ml-1"
-            >
-              #{{ task.queue_position }}
-            </v-chip>
-            <v-chip size="x-small" variant="outlined" class="ml-2">{{ task.state }}</v-chip>
-            <v-chip v-if="task.legacy" size="x-small" color="warning" variant="tonal" class="ml-1">
-              {{ t('taskLegacy') }}
-            </v-chip>
+          <v-card-title class="task-card-heading text-body-2 d-flex align-center">
+            <v-icon :icon="stateIcon(task.state)" size="small" class="task-card-state-icon mr-2" />
+            <span class="task-card-command text-truncate">{{ task.command }}</span>
+            <div class="task-card-badges">
+              <v-chip v-if="task.command.startsWith('moss-') || task.command.startsWith('qwen21-') || task.category === 'training'" size="x-small" variant="tonal">{{ task.command.startsWith('moss-') ? 'MOSS' : task.command.startsWith('qwen21-') ? 'Qwen-Image 2.1' : 'Anima' }}</v-chip>
+              <v-chip
+                v-if="task.state === 'pending' && task.queue_position != null"
+                size="x-small"
+                variant="tonal"
+                color="info"
+              >
+                #{{ task.queue_position }}
+              </v-chip>
+              <v-chip size="x-small" variant="outlined">{{ stateLabel(task.state) }}</v-chip>
+              <v-chip v-if="task.legacy" size="x-small" color="warning" variant="tonal">
+                {{ t('taskLegacy') }}
+              </v-chip>
+            </div>
           </v-card-title>
           <v-card-subtitle class="task-card-subtitle text-caption">
             {{ task.task_id }} &middot; PID {{ task.pid ?? '—' }}
@@ -159,30 +160,30 @@
         <!-- Expanded card with full-height log stream -->
         <v-card
           v-else
-          class="mb-2 d-flex flex-column"
+          class="task-card mb-2 d-flex flex-column"
           :class="{ 'task-complete': task.state === 'success', 'task-failed': task.state === 'failed', 'task-running': task.state === 'running' || task.state === 'stopping' }"
           variant="tonal"
           :color="stateColor(task.state)"
           style="flex: 1 1 0; min-height: 0;"
         >
-          <v-card-title class="text-body-2 d-flex align-center flex-shrink-0 py-2">
-            <v-icon :icon="stateIcon(task.state)" size="small" class="mr-2" />
-            <span class="text-truncate">{{ task.command }}</span>
-            <v-chip v-if="task.command.startsWith('moss-') || task.command.startsWith('qwen21-') || task.category === 'training'" size="x-small" variant="tonal" class="ml-2">{{ task.command.startsWith('moss-') ? 'MOSS' : task.command.startsWith('qwen21-') ? 'Qwen-Image 2.1' : 'Anima' }}</v-chip>
-            <v-spacer />
-            <v-chip
-              v-if="task.state === 'pending' && task.queue_position != null"
-              size="x-small"
-              variant="tonal"
-              color="info"
-              class="ml-1"
-            >
-              #{{ task.queue_position }}
-            </v-chip>
-            <v-chip size="x-small" variant="outlined" class="ml-2">{{ task.state }}</v-chip>
-            <v-chip v-if="task.legacy" size="x-small" color="warning" variant="tonal" class="ml-1">
-              {{ t('taskLegacy') }}
-            </v-chip>
+          <v-card-title class="task-card-heading text-body-2 d-flex align-center flex-shrink-0 py-2">
+            <v-icon :icon="stateIcon(task.state)" size="small" class="task-card-state-icon mr-2" />
+            <span class="task-card-command text-truncate">{{ task.command }}</span>
+            <div class="task-card-badges">
+              <v-chip v-if="task.command.startsWith('moss-') || task.command.startsWith('qwen21-') || task.category === 'training'" size="x-small" variant="tonal">{{ task.command.startsWith('moss-') ? 'MOSS' : task.command.startsWith('qwen21-') ? 'Qwen-Image 2.1' : 'Anima' }}</v-chip>
+              <v-chip
+                v-if="task.state === 'pending' && task.queue_position != null"
+                size="x-small"
+                variant="tonal"
+                color="info"
+              >
+                #{{ task.queue_position }}
+              </v-chip>
+              <v-chip size="x-small" variant="outlined">{{ stateLabel(task.state) }}</v-chip>
+              <v-chip v-if="task.legacy" size="x-small" color="warning" variant="tonal">
+                {{ t('taskLegacy') }}
+              </v-chip>
+            </div>
           </v-card-title>
           <v-card-subtitle class="task-card-subtitle text-caption flex-shrink-0">
             {{ task.task_id }} &middot; PID {{ task.pid ?? '—' }}
@@ -323,6 +324,7 @@ const { t } = useI18n()
 const selectedTask = ref(typeof route.query.task === 'string' ? route.query.task : '')
 watch(() => route.query.task, value => { selectedTask.value = typeof value === 'string' ? value : '' })
 const taskFilter = ref<TaskFilter>('all')
+const stateLabel = (state: TaskInfo['state']) => t(`taskState_${state}`)
 const historyTasks = ref<TaskInfo[]>([])
 const historyTotal = ref(0)
 const historyPage = ref(1)
@@ -458,6 +460,53 @@ function onTaskDone() {
 .task-toolbar { flex-shrink: 0; }
 .task-detail-content { overflow-y: auto; }
 .task-detail-content :deep(.log-stream) { min-height: 160px !important; }
+.task-refresh-progress { flex: 0 0 2px; margin-bottom: 6px; }
+.task-card { container: task-card / inline-size; }
+.task-card-heading { gap: 0; }
+.task-card-state-icon { flex: 0 0 auto; }
+.task-card-command { flex: 1 1 auto; min-width: 0; }
+.task-card-badges {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px 6px;
+  min-width: 0;
+  margin-left: auto;
+  padding-left: 12px;
+}
+.task-card-badges :deep(.v-chip) { flex: 0 0 auto; margin-inline-start: 0 !important; }
+.task-card-subtitle { color: var(--text-secondary); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.task-card-actions { min-height: 44px; }
+.task-filter {
+  padding: 2px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md) !important;
+  background: var(--bg-surface);
+}
+.task-filter :deep(.v-btn) {
+  min-width: 64px;
+  border-radius: var(--radius-sm) !important;
+  color: var(--text-secondary);
+}
+.task-filter :deep(.v-btn--active) { color: rgb(var(--v-theme-on-primary)); }
+@container task-card (max-width: 520px) {
+  .task-card-heading {
+    display: grid !important;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
+    row-gap: 8px;
+  }
+  .task-card-state-icon { margin-inline-end: 8px !important; }
+  .task-card-command { min-width: 0; }
+  .task-card-badges {
+    grid-column: 1 / -1;
+    justify-content: flex-start;
+    margin-left: 0;
+    padding-left: 26px;
+  }
+}
 /* Task status left-border accents */
 .task-complete {
   border-left: 3px solid var(--success) !important;
@@ -474,26 +523,21 @@ function onTaskDone() {
   transition: border-color var(--dur-slow) ease, box-shadow var(--dur-slow) ease;
 }
 
-/* Empty state ember icon */
-.ember-icon {
-  color: var(--forge-ember);
-  animation: ember-glow 2.5s ease-in-out infinite;
-}
-
-@keyframes ember-glow {
-  0%, 100% { opacity: 0.6; }
-  50%      { opacity: 1; }
-}
-
 @media (max-width: 600px) {
   .task-monitor {
-    padding: 8px !important;
+    padding: 16px 12px !important;
   }
 
   .task-toolbar {
     align-items: stretch !important;
     flex-direction: column;
-    gap: 4px;
+    flex-wrap: nowrap;
+    gap: 8px;
+  }
+
+  .task-toolbar-actions :deep(.v-btn--disabled) {
+    color: var(--text-muted) !important;
+    opacity: 0.7;
   }
 
   .task-toolbar > .v-spacer {

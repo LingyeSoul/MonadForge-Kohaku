@@ -1,7 +1,8 @@
 <template>
   <v-container fluid class="pa-4 d-flex flex-column" style="flex: 1 1 0; min-height: 0; overflow: hidden;">
     <!-- Header -->
-    <WorkspaceHeading class="dashboard-heading" :title="t('dashTitle')" :subtitle="`${selectedTaskModel} / ${t('dashMetrics')}`">
+    <WorkspaceHeading class="dashboard-heading" :title="t('dashTitle')"
+      :subtitle="trainingTasks.length > 0 ? `${selectedTaskModel} / ${t('dashMetrics')}` : t('dashSubtitle')">
       <v-spacer />
       <v-btn
         v-if="wandbRunUrl"
@@ -29,8 +30,13 @@
       />
     </WorkspaceHeading>
 
+    <section v-if="initialLoading" class="workspace-empty workspace-loading" role="status" aria-live="polite">
+      <v-progress-circular indeterminate size="28" width="2" />
+      <h2>{{ t('dashLoadingTasks') }}</h2>
+    </section>
+
     <!-- No training task state -->
-    <div v-if="trainingTasks.length === 0" class="dashboard-idle">
+    <div v-else-if="trainingTasks.length === 0" class="dashboard-idle">
       <section v-if="sysCards.length" class="system-overview">
         <h2 class="workspace-section-title">{{ t('dashSysMon') }}</h2>
         <div class="system-grid">
@@ -42,11 +48,13 @@
           </div>
         </div>
       </section>
-      <section class="workspace-empty dashboard-empty">
+      <section class="workspace-empty dashboard-empty" :class="{ 'workspace-empty--error': taskStore.taskListError }"
+        :role="taskStore.taskListError ? 'alert' : undefined">
         <div class="workspace-empty__mark">
           <v-icon :icon="taskStore.taskListError ? 'mdi-cloud-alert-outline' : 'mdi-chart-timeline-variant'" size="32" />
         </div>
-        <h2>{{ t(taskStore.taskListError ? 'taskLoadFailed' : 'dashNoTask') }}</h2>
+        <h2>{{ t(taskStore.taskListError ? 'taskLoadFailedTitle' : 'dashNoTask') }}</h2>
+        <p>{{ t(taskStore.taskListError ? 'taskLoadFailed' : 'dashNoTaskDescription') }}</p>
         <v-btn v-if="taskStore.taskListError" variant="outlined" prepend-icon="mdi-refresh" @click="taskStore.fetchTasks()">
           {{ t('ppRefresh') }}
         </v-btn>
@@ -68,6 +76,7 @@
                 :size="112"
                 :width="6"
                 color="primary"
+                :aria-label="t('dashProgress')"
               >
                 <div class="text-center">
                   <div class="progress-value">{{ progressPercent.toFixed(0) }}%</div>
@@ -271,6 +280,7 @@ async function fetchHwStats() {
 }
 
 const selectedTaskId = ref('')
+const initialLoading = ref(true)
 const selectedTaskModel = computed(() => {
   const task = taskStore.tasks.find(item => item.task_id === selectedTaskId.value)
   return task ? task.command.startsWith('moss-') ? 'MOSS' : task.command.startsWith('qwen21-') ? 'Qwen-Image 2.1' : 'Anima' : '—'
@@ -282,9 +292,9 @@ const trainingTasks = computed(() =>
 )
 
 const trainingTaskItems = computed(() =>
-  trainingTasks.value.map((t) => ({
-    task_id: t.task_id,
-    label: `${t.command} · ${t.task_id} · ${t.state}`,
+  trainingTasks.value.map((task) => ({
+    task_id: task.task_id,
+    label: `${task.command} · ${task.task_id} · ${t(`taskState_${task.state}`)}`,
   }))
 )
 
@@ -354,6 +364,7 @@ const sysCards = computed(() => {
 // Auto-select the first running training task
 onMounted(async () => {
   await taskStore.fetchTasks()
+  initialLoading.value = false
   autoSelect()
 })
 
