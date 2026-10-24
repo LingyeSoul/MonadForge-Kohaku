@@ -402,22 +402,22 @@ def vision_embeds(
     return out
 
 
-def ref_latents(model_dir, jobs: list[dict], device) -> dict[str, torch.Tensor]:
+def ref_latents(model_dir, jobs: list[dict], device, vae="") -> dict[str, torch.Tensor]:
     """Per job key, its reference fitted to the job's size and then to
     ``ref_size`` (as ``cache.cache_refs`` builds ``*.moss_ref``), ``(1,128,h,w)``
     fp32 on the CPU."""
     from library.moss.cache import fit, load_rgb, ref_size, to_pixels
     from library.moss.model import encode
 
-    vae = load_vae(model_dir, device=device)
+    encoder = load_vae(model_dir, device=device, vae=vae)
     out = {}
     for j in jobs:
         w, h = j["width"], j["height"]
         rw, rh = ref_size(w, h, j["ref_scale"])
         image = fit(fit(load_rgb(Path(j["ref"])), w, h), rw, rh)
-        out[j["key"]] = encode(to_pixels(image), vae).float().cpu()
+        out[j["key"]] = encode(to_pixels(image), encoder).float().cpu()
         print(f"[ref] {j['key']}: {w}x{h} -> {rw}x{rh}", flush=True)
-    del vae
+    del encoder
     empty_cache()
     return out
 
@@ -585,7 +585,7 @@ def _denoise_pending(req, model_dir, out_dir, pending, device) -> None:
     seen = [j for j in jobs if j.get("ref_vision")]
     seen = vision_embeds(model_dir, seen, out_dir / "_te_cache", req.text_encoder)
     refs = [j for j in jobs if j.get("ref")]
-    refs = ref_latents(model_dir, refs, device) if refs else {}
+    refs = ref_latents(model_dir, refs, device, req.vae) if refs else {}
 
     t0 = time.time()
     precision, fix, fix_c = _resolve_lane(req, device)
@@ -695,7 +695,9 @@ def _vae_dtype(name: str) -> torch.dtype:
     }[name]
 
 
-def _decode_all(model_dir, out_dir, records, device, vae_dtype, vae_compile) -> None:
+def _decode_all(
+    model_dir, out_dir, records, device, vae_dtype, vae_compile, vae=""
+) -> None:
     """Decode each record's latent from disk; an existing PNG is kept."""
     todo = [r for r in records if not _image_path(out_dir, r).is_file()]
     for r in records:
@@ -704,20 +706,24 @@ def _decode_all(model_dir, out_dir, records, device, vae_dtype, vae_compile) -> 
         return
     from diffusers.image_processor import VaeImageProcessor
 
-    vae = load_vae(
-        model_dir, dtype=_vae_dtype(vae_dtype), device=device, compile=vae_compile
+    decoder = load_vae(
+        model_dir,
+        dtype=_vae_dtype(vae_dtype),
+        device=device,
+        compile=vae_compile,
+        vae=vae,
     )
     processor = VaeImageProcessor(vae_scale_factor=16)
     for rec in todo:
         torch.cuda.reset_peak_memory_stats()
-        image = decode(load_latent(_latent_path(out_dir, rec)).to(device), vae)
+        image = decode(load_latent(_latent_path(out_dir, rec)).to(device), decoder)
         processor.postprocess(image, output_type="pil")[0].save(rec["image"])
         rec["decode_peak_gib"] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
         print(
             f"[vae] {rec['key']} -> {rec['image']} (peak {rec['decode_peak_gib']} GiB)",
             flush=True,
         )
-    del vae
+    del decoder
     empty_cache()
 
 
@@ -771,7 +777,9 @@ def run_generate(req: GenerateRequest) -> Path:
         if pending:
             _denoise_pending(req, model_dir, out_dir, pending, device)
 
-    _decode_all(model_dir, out_dir, records, device, req.vae_dtype, req.vae_compile)
+    _decode_all(
+        model_dir, out_dir, records, device, req.vae_dtype, req.vae_compile, req.vae
+    )
     manifest = _write_manifest(out_dir, req, records)
     print(f"manifest -> {manifest}", flush=True)
     return out_dir

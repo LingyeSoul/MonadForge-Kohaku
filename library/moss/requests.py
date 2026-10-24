@@ -80,6 +80,12 @@ _DIT_HELP = (
     "fp16-fix fold in the metadata is undone on load). The text encoder / VAE still "
     "come from --model_dir; quantized single files are refused"
 )
+_VAE_HELP = (
+    "VAE from a single .safetensors file instead of --model_dir's "
+    "MOSS-Image-Base/vae/ folder (ComfyUI flux2-vae: BFL/ldm or diffusers keys; the "
+    "config is inferred from the shapes). The DiT / text encoder still come from "
+    "model / --model_dir"
+)
 
 
 @dataclass
@@ -130,6 +136,7 @@ class CacheRequest(Request):
     vae_dtype: str = _f(
         "fp32", "VAE encode dtype", choices=("fp32", "bf16"), advanced=True
     )
+    vae: str = _f("", _VAE_HELP)
     max_text_tokens: int = _f(
         4096, "TE truncation length (the model's own limit)", advanced=True
     )
@@ -202,6 +209,7 @@ class ColorizeCacheRequest(Request):
     te_file: str = _f(
         "", "quantized TE file instead of the catalog's (fp8 / int8 only)", advanced=True
     )
+    vae: str = _f("", _VAE_HELP)
     model_dir: str = _f("", _MODEL_DIR_HELP, advanced=True)
 
 
@@ -332,6 +340,7 @@ class GenerateRequest(Request):
         "C++ toolchain on Windows",
         advanced=True,
     )
+    vae: str = _f("", _VAE_HELP)
     shift: float = _f(
         DEFAULT_SHIFT, "scheduler shift (pipeline default)", advanced=True
     )

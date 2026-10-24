@@ -370,13 +370,21 @@ def compile_blocks(blocks) -> None:
         block.forward = torch.compile(block.forward, dynamic=True)
 
 
-def load_vae(model_dir, dtype=torch.float32, device=None, compile=False):
-    from diffusers import AutoencoderKLFlux2
+def load_vae(model_dir, dtype=torch.float32, device=None, compile=False, vae=""):
+    """The FLUX.2 VAE in `dtype`: `vae=` reads one ComfyUI / diffusers
+    `.safetensors` (either key layout, config inferred; `library.moss.checkpoint`),
+    otherwise `<base>/vae/`."""
+    if vae:
+        from library.moss.checkpoint import load_vae_file
 
-    vae = AutoencoderKLFlux2.from_pretrained(
-        variant_dir(model_dir, "base") / "vae", torch_dtype=dtype
-    ).eval()
+        model = load_vae_file(resolve_under_home(vae), dtype)
+    else:
+        from diffusers import AutoencoderKLFlux2
+
+        model = AutoencoderKLFlux2.from_pretrained(
+            variant_dir(model_dir, "base") / "vae", torch_dtype=dtype
+        ).eval()
     if compile:
-        vae.to(memory_format=torch.channels_last)
-        vae.decode = torch.compile(vae.decode, dynamic=True)
-    return vae.to(device) if device is not None else vae
+        model.to(memory_format=torch.channels_last)
+        model.decode = torch.compile(model.decode, dynamic=True)
+    return model.to(device) if device is not None else model

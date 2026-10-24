@@ -435,3 +435,246 @@ def assign(model: nn.Module, name: str, value: Tensor) -> None:
         module._parameters[attribute] = nn.Parameter(value, requires_grad=False)
     else:
         module._buffers[attribute] = value
+
+
+# --------------------------------------------------------------------- VAE
+
+# ComfyUI / BFL single-file VAEs use the ldm key layout (`flux2-vae`); a
+# diffusers export keeps `down_blocks` / `up_blocks` names. Both are accepted:
+# the layout is detected from the key set, the BFL keys map onto
+# `AutoencoderKLFlux2`'s names, and the config is inferred from the shapes (the
+# architecture is fixed apart from widths, layers and attention).
+VAE_BFL_MARK = "encoder.down.0.block.0.conv1.weight"
+_VAE_RESNET_PARTS = {"nin_shortcut": "conv_shortcut"}
+_VAE_ATTN_PARTS = {
+    "norm": "group_norm",
+    "q": "to_q",
+    "k": "to_k",
+    "v": "to_v",
+    "proj_out": "to_out.0",
+}
+_VAE_SIDE_PARTS = {
+    "norm_out": "conv_norm_out",
+    "conv_in": "conv_in",
+    "conv_out": "conv_out",
+}
+_VAE_TOP_LEVEL = {
+    "encoder.quant_conv": "quant_conv",
+    "decoder.post_quant_conv": "post_quant_conv",
+}
+_VAE_STOCK = {
+    "act_fn": "silu",
+    "norm_num_groups": 32,
+    "sample_size": 1024,
+    "batch_norm_eps": 1e-4,
+    "batch_norm_momentum": 0.1,
+}
+_VAE_DOWN = re.compile(r"^encoder\.down\.(\d+)\.(block\.(\d+)|downsample)\.(.+)$")
+_VAE_UP = re.compile(r"^decoder\.up\.(\d+)\.(block\.(\d+)|upsample)\.(.+)$")
+_VAE_MID_BLOCK = re.compile(r"^(encoder|decoder)\.mid\.block_(\d+)\.(.+)$")
+_VAE_MID_ATTN = re.compile(
+    r"^(encoder|decoder)\.mid\.attn_1\.([a-z_]+)\.(weight|bias)$"
+)
+_VAE_SIDE = re.compile(r"^(encoder|decoder)\.([a-z_]+)\.(weight|bias)$")
+_VAE_TOP = re.compile(
+    r"^(encoder\.quant_conv|decoder\.post_quant_conv)\.(weight|bias)$"
+)
+
+
+def vae_is_bfl(keys) -> bool:
+    """Whether a key set is BFL / ldm layout (ComfyUI's `flux2-vae`)."""
+    return VAE_BFL_MARK in keys
+
+
+def _vae_up_blocks(keys) -> int:
+    """The decoder up-block count of a BFL key set."""
+    found = {int(m.group(1)) for key in keys if (m := _VAE_UP.match(key))}
+    return 1 + max(found) if found else 0
+
+
+def _vae_resnet(rest: str) -> str:
+    part, _, tail = rest.partition(".")
+    return f"{_VAE_RESNET_PARTS.get(part, part)}.{tail}"
+
+
+def vae_key(key: str, n_up: int) -> str:
+    """The diffusers key of BFL key `key` (`n_up` decoder up blocks)."""
+    if key.startswith("bn."):
+        return key
+    if m := _VAE_TOP.match(key):
+        return f"{_VAE_TOP_LEVEL[m.group(1)]}.{m.group(2)}"
+    if m := _VAE_DOWN.match(key):
+        index, rest = m.group(1), m.group(4)
+        if m.group(3) is None:
+            return f"encoder.down_blocks.{index}.downsamplers.0.{rest}"
+        return f"encoder.down_blocks.{index}.resnets.{m.group(3)}.{_vae_resnet(rest)}"
+    if m := _VAE_UP.match(key):
+        index, rest = n_up - 1 - int(m.group(1)), m.group(4)
+        if m.group(3) is None:
+            return f"decoder.up_blocks.{index}.upsamplers.0.{rest}"
+        return f"decoder.up_blocks.{index}.resnets.{m.group(3)}.{_vae_resnet(rest)}"
+    if m := _VAE_MID_BLOCK.match(key):
+        index = int(m.group(2)) - 1
+        return f"{m.group(1)}.mid_block.resnets.{index}.{_vae_resnet(m.group(3))}"
+    if (m := _VAE_MID_ATTN.match(key)) and m.group(2) in _VAE_ATTN_PARTS:
+        part = _VAE_ATTN_PARTS[m.group(2)]
+        return f"{m.group(1)}.mid_block.attentions.0.{part}.{m.group(3)}"
+    if (m := _VAE_SIDE.match(key)) and m.group(2) in _VAE_SIDE_PARTS:
+        return f"{m.group(1)}.{_VAE_SIDE_PARTS[m.group(2)]}.{m.group(3)}"
+    raise CheckpointFormatError(f"{key!r} is not a FLUX.2 VAE key of the BFL layout")
+
+
+def _vae_attn_weight(key: str) -> bool:
+    m = _VAE_MID_ATTN.match(key)
+    return m is not None and m.group(2) != "norm" and m.group(3) == "weight"
+
+
+def vae_to_diffusers(state: Mapping[str, Tensor]) -> dict[str, Tensor]:
+    """A BFL / ldm VAE state on `AutoencoderKLFlux2` keys (mid attention's 1x1 conv
+    weights viewed as `[C, C]`)."""
+    n_up = _vae_up_blocks(state)
+    out = {}
+    for key, tensor in state.items():
+        name = vae_key(key, n_up)
+        out[name] = (
+            tensor.reshape(tensor.shape[:2]) if _vae_attn_weight(key) else tensor
+        )
+    return out
+
+
+def _vae_diffusers_shapes(shapes: Mapping[str, tuple]) -> dict[str, tuple]:
+    """Key -> shape on `AutoencoderKLFlux2`'s keys, from either key style."""
+    if not vae_is_bfl(shapes):
+        return dict(shapes)
+    n_up = _vae_up_blocks(shapes)
+    return {
+        vae_key(key, n_up): (
+            tuple(shape[:2]) if _vae_attn_weight(key) else tuple(shape)
+        )
+        for key, shape in shapes.items()
+    }
+
+
+def _count_keys(shapes, pattern: str) -> int:
+    count = 0
+    while pattern.format(count) in shapes:
+        count += 1
+    return count
+
+
+def infer_vae_config(shapes: Mapping[str, tuple]) -> dict:
+    """`AutoencoderKLFlux2` kwargs of a state given as key -> shape (either layout).
+
+    Widths, layers per block, channels and conv / attention presence come from the
+    shapes; the rest is the stock config (silu, 32 groups, patch 2x2 when `bn` says
+    so). There is one FLUX.2 VAE family, so a shape the inference cannot explain is
+    an error, not a guess.
+    """
+    shapes = _vae_diffusers_shapes(shapes)
+    anchors = (
+        "encoder.conv_in.weight",
+        "decoder.conv_in.weight",
+        "decoder.conv_out.weight",
+        "bn.running_mean",
+    )
+    absent = [name for name in anchors if name not in shapes]
+    if absent:
+        raise CheckpointFormatError(
+            f"not a FLUX.2 VAE: missing {absent} (of {len(shapes)} keys)"
+        )
+    down = _count_keys(shapes, "encoder.down_blocks.{}.resnets.0.conv1.weight")
+    up = _count_keys(shapes, "decoder.up_blocks.{}.resnets.0.conv2.weight")
+    if down == 0 or up != down:
+        raise CheckpointFormatError(
+            f"a FLUX.2 VAE has as many up as down blocks, got {down} / {up}"
+        )
+    layers = _count_keys(shapes, "encoder.down_blocks.0.resnets.{}.conv1.weight")
+    decoded = _count_keys(shapes, "decoder.up_blocks.0.resnets.{}.conv1.weight")
+    if decoded != layers + 1:
+        raise CheckpointFormatError(
+            f"decoder blocks hold {decoded} resnets, expected {layers + 1}"
+        )
+    latent = shapes["decoder.conv_in.weight"][1]
+    patches = shapes["bn.running_mean"][0] // latent
+    patch = round(patches**0.5)
+    widths = [
+        shapes[f"encoder.down_blocks.{i}.resnets.0.conv1.weight"][0]
+        for i in range(down)
+    ]
+    decoded_widths = [
+        shapes[f"decoder.up_blocks.{up - 1 - i}.resnets.0.conv2.weight"][0]
+        for i in range(up)
+    ]
+    return {
+        **_VAE_STOCK,
+        "in_channels": shapes["encoder.conv_in.weight"][1],
+        "out_channels": shapes["decoder.conv_out.weight"][0],
+        "down_block_types": ("DownEncoderBlock2D",) * down,
+        "up_block_types": ("UpDecoderBlock2D",) * up,
+        "block_out_channels": tuple(widths),
+        "decoder_block_out_channels": tuple(decoded_widths),
+        "layers_per_block": layers,
+        "latent_channels": latent,
+        "use_quant_conv": "quant_conv.weight" in shapes,
+        "use_post_quant_conv": "post_quant_conv.weight" in shapes,
+        "mid_block_add_attention": "encoder.mid_block.attentions.0.to_q.weight"
+        in shapes,
+        "patch_size": (patch, patch),
+    }
+
+
+def read_state_all(path: str | Path) -> dict[str, Tensor]:
+    """Every tensor of one safetensors file on the host (a VAE is a few hundred MB)."""
+    with _open(Path(path)) as handle:
+        keys = handle.keys()
+        return {key: handle.get_tensor(key) for key in keys}
+
+
+def load_vae_file(path: str | Path, dtype=torch.float32) -> nn.Module:
+    """`AutoencoderKLFlux2` from one safetensors file of either layout, in `dtype`.
+
+    The config is inferred from the shapes; the state is then loaded strictly, so a
+    wrong file fails with its missing / unexpected keys instead of silently
+    half-loading. Built on the meta device, then one fp32 load of the state.
+    """
+    from diffusers import AutoencoderKLFlux2
+
+    path = Path(path)
+    state = read_state_all(path)
+    if vae_is_bfl(state):
+        state = vae_to_diffusers(state)
+    config = infer_vae_config({key: tuple(t.shape) for key, t in state.items()})
+    with torch.device("meta"):
+        vae = AutoencoderKLFlux2(**config)
+    want = set(vae.state_dict())
+    missing = sorted(want - set(state))
+    unexpected = sorted(set(state) - want)
+    if missing or unexpected:
+        raise CheckpointFormatError(
+            f"{path.name}: missing {missing[:6]} ({len(missing)}), unexpected "
+            f"{unexpected[:6]} ({len(unexpected)})"
+        )
+    # Load in the target dtype directly: `to(dtype)` on a diffusers model warns
+    # about its float32-only modules (none here) and would cast twice.
+    keep_fp32 = tuple(getattr(vae, "_keep_in_fp32_modules", None) or ())
+
+    def placed(key: str, value: Tensor) -> Tensor:
+        if not value.is_floating_point():
+            return value
+        if keep_fp32 and any(marker in key for marker in keep_fp32):
+            return value.float()
+        return value.to(dtype)
+
+    vae.load_state_dict(
+        {key: placed(key, value) for key, value in state.items()},
+        strict=True,
+        assign=True,
+    )
+    left = [
+        name
+        for name, tensor in (*vae.named_parameters(), *vae.named_buffers())
+        if tensor.is_meta
+    ]
+    if left:
+        raise CheckpointFormatError(f"{path.name}: tensors left unloaded {left[:6]}")
+    return vae.eval().requires_grad_(False)

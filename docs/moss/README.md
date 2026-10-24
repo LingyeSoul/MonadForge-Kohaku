@@ -100,10 +100,11 @@ and it now takes the same `--precision` / `--fp16_fix` so the plan matches the r
 
 `--dit` (train, generate, tune) takes the DiT from **one ComfyUI `.safetensors`**
 instead of `MOSS-Image-Base/transformer/`. The file holds only the DiT, so
-`--model_dir` still supplies the text encoder and VAE: `cache` and `generate` need
-them, while training reads only the cache and needs neither (its empty prompt is
-the shipped `library/moss/asset/empty_prompt.safetensors`; the text encoder is
-used only when that asset is missing).
+`--model_dir` still supplies the text encoder and VAE (or `--vae` a single file,
+see below): `cache` and `generate` need them, while training reads only the cache
+and needs neither (its empty prompt is the shipped
+`library/moss/asset/empty_prompt.safetensors`; the text encoder is used only when
+that asset is missing).
 
 ```bash
 make daemon-run ARGS="scripts/moss/train.py --dit /path/moss_image_base_fp16_fixed.safetensors --cache post_image_dataset/moss/<set>"
@@ -135,6 +136,27 @@ Refused: quantized single files (ComfyUI `comfy_quant` / `weight_scale`, int8 / 
 inference only — and per-block folds (`via="proj"`), which need a runtime residual
 rescale the model does not implement. LoRA metadata records the file as `base_dit`
 (plus `base_fold_c` when its fold was undone).
+
+### ComfyUI single-file VAE
+
+`--vae` (cache, generate) takes the FLUX.2 VAE from **one `.safetensors`** instead
+of `MOSS-Image-Base/vae/`. Both key layouts load — ComfyUI's BFL / ldm `flux2-vae`
+(`encoder.down.0.block.0.…`, `decoder.up.…`, the mid attention's 1×1 convs) and a
+diffusers export — the config (block widths, layers per block, latent channels,
+patch size, attention) is inferred from the shapes, and the state then loads
+**strictly**, so a wrong file fails with its missing / unexpected keys instead of
+half-loading. Decode semantics are unchanged: latents stay fp32 and `--vae_dtype`
+picks the decode dtype.
+
+```bash
+make daemon-run ARGS="scripts/moss/cache.py --vae /path/flux2-vae.safetensors --src post_image_dataset/resized/<set>"
+make daemon-run ARGS="scripts/moss/generate.py --vae /path/flux2-vae.safetensors ..."
+```
+
+In the WebUI it is the `vae` field of the Paths section; preflight checks the
+file's **header** (`encoder.conv_in` / `bn` keys, floating 16-/32-bit weights)
+instead of requiring `vae/`. The DiT and text encoder still come from `--dit` /
+`--model_dir`.
 
 ## Training
 

@@ -16,6 +16,8 @@ skip_latents = false           # skip the VAE pass
 
 # VAE
 vae_dtype = "fp32"             # fp32 | bf16
+# vae = ""                     # single .safetensors FLUX.2 VAE instead of
+#                              # <model_dir>/MOSS-Image-Base/vae/ (ComfyUI flux2-vae)
 save_crops = false             # also write the exact pixels each latent was encoded from
 
 # Text encoder (Qwen3.5-9B)

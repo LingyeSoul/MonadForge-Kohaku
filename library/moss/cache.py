@@ -580,7 +580,15 @@ def cache_text(
 
 
 def cache_latents(
-    pairs, out_dir, model_dir, device, resolution, vae_dtype, overwrite, save_crops
+    pairs,
+    out_dir,
+    model_dir,
+    device,
+    resolution,
+    vae_dtype,
+    overwrite,
+    save_crops,
+    vae="",
 ) -> dict:
     from library.moss.loader import empty_cache, load_vae
     from library.moss.model import encode
@@ -599,7 +607,7 @@ def cache_latents(
         return {"encoded": 0}
     dtype = torch.float32 if vae_dtype == "fp32" else torch.bfloat16
     t0 = time.time()
-    vae = load_vae(model_dir, dtype=dtype, device=device)
+    encoder = load_vae(model_dir, dtype=dtype, device=device, vae=vae)
     t_load = time.time() - t0
     crops = out_dir / "crops"
     if save_crops:
@@ -611,7 +619,7 @@ def cache_latents(
         image = load_rgb(p.image)
         fitted = fit(image, w, h)
         resampled += fitted is not image
-        latent = encode(to_pixels(fitted), vae)[0].cpu().contiguous()
+        latent = encode(to_pixels(fitted), encoder)[0].cpu().contiguous()
         for *_, old in latent_files(out_dir, p.stem):
             if old != path:
                 old.unlink()
@@ -641,7 +649,7 @@ def cache_latents(
         f"encode {t_enc:.1f}s, peak {peak:.2f} GiB",
         flush=True,
     )
-    del vae
+    del encoder
     empty_cache()
     return {
         "encoded": len(plan),
@@ -653,7 +661,16 @@ def cache_latents(
 
 
 def cache_refs(
-    pairs, refs, out_dir, model_dir, device, resolution, ref_scale, vae_dtype, overwrite
+    pairs,
+    refs,
+    out_dir,
+    model_dir,
+    device,
+    resolution,
+    ref_scale,
+    vae_dtype,
+    overwrite,
+    vae="",
 ) -> dict:
     """``{stem}.moss_ref`` per pair: the condition fitted to the target's cached
     size, then to :func:`ref_size`. Current while newer than the condition and
@@ -680,12 +697,12 @@ def cache_refs(
         print("refs: all cached", flush=True)
         return {"encoded": 0}
     dtype = torch.float32 if vae_dtype == "fp32" else torch.bfloat16
-    vae = load_vae(model_dir, dtype=dtype, device=device)
+    encoder = load_vae(model_dir, dtype=dtype, device=device, vae=vae)
     t0 = time.time()
     for i, (stem, cond, w, h, path) in enumerate(plan, 1):
         rw, rh = ref_size(w, h, ref_scale)
         image = fit(fit(load_rgb(cond), w, h), rw, rh)
-        latent = encode(to_pixels(image), vae)[0].cpu().contiguous()
+        latent = encode(to_pixels(image), encoder)[0].cpu().contiguous()
         save_file(
             {"latent": latent},
             path,
@@ -701,7 +718,7 @@ def cache_refs(
         print(f"  refs {i}/{len(plan)} {stem}: {w}x{h} -> {rw}x{rh}", flush=True)
     seconds = time.time() - t0
     print(f"refs: {len(plan)} encoded in {seconds:.1f}s", flush=True)
-    del vae
+    del encoder
     empty_cache()
     return {"encoded": len(plan), "encode_s": seconds, "ref_scale": ref_scale}
 
@@ -775,6 +792,7 @@ def run_cache(req) -> Path:
             req.vae_dtype,
             req.overwrite,
             req.save_crops,
+            req.vae,
         )
     if refs is not None and not req.skip_latents:
         report["refs"] = cache_refs(
@@ -787,6 +805,7 @@ def run_cache(req) -> Path:
             req.ref_scale,
             req.vae_dtype,
             req.overwrite,
+            req.vae,
         )
     report["summary"] = summarize(out_dir)
     (out_dir / "cache_report.json").write_text(json.dumps(report, indent=2))

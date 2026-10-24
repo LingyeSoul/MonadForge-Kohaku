@@ -24,20 +24,25 @@ def training_output_paths(output: str) -> tuple[Path, Path]:
     return path, report
 
 
-def validate_dit(dit: str) -> None:
-    """A single-file DiT must be an existing .safetensors file, never a folder."""
-    if not dit:
+def validate_single_file(value: str, field: str) -> None:
+    """`--dit` / `--vae`: an existing .safetensors file, never a folder."""
+    if not value:
         return
-    path = resolve_under_home(dit)
+    path = resolve_under_home(value)
     if path.is_dir():
         raise ValueError(
-            f"dit must be a single .safetensors file, not a folder: {dit!r} "
+            f"{field} must be a single .safetensors file, not a folder: {value!r} "
             "(use model_dir / model for a diffusers folder)"
         )
     if not path.is_file():
-        raise ValueError(f"dit does not exist: {dit!r}")
+        raise ValueError(f"{field} does not exist: {value!r}")
     if path.suffix.lower() != ".safetensors":
-        raise ValueError(f"dit must be a .safetensors file: {dit!r}")
+        raise ValueError(f"{field} must be a .safetensors file: {value!r}")
+
+
+def validate_dit(dit: str) -> None:
+    """Kept as the named DiT check the requests have always used."""
+    validate_single_file(dit, "dit")
 
 
 def validate_request(
@@ -55,6 +60,8 @@ def validate_request(
             raise ValueError(
                 "resolution must be at least 16 and max_text_tokens positive"
             )
+    if isinstance(req, CacheRequest):
+        validate_single_file(req.vae, "vae")
     if isinstance(req, TrainRequest):
         validate_dit(req.dit)
         training_output_paths(req.output)
@@ -94,6 +101,7 @@ def validate_request(
             raise ValueError("invalid sigma distribution or logging interval")
     if isinstance(req, GenerateRequest):
         validate_dit(req.dit)
+        validate_single_file(req.vae, "vae")
         if req.width <= 0 or req.height <= 0 or req.width % 16 or req.height % 16:
             raise ValueError("width and height must be positive multiples of 16")
         if req.steps < 1 or req.cfg < 0 or req.shift <= 0:

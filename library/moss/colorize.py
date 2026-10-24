@@ -214,6 +214,7 @@ def run_colorize_cache(req) -> Path:
         "fp32",
         False,
         False,
+        req.vae,
     )
 
     todo = [j for j in jobs if not ref_path(j[0], j[3]).exists()]
@@ -221,7 +222,7 @@ def run_colorize_cache(req) -> Path:
         from library.moss.loader import load_vae
         from library.moss.model import encode as vae_encode
 
-        vae = load_vae(req.model_dir, device=device)
+        vae = load_vae(req.model_dir, device=device, vae=req.vae)
         for i, (stem, cond, _, held, (w, h)) in enumerate(todo, 1):
             rw, rh = moss_cache.ref_size(w, h, req.ref_scale)
             page = moss_cache.fit(moss_cache.load_rgb(cond), w, h)
