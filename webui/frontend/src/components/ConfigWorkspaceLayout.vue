@@ -34,10 +34,9 @@ const { t } = useI18n()
 .config-field-count { color: var(--text-muted); font-size: var(--fs-caption); white-space: nowrap; }
 .config-search { max-width: 320px; margin-left: auto; }
 .config-body { margin-top: 0; }
-.config-reference { border-left: 1px solid var(--border-subtle); }
 .help-panel-sticky { position: sticky; top: 16px; }
 @media (max-width: 1279px) {
-  .config-reference { border-left: 0; border-top: 1px solid var(--border-subtle); }
+  .config-reference { border-top: 1px solid var(--border-subtle); }
   .help-panel-sticky { position: static; }
 }
 @media (max-width: 599px) {

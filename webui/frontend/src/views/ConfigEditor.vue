@@ -238,7 +238,7 @@
     <ConfigWorkspaceLayout v-if="selectedVariant" v-model:search="fieldSearch" v-model:show-guide="showGuide"
       :field-count="visibleFieldCount" :filterable="Boolean(selectedVariant && configStore.fields.length)"
       search-test-id="anima-field-search" help-test-id="anima-help-toggle">
-        <v-card v-if="filteredBasic.length > 0" class="mb-4 config-section" variant="flat">
+        <v-card v-if="filteredBasic.length > 0" class="mb-4" variant="flat">
           <v-card-title class="text-subtitle-1">
             <v-icon icon="mdi-tune" class="mr-2" />
             {{ t('cfgBasicSettings') }}
@@ -305,7 +305,7 @@
         </div>
 
         <!-- Extra Args section -->
-        <v-card v-if="selectedVariant" class="mt-4 config-section" variant="flat">
+        <v-card v-if="selectedVariant" class="mt-4 config-section--flat" variant="flat">
           <button
             type="button"
             class="config-extra-args-trigger"
@@ -1476,13 +1476,14 @@ function waitForTask(taskId: string): Promise<void> {
   color: rgb(var(--v-theme-warning));
   font-size: var(--fs-caption);
 }
-.config-section {
+/* Collapsible footer section: a page-level band, not a card like the sections above. */
+.config-section--flat {
   background: transparent;
   border-radius: 0 !important;
   border-bottom: 1px solid var(--border-subtle);
 }
-.config-section > :deep(.v-card-title) { padding: 0 0 22px; }
-.config-section > :deep(.v-card-text) { padding: 0 0 20px; }
+.config-section--flat > :deep(.v-card-title) { padding: 0 0 22px; }
+.config-section--flat > :deep(.v-card-text) { padding: 0 0 20px; }
 .config-extra-args-trigger {
   display: flex;
   align-items: center;
