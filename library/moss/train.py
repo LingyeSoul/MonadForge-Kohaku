@@ -637,6 +637,7 @@ def train(
         dtype=compute,
         fp16_fix=req.fp16_fix,
         fp16_fix_c=req.fp16_fix_c,
+        dit=req.dit,
     )
     transformer.requires_grad_(False)
     transformer.ref_timestep = req.ref_timestep if req.ref_timestep >= 0 else None
@@ -802,6 +803,12 @@ def train(
     }
     if req.token_batch > 0:
         meta["token_batch"] = req.token_batch
+    if req.dit:
+        # Provenance only: an fp16-fix fold in the file was undone on load, so the
+        # LoRA is in the official parameterisation like every folder-trained run.
+        meta["base_dit"] = Path(req.dit).name
+        if getattr(transformer, "base_fold", None) is not None:
+            meta["base_fold_c"] = f"{transformer.base_fold['c']:g}"
     if compute == torch.float16:
         # A sample is only the trained model when the fix (and c) match.
         meta["fp16_fix"] = req.fp16_fix

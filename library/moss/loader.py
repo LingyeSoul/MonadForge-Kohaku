@@ -20,7 +20,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
+from accelerate import init_empty_weights
 
+from library.env import resolve_under_home
 from library.moss.model import MOSSImageTransformer
 from library.moss.requests import variant_dir
 from library.runtime.device import clean_memory as empty_cache
@@ -235,6 +237,62 @@ def resolve_compute_dtype(precision="auto", device=None) -> torch.dtype:
     raise ValueError(f"precision must be auto, bf16 or fp16, not {precision!r}")
 
 
+def _load_folder(model_dir, variant, dtype):
+    """The published diffusers `transformer/` folder of one variant."""
+    tr = MOSSImageTransformer.from_pretrained(
+        variant_dir(model_dir, variant) / "transformer", torch_dtype=dtype
+    ).eval()
+    tr.base_file = None
+    tr.base_fold = None
+    return tr
+
+
+def _load_single_file(dit, dtype):
+    """A ComfyUI single file: header check, inferred arch, one tensor at a time.
+
+    The file holds only the DiT (fused `proj.qkv`, optionally a key prefix and an
+    fp16-fix fold in its weights); `library.moss.checkpoint` splits, strips and
+    un-folds it, so the result is interchangeable with the diffusers folder and
+    the fp16 guards below apply exactly as they do there. The host peak is the
+    model plus one weight: each tensor is assigned as it is read.
+    """
+    from library.moss import checkpoint
+
+    path = resolve_under_home(dit)
+    if path.is_dir():
+        raise ValueError(
+            f"dit={dit!r} is a folder: a single-file DiT is one .safetensors "
+            "(keep --model/--model_dir for a diffusers folder)"
+        )
+    if not path.is_file():
+        raise ValueError(f"dit={dit!r} is not a file")
+    checkpoint.assert_compute_weights(path)
+    fold = checkpoint.fold_record(path)
+    cfg = checkpoint.arch_config(path)
+    with init_empty_weights():
+        tr = MOSSImageTransformer(**cfg)
+    plan = checkpoint.inspect(
+        path, {key: tuple(t.shape) for key, t in tr.state_dict().items()}
+    )
+    for name, tensor in checkpoint.read_state(path, plan, dtype, fold):
+        checkpoint.assign(tr, name, tensor)
+    tr.eval().requires_grad_(False)
+    tr.base_file = str(path)
+    tr.base_fold = fold
+    print(
+        f"[dit] {path.name}: {len(plan)} tensors, "
+        f"{cfg['num_layers']} blocks x {cfg['dim']}, "
+        f"{str(dtype).removeprefix('torch.')}"
+        + (
+            f", un-folded fp16-fix c={fold['c']:g} from the weights"
+            if fold is not None
+            else ""
+        ),
+        flush=True,
+    )
+    return tr
+
+
 def load_transformer(
     model_dir,
     variant="base",
@@ -243,8 +301,16 @@ def load_transformer(
     quant="",
     fp16_fix=None,
     fp16_fix_c=None,
+    dit="",
 ):
     """The DiT in its compute dtype (``dtype=None``: resolved for this device).
+
+    ``dit`` loads a **ComfyUI single file** (one ``.safetensors`` holding only
+    the DiT) instead of ``variant_dir(model_dir, variant) / "transformer"``: fused
+    ``proj.qkv`` rows are split into q / k / v, key prefixes stripped, the
+    architecture inferred from the file's shapes, and its fp16-fix fold undone on
+    load (``library.moss.checkpoint``). The text encoder and VAE still come from
+    ``model_dir``.
 
     fp16 compute turns on the residual-stream guard: the 42-block stream exceeds
     fp16's 65504 ceiling and overflows to NaN without one. ``fp16_fix`` picks it
@@ -262,9 +328,11 @@ def load_transformer(
     """
     if dtype is None:
         dtype = resolve_compute_dtype("auto", device)
-    tr = MOSSImageTransformer.from_pretrained(
-        variant_dir(model_dir, variant) / "transformer", torch_dtype=dtype
-    ).eval()
+    tr = (
+        _load_single_file(dit, dtype)
+        if dit
+        else _load_folder(model_dir, variant, dtype)
+    )
     if dtype == torch.float16:
         from library.moss.requests import DEFAULT_FP16_FIX, DEFAULT_FP16_FIX_C
 

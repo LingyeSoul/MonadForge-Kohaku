@@ -24,6 +24,22 @@ def training_output_paths(output: str) -> tuple[Path, Path]:
     return path, report
 
 
+def validate_dit(dit: str) -> None:
+    """A single-file DiT must be an existing .safetensors file, never a folder."""
+    if not dit:
+        return
+    path = resolve_under_home(dit)
+    if path.is_dir():
+        raise ValueError(
+            f"dit must be a single .safetensors file, not a folder: {dit!r} "
+            "(use model_dir / model for a diffusers folder)"
+        )
+    if not path.is_file():
+        raise ValueError(f"dit does not exist: {dit!r}")
+    if path.suffix.lower() != ".safetensors":
+        raise ValueError(f"dit must be a .safetensors file: {dit!r}")
+
+
 def validate_request(
     req: CacheRequest | GenerateRequest | TrainRequest | TuneSwapRequest,
 ) -> None:
@@ -40,6 +56,7 @@ def validate_request(
                 "resolution must be at least 16 and max_text_tokens positive"
             )
     if isinstance(req, TrainRequest):
+        validate_dit(req.dit)
         training_output_paths(req.output)
         if req.resume and not resolve_under_home(req.resume).is_file():
             raise ValueError(f"resume state not found: {req.resume}")
@@ -76,6 +93,7 @@ def validate_request(
         ):
             raise ValueError("invalid sigma distribution or logging interval")
     if isinstance(req, GenerateRequest):
+        validate_dit(req.dit)
         if req.width <= 0 or req.height <= 0 or req.width % 16 or req.height % 16:
             raise ValueError("width and height must be positive multiples of 16")
         if req.steps < 1 or req.cfg < 0 or req.shift <= 0:
@@ -103,6 +121,7 @@ def validate_request(
         ):
             raise ValueError("invalid Spectrum forecast parameters")
     if isinstance(req, TuneSwapRequest):
+        validate_dit(req.dit)
         if req.rank < 1 or req.patience < 1 or req.steps < 1 or req.warmup < 0:
             raise ValueError(
                 "rank, patience and timed steps must be positive; warmup non-negative"

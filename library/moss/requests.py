@@ -74,6 +74,12 @@ def variant_dir(model_dir: str | Path | None, variant: str) -> Path:
 
 
 _MODEL_DIR_HELP = f"folder holding MOSS-Image-Base/ and MOSS-Image-SFT/ (default: ${MODEL_DIR_ENV} or models/{MODEL_DIR_NAME})"
+_DIT_HELP = (
+    "DiT from a single .safetensors file instead of --model's transformer/ folder "
+    "(ComfyUI layout: fused proj.qkv, optional model.diffusion_model. prefix, and an "
+    "fp16-fix fold in the metadata is undone on load). The text encoder / VAE still "
+    "come from --model_dir; quantized single files are refused"
+)
 
 
 @dataclass
@@ -221,7 +227,10 @@ class GenerateRequest(Request):
         "in JSON or a LoRA cached as text (not applied to example)",
         choices=("text", "layout_json"),
     )
-    model: str = _f("base", "which DiT", choices=VARIANTS)
+    model: str = _f(
+        "base", "which DiT (ignored for the DiT when dit is set)", choices=VARIANTS
+    )
+    dit: str = _f("", _DIT_HELP)
     quant: str = _f(
         "",
         "quantized frozen DiT base: empty = bf16, int8 or fp8 (e4m3, sm89+). Halves "
@@ -405,7 +414,12 @@ class TrainRequest(Request):
         "last completed epoch",
         advanced=True,
     )
-    model: str = _f("base", "which DiT to train on", choices=VARIANTS)
+    model: str = _f(
+        "base",
+        "which DiT to train on (ignored for the DiT when dit is set)",
+        choices=VARIANTS,
+    )
+    dit: str = _f("", _DIT_HELP)
     epochs: int = _f(8, "passes over the cache")
     max_steps: int = _f(0, "stop after this many steps (0 = epochs decide)")
     algo: str = _f(
@@ -681,7 +695,12 @@ class TuneSwapRequest(Request):
         "",
         "synthetic WxH:text_tokens instead of the cache (e.g. 1024x1024:300)",
     )
-    model: str = _f("base", "which DiT to time", choices=VARIANTS)
+    model: str = _f(
+        "base",
+        "which DiT to time (ignored for the DiT when dit is set)",
+        choices=VARIANTS,
+    )
+    dit: str = _f("", _DIT_HELP)
     precision: str = _f(
         "auto",
         "DiT compute dtype; must match the training run",

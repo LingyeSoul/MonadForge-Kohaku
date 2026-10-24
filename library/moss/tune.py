@@ -293,6 +293,7 @@ def run_tune(req: TuneSwapRequest) -> dict:
         dtype=resolve_compute_dtype(req.precision, device),
         fp16_fix=req.fp16_fix,
         fp16_fix_c=req.fp16_fix_c,
+        dit=req.dit,
     )
     transformer.requires_grad_(False)
     network = LoRANetwork(

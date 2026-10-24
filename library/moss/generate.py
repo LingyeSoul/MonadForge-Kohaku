@@ -597,6 +597,7 @@ def _denoise_pending(req, model_dir, out_dir, pending, device) -> None:
         quant=req.quant,
         fp16_fix=fix,
         fp16_fix_c=fix_c,
+        dit=req.dit,
     )
     compute = transformer.layers[0].proj["q"].weight.dtype
     print(

@@ -10,6 +10,8 @@ cache = "post_image_dataset/moss"
 output = "output/ckpt_moss/moss_lora.safetensors"
 # resume = ""                  # <output>.state.pt from a previous run; continues at the next epoch
 model = "base"                 # base | sft
+# dit = ""                     # ComfyUI single-file DiT (.safetensors) instead of model;
+                               # TE/VAE still come from model_dir (docs/moss/README.md)
 epochs = 8
 max_steps = 0                  # 0 = epochs decide
 save_every_epochs = 0          # 0 = final only

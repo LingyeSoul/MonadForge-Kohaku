@@ -23,7 +23,7 @@ from library.moss.requests import (
 from library.moss.validation import training_output_paths, validate_request
 from scripts.moss.workflow import parse_workflow
 from webui.services.qwen21_service import FormField, form_fields
-from webui.services.qwen21_workspace import check_component_headers
+from webui.services.qwen21_workspace import check_component_headers, read_header
 
 Scalar = str | int | float | bool | None
 RequestT = TypeVar(
@@ -108,11 +108,13 @@ def resolve_values(values: dict[str, Scalar]) -> ResolvedPaths:
     base = variant_dir(req.model_dir, "base")
     return ResolvedPaths(
         model_dir=str(root),
-        dit=str(variant_dir(req.model_dir, req.model) / "transformer"),
+        dit=str(
+            resolve_under_home(req.dit)
+            if req.dit
+            else variant_dir(req.model_dir, req.model) / "transformer"
+        ),
         text_encoder=str(
-            text_encoder_path(
-                base, getattr(req, "text_encoder", DEFAULT_TEXT_ENCODER)
-            )
+            text_encoder_path(base, getattr(req, "text_encoder", DEFAULT_TEXT_ENCODER))
         ),
         vae=str(base / "vae"),
         tokenizer=str(base / "tokenizer"),
@@ -147,6 +149,44 @@ def require_component(path: Path, label: str) -> None:
     check_component_headers(path)
 
 
+_DIT_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "transformer.")
+
+
+def require_weights_file(path: Path, label: str) -> None:
+    """A single-file DiT: a 16-bit safetensors that looks like MOSS-Image.
+
+    Header-only and torch-free, so the browser form can check the file before a
+    GPU job is queued; the worker's loader re-validates every key and shape
+    (`library.moss.checkpoint`).
+    """
+    if path.is_dir():
+        raise ValueError(
+            f"{label} must be a single .safetensors file, not a folder: {path}"
+        )
+    if not path.is_file():
+        raise FileNotFoundError(f"{label} file not found: {path}")
+    if path.suffix.lower() != ".safetensors":
+        raise ValueError(f"{label} must be a .safetensors file: {path}")
+    header = read_header(path)
+    for key, tensor in header.tensors.items():
+        if key.endswith((".comfy_quant", ".weight_scale")) or tensor.dtype.startswith(
+            ("F8", "I8", "U8")
+        ):
+            raise ValueError(
+                f"Quantized {label} is unsupported: {path}; select 16-bit weights "
+                f"({key}, {tensor.dtype})"
+            )
+    names = set(header.tensors)
+    for prefix in _DIT_PREFIXES:
+        if names and all(key.startswith(prefix) for key in names):
+            names = {key[len(prefix) :] for key in names}
+            break
+    if "shared_block_modulation.weight" not in names or not (
+        "layers.0.proj.qkv.weight" in names or "layers.0.proj.q.weight" in names
+    ):
+        raise ValueError(f"{label} is not a MOSS-Image DiT: {path}")
+
+
 def validate_paths(req) -> None:
     base = variant_dir(req.model_dir, "base")
     if isinstance(req, CacheRequest):
@@ -161,18 +201,25 @@ def validate_paths(req) -> None:
             require_component(base / "vae", "MOSS VAE")
     elif isinstance(req, TrainRequest):
         training_output_paths(req.output)
-        require_component(
-            variant_dir(req.model_dir, req.model) / "transformer", "MOSS transformer"
-        )
+        if req.dit:
+            require_weights_file(resolve_under_home(req.dit), "MOSS transformer")
+        else:
+            require_component(
+                variant_dir(req.model_dir, req.model) / "transformer",
+                "MOSS transformer",
+            )
         output_path(req.output)
     elif isinstance(req, GenerateRequest):
         output_path(req.out_dir)
         require_component(base / "vae", "MOSS VAE")
         if not req.decode_only:
-            require_component(
-                variant_dir(req.model_dir, req.model) / "transformer",
-                "MOSS transformer",
-            )
+            if req.dit:
+                require_weights_file(resolve_under_home(req.dit), "MOSS transformer")
+            else:
+                require_component(
+                    variant_dir(req.model_dir, req.model) / "transformer",
+                    "MOSS transformer",
+                )
             require_component(
                 text_encoder_path(base, req.text_encoder), "MOSS text encoder"
             )
@@ -181,9 +228,13 @@ def validate_paths(req) -> None:
             if value and not resolve_under_home(value.strip()).is_file():
                 raise FileNotFoundError(f"MOSS input file not found: {value}")
     elif isinstance(req, TuneSwapRequest):
-        require_component(
-            variant_dir(req.model_dir, req.model) / "transformer", "MOSS transformer"
-        )
+        if req.dit:
+            require_weights_file(resolve_under_home(req.dit), "MOSS transformer")
+        else:
+            require_component(
+                variant_dir(req.model_dir, req.model) / "transformer",
+                "MOSS transformer",
+            )
         output_path(req.output)
         if not req.sizes:
             require_directory(resolve_under_home(req.cache), "MOSS cache")
@@ -197,6 +248,7 @@ def pin_request_paths(req: RequestT) -> RequestT:
         "output",
         "out_dir",
         "model_dir",
+        "dit",
         "lora",
         "prompts_file",
         "resume",
@@ -249,13 +301,16 @@ def prepare_job_args(command: str, args: list[str]) -> list[str]:
 def task_context(command: str, args: list[str]) -> dict:
     if command == "moss-cache-train":
         cache, req = parse_workflow(args)
-        return {
+        context = {
             "model_type": "moss",
             "phase": "cache-train",
             "cache_dir": cache.out,
             "output": req.output,
             "model": req.model,
         }
+        if req.dit:
+            context["dit"] = Path(req.dit).name
+        return context
     req = REQUEST_TYPES[command].from_argv(args)
     context = {
         "model_type": "moss",
@@ -267,6 +322,8 @@ def task_context(command: str, args: list[str]) -> dict:
             context[{"out_dir": "output_dir", "out": "cache_dir"}.get(attr, attr)] = (
                 getattr(req, attr)
             )
+    if getattr(req, "dit", ""):
+        context["dit"] = Path(req.dit).name
     return context
 
 

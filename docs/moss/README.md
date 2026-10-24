@@ -96,6 +96,46 @@ This is the pre-Ampere fallback, not an Ampere speed option — keep `auto`/`bf1
 at 1024² still needs the swap plan a bf16 16 GB card uses (`tune_swap.py` measures it,
 and it now takes the same `--precision` / `--fp16_fix` so the plan matches the run).
 
+## ComfyUI single-file DiT
+
+`--dit` (train, generate, tune) takes the DiT from **one ComfyUI `.safetensors`**
+instead of `MOSS-Image-Base/transformer/`. The file holds only the DiT, so
+`--model_dir` still supplies the text encoder and VAE: `cache` and `generate` need
+them, while training reads only the cache and needs neither (its empty prompt is
+the shipped `library/moss/asset/empty_prompt.safetensors`; the text encoder is
+used only when that asset is missing).
+
+```bash
+make daemon-run ARGS="scripts/moss/train.py --dit /path/moss_image_base_fp16_fixed.safetensors --cache post_image_dataset/moss/<set>"
+```
+
+What the loader handles, all from the header before any weight is read:
+
+- fused `layers.N.proj.qkv.weight` split into q / k / v (ComfyUI's chunk order);
+- a `model.diffusion_model.` / `diffusion_model.` / `transformer.` key prefix stripped;
+- the architecture inferred from the tensor shapes — `rope_base` comes back out of
+  the file's own `rope.bands`, so no `config.json` is required (a `<file>.json`
+  beside it — `foo.json` or `foo.safetensors.json` — overrides the inference and
+  must agree with it);
+- an **fp16-fix fold undone on load**. `moss_image_base_fp16_fixed` carries
+  `kohakumoss_fp16_fix` (c = 1/16) with the fold baked into its weights; loading
+  divides it back out (exact for a power-of-two c), so the LoRA trains in the
+  official parameterisation and merges onto the diffusers base like any other.
+  `--precision fp16` then applies its runtime `online` fold once, exactly as it
+  does with the folder base.
+
+In the WebUI it is the `dit` field of the Paths section. Preflight checks the
+file's **header** (16-bit, MOSS-Image DiT, no `comfy_quant` / `weight_scale`) instead
+of requiring `transformer/`, and the resolved-paths panel shows the file it will
+load. At run time the loader's `un-folded fp16-fix c=…` line means the fold was
+undone — no extra flag is needed, and `--precision fp16` still folds once at run time.
+
+Refused: quantized single files (ComfyUI `comfy_quant` / `weight_scale`, int8 / fp8)
+— the loader reads 16-bit weights, and `--quant` quantizes a *loaded* base for
+inference only — and per-block folds (`via="proj"`), which need a runtime residual
+rescale the model does not implement. LoRA metadata records the file as `base_dit`
+(plus `base_fold_c` when its fold was undone).
+
 ## Training
 
 - **Defaults**: `--rank 32`, alpha 128 for `lora` (scale 4; `lokr` / `loha` use

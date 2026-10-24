@@ -48,6 +48,56 @@ def test_moss_http_schema_strict_inputs_and_runtime(monkeypatch):
     }
 
 
+def test_moss_preflight_accepts_a_single_file_dit(tmp_path):
+    """A ComfyUI single file replaces the transformer folder, not the other paths."""
+    import numpy as np
+    from safetensors.numpy import save_file
+
+    path = tmp_path / "dit.safetensors"
+    save_file(
+        {
+            "shared_block_modulation.weight": np.zeros((6, 2), np.float32),
+            "layers.0.proj.q.weight": np.zeros((2, 2), np.float32),
+        },
+        str(path),
+    )
+    app = FastAPI()
+    app.include_router(router, prefix="/moss")
+    with TestClient(app) as client:
+        preflight = client.post(
+            "/moss/preflight",
+            json={"values": {"dit": str(path), "cache": str(tmp_path / "cache")}},
+        )
+        assert preflight.status_code == 200, preflight.text
+        resolved = client.post("/moss/resolve", json={"values": {"dit": str(path)}})
+        assert resolved.status_code == 200
+        assert resolved.json()["dit"] == str(path)
+
+
+def test_moss_preflight_rejects_a_quantized_single_file(tmp_path):
+    import numpy as np
+    from safetensors.numpy import save_file
+
+    path = tmp_path / "int8.safetensors"
+    save_file(
+        {
+            "shared_block_modulation.weight": np.zeros((6, 2), np.float32),
+            "layers.0.proj.q.weight": np.zeros((2, 2), np.float32),
+            "layers.0.proj.o.weight_scale": np.zeros(1, np.float32),
+        },
+        str(path),
+    )
+    app = FastAPI()
+    app.include_router(router, prefix="/moss")
+    with TestClient(app) as client:
+        response = client.post(
+            "/moss/preflight",
+            json={"values": {"dit": str(path), "cache": str(tmp_path / "cache")}},
+        )
+        assert response.status_code == 400
+        assert "Quantized" in response.json()["detail"]
+
+
 def test_moss_chain_pins_train_to_cache_output():
     cache, train = parse_workflow(
         [
