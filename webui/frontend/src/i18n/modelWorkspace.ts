@@ -23,6 +23,7 @@ export function mossText(language: string, key: keyof typeof mossEn): string {
 const mossFields: Record<string, [string, string]> = {
   model: ['Model variant', '模型变体'], algo: ['Adapter algorithm', '适配器算法'], max_steps: ['Maximum steps', '最大步数'],
   caption_format: ['Caption format', '标注格式'], prompt_format: ['Prompt format', '提示词格式'], vae_dtype: ['VAE precision', 'VAE 精度'],
+  dit: ['DiT file', 'DiT 文件'], vae: ['VAE file', 'VAE 文件'],
   max_text_tokens: ['Text token limit', '文本 token 上限'], lora_multiplier: ['Adapter strength', '适配器强度'], cfg: ['CFG scale', 'CFG 强度'],
   sampler: ['Sampler', '采样器'], uncond_skip: ['Unconditional skip rule', '无条件分支跳过规则'], example: ['Example prompt', '示例提示词'],
   batched: ['Batch conditional passes', '合并条件分支'], shift: ['Scheduler shift', '调度偏移'], decode_only: ['Decode existing latents only', '仅解码已有潜变量'],
