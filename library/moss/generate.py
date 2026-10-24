@@ -616,9 +616,16 @@ def _denoise_pending(req, model_dir, out_dir, pending, device) -> None:
 
 
 def _vae_dtype(name: str) -> torch.dtype:
-    """The decode VAE's dtype; ``auto`` is bf16 on a bf16 card, fp16 elsewhere."""
+    """The decode VAE's dtype; ``auto`` is bf16 on a bf16 card, fp16 elsewhere.
+
+    ``including_emulation=False`` is the question: the default returns True on a
+    V100 (a bf16 tensor can be created there) and cuDNN has no bf16 convolution.
+    """
     if name == "auto":
-        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        native_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported(
+            including_emulation=False
+        )
+        return torch.bfloat16 if native_bf16 else torch.float16
     return {
         "fp32": torch.float32,
         "bf16": torch.bfloat16,

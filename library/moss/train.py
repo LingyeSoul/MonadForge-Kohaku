@@ -57,6 +57,7 @@ from library.moss.loader import (
     empty_cache,
     free_vram_gb,
     load_transformer,
+    resolve_compute_dtype,
 )
 from library.moss.lora import LoRANetwork, load_channel_stats
 from library.moss.ops import fuse
@@ -391,7 +392,8 @@ def train(
     )
     kinds = {"plain": 0, "variant": 0, "empty": 0}
 
-    transformer = load_transformer(req.model_dir, req.model)
+    compute = resolve_compute_dtype(req.precision, device)
+    transformer = load_transformer(req.model_dir, req.model, dtype=compute)
     transformer.requires_grad_(False)
     transformer.ref_timestep = req.ref_timestep if req.ref_timestep >= 0 else None
     transformer.ref_isolate = req.ref_isolate
@@ -416,9 +418,19 @@ def train(
         dc_isolate=dc_isolate,
         svd_slice=req.svd_slice,
         svd_slice_count=req.svd_slice_count,
+        fp32_compute=compute == torch.float16,
     )
     patched = network.apply_to()
     network.to(device)
+    print(
+        f"precision {str(compute).removeprefix('torch.')}"
+        + (
+            " with the fp32 residual stream + fp32 adapter math"
+            if compute == torch.float16
+            else ""
+        ),
+        flush=True,
+    )
     detail = {
         "lora": f"{req.down_init} down"
         + (
@@ -499,6 +511,10 @@ def train(
         )
     else:
         optimizer = torch.optim.AdamW(params, lr=req.lr)
+    # fp16 gradients underflow (the loss is fp32 but W_grad is not); the scaler
+    # is the same dynamic-loss-scale contract upstream's DynamicScaler uses.
+    # bf16 needs none — its exponent matches fp32.
+    scaler = torch.amp.GradScaler("cuda", enabled=compute == torch.float16)
     total = req.epochs * len(samples)
     if req.max_steps:
         total = min(total, req.max_steps) if req.epochs else req.max_steps
@@ -608,19 +624,27 @@ def train(
                 loss = training_loss(transformer, latent, embeds, sigma, ref=ref)
                 align = repa.loss() if repa is not None else None
                 if align is not None:
-                    ((loss + req.repa_weight * align) / accum).backward()
+                    scaler.scale((loss + req.repa_weight * align) / accum).backward()
                     aligns.append(align.item())
                 else:
-                    (loss / accum).backward()
+                    scaler.scale(loss / accum).backward()
                 step += 1
                 updated = step % accum == 0 or step == total
                 if updated:
+                    scaler.unscale_(optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         params, req.max_grad_norm
                     ).item()
-                    optimizer.step()
-                    network.reproject_dc()
-                    lr_sched.step()
+                    finite = math.isfinite(grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    # A non-finite gradient makes GradScaler skip the step; the DC
+                    # re-projection and the schedule must not advance on a skipped
+                    # update either. Without a scaler (bf16/fp32) the step always
+                    # runs, as before.
+                    if finite or not scaler.is_enabled():
+                        network.reproject_dc()
+                        lr_sched.step()
                     optimizer.zero_grad(set_to_none=True)
                 value = loss.item()
                 sink.log(

@@ -94,6 +94,7 @@ Press **Run preprocessing**. The status line counts images, captions and cached 
 | `model` | `base` | Which DiT to train on |
 | `epochs` | `8` | Passes over the cache (one image per step) |
 | `save_every_epochs` | `0` | Also save every N epochs, as `<name>/<name>_e10.safetensors` etc. beside the final file (the last epoch is the final file itself) |
+| `precision` | `auto` | DiT compute dtype; `auto` = bf16 on sm_80+, fp16 on V100/T4 (see §4.3) |
 
 Rank, alpha, lr and the adapter type are in §4. **Train** reads `cache`; **Preprocess, then train** runs Preprocess first and points `cache` at its `out`.
 
@@ -158,6 +159,26 @@ Synthetic 1024² image + 300 text tokens (~4.4k tokens in all), LoRA rank 16, RT
 - The best pair depends on the PCIe link and the GPU. `scripts/moss/tune_swap.py` (CLI, [Appendix](#appendix-cli), about 4 minutes) times each swap count on the cache's largest sample and prints the fields to train with.
 - `blocks_to_swap -1` sizes the swap from free VRAM; it is calibrated for LoRA and under-reserves for LoKr/LoHa.
 - `compile` off needs `grad_checkpointing` on. Compiled training ran 2.0 against 3.1 s/step, for ~30 s of compile at the start.
+
+### 4.3 Pre-Ampere cards (V100, T4)
+
+`precision` picks the DiT's compute dtype. A pre-Ampere card has no native bf16 GEMM —
+cuBLAS wants compute capability 8.0 — so `auto` resolves to fp16 there, and an explicit
+`bf16` is refused instead of failing at the first matmul.
+
+fp16 needs the fix upstream KohakuMossTrainer ships as `FP16_FIX='fp32_residual'`, and
+the trainer turns it on for you: the 42-block residual stream passes fp16's 65504
+ceiling, so the stream stays fp32 while the matmuls stay fp16; the adapter GEMMs and
+their merge run in fp32 (fp16 would round the small LoRA updates away); and a dynamic
+loss scale guards the fp16 gradients. On this lane the fused block kernels are skipped
+(they are 16-bit only), so the step runs the reference branch.
+
+- **Speed**: fp16 is not a win over bf16 on an Ampere card — use `auto` there. On a V100
+  it is the only supported dtype.
+- **Memory**: the fp32 residual stream and fp32 adapter math lift the step's footprint a
+  little; keep the §4.2 swap plan and check with `--fit_report`.
+- **Inference** (`generate`) follows the same rule: the DiT loads in the resolved dtype
+  and turns the fp32 residual on for fp16, so a LoRA trained on a V100 samples on it.
 
 ---
 

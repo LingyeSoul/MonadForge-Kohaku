@@ -195,6 +195,21 @@ class _Block(nn.Module):
         # Set by ``library.moss.ops.fuse``: the branch below then runs the vendored
         # fused kernels instead of the op-for-op reference.
         self.fused = False
+        # fp16-safe residual stream; see MOSSImageTransformer.enable_fp32_residual().
+        # Inert (False) by default: bf16 / fp32 runs are bit-exact.
+        self.fp32_residual = False
+
+    def _gated_residual(self, x, branch, gate, ref_span):
+        """``x + gate · branch``, computed in fp32 when the fp16 guard is on.
+
+        Both the sum and the gated product are what overflow: an fp16
+        ``gate * branch`` past 65504 is already inf before the add, and a value
+        past 65504 has no fp16 representation at all. So the guard promotes both
+        operands, and the stream stays fp32 until a downstream matmul casts it.
+        """
+        if not self.fp32_residual:
+            return x + _gated(branch, gate, ref_span)
+        return x.float() + _gated(branch.float(), gate.float(), ref_span)
 
     def forward(
         self,
@@ -215,6 +230,7 @@ class _Block(nn.Module):
             and ctx is not None
             and modulation.ndim == 3
             and x.dtype in (torch.float16, torch.bfloat16)
+            and not self.fp32_residual
         ):
             return self._forward_fused(
                 x, modulation, key_mask, ref_span, ref_isolate, ctx
@@ -225,13 +241,28 @@ class _Block(nn.Module):
         y = y.to(dtype)
         q = self.q_norm(self.proj["q"](y).unflatten(-1, (self.heads, -1))).flatten(2)
         k = self.k_norm(self.proj["k"](y).unflatten(-1, (self.heads, -1))).flatten(2)
+        # On the fp16-safe lane every adapter merge returns fp32 (the sum past
+        # 65504 has no fp16 representation), so each matmul input is cast back to
+        # the weight dtype here; off that lane these casts are no-ops.
         attn = _attention(
-            q, k, self.proj["v"](y), rope, self.heads, key_mask, ref_span, ref_isolate
+            q,
+            k,
+            self.proj["v"](y).to(dtype),
+            rope,
+            self.heads,
+            key_mask,
+            ref_span,
+            ref_isolate,
         )
-        x = x + _gated(self.proj["o"](attn), gate_a, ref_span)
+        x = self._gated_residual(x, self.proj["o"](attn), gate_a, ref_span)
         y = _affine(self.norm2(x), scale_f, shift_f, ref_span)
         hidden, gate = self.proj["ffn_up_gate"](y.to(dtype)).chunk(2, -1)
-        return x + _gated(self.proj["ffn_down"](_situ(hidden, gate)), gate_f, ref_span)
+        return self._gated_residual(
+            x,
+            self.proj["ffn_down"](_situ(hidden, gate).to(dtype)),
+            gate_f,
+            ref_span,
+        )
 
     def _forward_fused(self, x, modulation, key_mask, ref_span, ref_isolate, ctx):
         """``forward`` with the norm+modulation, qk-norm+RoPE, SiTU-GLU and gated
@@ -415,6 +446,24 @@ class MOSSImageTransformer(ModelMixin, ConfigMixin):
         self.layer_hook = None
         self.ref_timestep = None
         self.ref_isolate = False
+        # fp16-safe residual stream; see enable_fp32_residual().
+        self.fp32_residual = False
+
+    def enable_fp32_residual(self) -> None:
+        """Keep the joint residual stream in fp32 (upstream ``fp16_fix=fp32_residual``).
+
+        The 42-block residual stream exceeds fp16's 65504 ceiling, so an fp16
+        run overflows to ``inf → NaN``; the matmuls stay fp16 (the norm outputs
+        are cast back to the compute dtype inside each block). bf16 / fp32 runs
+        are unaffected: the flag is False at construction and the reference and
+        fused branches are bit-exact while it stays False.
+
+        Call this BEFORE ``compile_blocks`` — dynamo specializes each block's
+        graph on the per-block bool.
+        """
+        for block in self.layers:
+            block.fp32_residual = True
+        self.fp32_residual = True
 
     def load_training_state_dict(self, state_dict, *, prefix=""):
         """Load a consolidated raw/EMA model mapping, strictly; no silent key drops."""
@@ -547,6 +596,15 @@ class MOSSImageTransformer(ModelMixin, ConfigMixin):
     def head(self, features, head_mod, height, width):
         """Image-token hidden state after the last block ``(B, H·W, D)`` →
         velocity ``(B, C, H, W)``. Spectrum forecasts ``features`` and calls this."""
+        # On the fp16-safe lane `features` is the fp32 residual stream: the norm
+        # must see it uncut (a >65504 value has no fp16 representation), and the
+        # final projection stays fp32 too — its true result can exceed the fp16
+        # range even though the norm's output is O(1) after the modulation.
+        if self.fp32_residual:
+            y = self.final_norm_video(features.float())
+            y = y * (1 + head_mod[:, 1, None].float()) + head_mod[:, 0, None].float()
+            x = F.linear(y, self.final_linear_video.weight.float())
+            return x.transpose(1, 2).reshape(x.shape[0], -1, height, width)
         x = self.final_norm_video(features.to(self.final_norm_video.weight.dtype))
         x = x * (1 + head_mod[:, 1, None]) + head_mod[:, 0, None]
         x = self.final_linear_video(x.to(self.final_linear_video.weight.dtype))

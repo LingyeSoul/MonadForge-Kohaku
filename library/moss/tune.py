@@ -171,6 +171,9 @@ class _Bench:
         if grad_checkpointing:
             checkpoint_blocks(blocks)
         optimizer = torch.optim.AdamW(self.params, lr=1e-6)
+        scaler = torch.amp.GradScaler(
+            "cuda", enabled=next(self.transformer.parameters()).dtype == torch.float16
+        )
         gen = torch.Generator().manual_seed(req.seed)
         torch.cuda.reset_peak_memory_stats()
         start = 0.0
@@ -182,9 +185,11 @@ class _Bench:
             loss = training_loss(
                 self.transformer, self.latent, self.embeds, sigma, ref=self.ref
             )
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(self.params, 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
         return {
@@ -237,7 +242,11 @@ def run_tune(req: TuneSwapRequest) -> dict:
     transformer = load_transformer(req.model_dir, req.model)
     transformer.requires_grad_(False)
     network = LoRANetwork(
-        transformer, rank=req.rank, targets=TrainRequest.TARGETS, dtype=torch.float32
+        transformer,
+        rank=req.rank,
+        targets=TrainRequest.TARGETS,
+        dtype=torch.float32,
+        fp32_compute=next(transformer.parameters()).dtype == torch.float16,
     )
     network.apply_to()
     network.to(device)

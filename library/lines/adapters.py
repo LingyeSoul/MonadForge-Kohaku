@@ -66,6 +66,39 @@ import torch.nn.functional as F
 SAVED_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 DOWN_INITS = ("kaiming", "weight_svd")
 ALGOS = ("lora", "lokr", "loha")
+
+
+def adapter_work_dtype(
+    base_out: torch.Tensor, fp32_compute: bool, training: bool
+) -> torch.dtype:
+    """The rank-path compute dtype: the base output's, except on the fp16-safe lane.
+
+    A frozen fp16 base makes ``base_out`` fp16; an fp16 rank GEMM then rounds the
+    small adapter updates away and can overflow on its own residual merge. With
+    ``fp32_compute`` (training only, fp16 base only) the adapters do their own
+    math in fp32 while the base stays fp16. BF16 / fp32 bases are untouched:
+    bf16's fp32 exponent needs no guard and it is the long-tested path.
+    """
+    if training and fp32_compute and base_out.dtype == torch.float16:
+        return torch.float32
+    return base_out.dtype
+
+
+def merge_adapter_delta(
+    base_out: torch.Tensor, delta: torch.Tensor, *, preserve_fp32: bool
+) -> torch.Tensor:
+    """Merge an adapter delta without re-entering fp16's 65504 ceiling.
+
+    ``base_out + delta.to(base_out.dtype)`` is the legacy path and stays
+    bit-exact off the fp16 lane. There a sum past 65504 has no fp16
+    representation, so the merge is computed and kept in fp32; the block's
+    residual add then reads fp32 as well.
+    """
+    if preserve_fp32 and base_out.dtype == torch.float16:
+        return base_out.float() + delta.float()
+    return base_out + delta.to(base_out.dtype)
+
+
 FILE_PREFIX = "lora_unet_"
 _LORA_FILE_KEYS = {"down.weight": "lora_down.weight", "up.weight": "lora_up.weight"}
 _LORA_STATE_KEYS = {v: k for k, v in _LORA_FILE_KEYS.items()}
@@ -90,6 +123,8 @@ class LoRAAdapter(nn.Module):
         nn.init.zeros_(self.up.weight)
         self.scale = alpha / rank
         self.multiplier = 1.0
+        # fp16-safe lane (see ``adapter_work_dtype``); inert off it.
+        self.fp32_compute = False
         self.register_buffer("inv_scale", None, persistent=False)
         self.register_buffer("dc_dir", None, persistent=False)
 
@@ -173,10 +208,20 @@ class LoRAAdapter(nn.Module):
     def forward(self, x: torch.Tensor, base_out: torch.Tensor) -> torch.Tensor:
         if self.multiplier == 0.0:
             return base_out
-        work = base_out.dtype
-        lx = F.linear(x.to(work), self.down_weight().to(work))
-        delta = F.linear(lx, self.up.weight.to(work))
-        return base_out + delta * (self.scale * self.multiplier)
+        work = adapter_work_dtype(base_out, self.fp32_compute, self.training)
+        if work == torch.float32:
+            with torch.autocast(device_type=base_out.device.type, enabled=False):
+                lx = F.linear(x.to(work), self.down_weight().float())
+                delta = F.linear(lx, self.up.weight.float())
+        else:
+            lx = F.linear(x.to(work), self.down_weight().to(work))
+            delta = F.linear(lx, self.up.weight.to(work))
+        delta = delta * (self.scale * self.multiplier)
+        return merge_adapter_delta(
+            base_out,
+            delta,
+            preserve_fp32=self.training and self.fp32_compute,
+        )
 
     def patched(self, module: nn.Linear, base, x: torch.Tensor) -> torch.Tensor:
         return self(x, base(module, x))
@@ -210,13 +255,15 @@ class LoKrAdapter(nn.Module):
         self.register_buffer("alpha", torch.tensor(float(alpha)))
         self.scale = alpha / rank
         self.multiplier = 1.0
+        # fp16-safe lane (see ``adapter_work_dtype``); inert off it.
+        self.fp32_compute = False
 
     def forward(self, x: torch.Tensor, base_out: torch.Tensor) -> torch.Tensor:
         if self.multiplier == 0.0:
             return base_out
         from lycoris.functional import lokr
 
-        work = base_out.dtype
+        work = adapter_work_dtype(base_out, self.fp32_compute, self.training)
         full = hasattr(self, "lokr_w2")
         delta = lokr.kron_bypass(
             x.to(work),
@@ -230,7 +277,11 @@ class LoKrAdapter(nn.Module):
             scale=self.scale * self.multiplier,
             backend="torch",
         )
-        return base_out + delta
+        return merge_adapter_delta(
+            base_out,
+            delta,
+            preserve_fp32=self.training and self.fp32_compute,
+        )
 
     def patched(self, module: nn.Linear, base, x: torch.Tensor) -> torch.Tensor:
         return self(x, base(module, x))
@@ -256,6 +307,8 @@ class LoHaAdapter(nn.Module):
         self.register_buffer("_unit", torch.ones(()), persistent=False)
         self.scale = alpha / rank
         self.multiplier = 1.0
+        # fp16-safe lane (see ``adapter_work_dtype``); inert off it.
+        self.fp32_compute = False
 
     def delta_weight(self, dtype: torch.dtype) -> torch.Tensor:
         from lycoris.functional import loha
@@ -276,6 +329,11 @@ class LoHaAdapter(nn.Module):
         if self.multiplier == 0.0:
             return base(module, x)
         weight = module.weight
+        if self.training and self.fp32_compute and weight.dtype == torch.float16:
+            # ΔW is built in fp32 and the single GEMM runs there too: an fp16
+            # ``W + ΔW`` rounds the adapter away and can overflow the weight.
+            merged = weight.float() + self.delta_weight(torch.float32)
+            return F.linear(x.float(), merged, module.bias)
         merged = weight + self.delta_weight(weight.dtype)
         return F.linear(x.to(weight.dtype), merged, module.bias)
 
@@ -308,6 +366,7 @@ class LoRANetwork(nn.Module):
         dc_isolate: bool = False,
         svd_slice: int = 0,
         svd_slice_count: int = 0,
+        fp32_compute: bool = False,
     ):
         super().__init__()
         if down_init not in DOWN_INITS:
@@ -349,6 +408,7 @@ class LoRANetwork(nn.Module):
         self.dc_isolate = bool(dc_isolate)
         self.svd_slice = int(svd_slice)
         self.svd_slice_count = int(svd_slice_count)
+        self.fp32_compute = bool(fp32_compute)
         self.num_blocks = self._num_blocks(model)
         self.adapters = nn.ModuleDict()
         self._targets: list[tuple[str, nn.Linear]] = []
@@ -378,6 +438,7 @@ class LoRANetwork(nn.Module):
                         channel_scale(channel_stats[name], self.channel_scaling_alpha)
                     )
             self.adapters[name.replace(".", "_")] = adapter
+            adapter.fp32_compute = self.fp32_compute
             self._targets.append((name, module))
         if not self._targets:
             raise ValueError(f"no nn.Linear matched {targets!r}")

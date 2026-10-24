@@ -87,6 +87,15 @@ def describe(device, dtype: torch.dtype) -> dict[str, str]:
 
 def fuse(model) -> int:
     """Switch ``model.layers`` to the fused branch; returns how many blocks took it."""
+    if getattr(model, "fp32_residual", False):
+        # The fp16-safe lane keeps the residual stream in fp32; the four block
+        # kernels are fp16/bff16-only, so the reference branch is the definition
+        # there. Say so once instead of flipping blocks the guard then skips.
+        logger.info(
+            "fused MOSS kernels off: the fp32 residual stream (fp16-safe lane) "
+            "runs the reference branch"
+        )
+        return 0
     device = next(model.parameters(), torch.empty(0)).device
     dtype = next(model.parameters()).dtype
     if not available(device) or dtype not in _DTYPES:

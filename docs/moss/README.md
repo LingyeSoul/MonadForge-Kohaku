@@ -59,6 +59,31 @@ cache records which encoder wrote it and switching re-encodes it, so a cache mad
 int8 became the default re-encodes on the next `cache` run unless it passes
 `--text_encoder bf16` (or `text_encoder = "bf16"` in a copy of `cache.toml`).
 
+## Compute precision (V100 / T4)
+
+`--precision` (train; WebUI: Advanced → Performance) picks the DiT's compute dtype:
+
+| Value | Behaviour |
+|---|---|
+| `auto` (default) | bf16 on a card with native bf16 (sm_80+), fp16 on a pre-Ampere card |
+| `bf16` | explicit; refused on a pre-Ampere card (no native bf16 GEMM) |
+| `fp16` | fp16 + the fp32 residual stream + fp32 adapter math + a loss scaler |
+
+A pre-Ampere card (V100 sm_70, T4 sm_75) has no bf16 GEMM: cuBLAS rejects it, and
+`torch.cuda.is_bf16_supported()`'s default (`including_emulation=True`) hides that by
+reporting a bf16 tensor can be *created*. `auto` therefore picks fp16 there, which needs
+the fix upstream KohakuMossTrainer ships as `FP16_FIX='fp32_residual'`:
+
+- the 42-block residual stream passes fp16's 65504 ceiling, so the stream is kept in
+  fp32 across the blocks and the fused block kernels are skipped on this lane;
+- the frozen base stays fp16 (matmuls are fp16); adapter GEMMs and their merge are fp32
+  so the small LoRA updates are not rounded away;
+- fp16 gradients get a dynamic loss scale.
+
+That is the pre-Ampere fallback, not an Ampere speed option — keep `auto`/`bf16` there
+(bf16 and fp16 run at the same tensor-core rate; fp16 only costs the fp32 guards). 16 GB
+at 1024² still needs the swap plan a bf16 16 GB card uses (`tune_swap.py` measures it).
+
 ## Training
 
 - **Defaults**: `--rank 32`, alpha 128 for `lora` (scale 4; `lokr` / `loha` use

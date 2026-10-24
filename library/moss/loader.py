@@ -194,10 +194,62 @@ def pad_embeds(rows, device=None):
     return embeds, mask
 
 
-def load_transformer(model_dir, variant="base", dtype=torch.bfloat16, device=None, quant=""):
+def native_bf16(device=None) -> bool:
+    """Whether this CUDA device has native bf16 arithmetic (sm_80+/Ampere).
+
+    ``torch.cuda.is_bf16_supported()`` is not the question: with its default
+    ``including_emulation=True`` it returns True on a V100, where a bf16 tensor
+    can be *created* but every bf16 GEMM is unsupported (cuBLAS wants compute
+    capability 8.0+). Ask the capability instead — and of ``device``, which
+    ``is_bf16_supported`` cannot take.
+    """
+    if not torch.cuda.is_available():
+        return False
+    major, _ = torch.cuda.get_device_capability(device)
+    return major >= 8
+
+
+def resolve_compute_dtype(precision="auto", device=None) -> torch.dtype:
+    """``auto | bf16 | fp16`` → the DiT's compute dtype for this device.
+
+    ``auto`` is bf16 on a card with native bf16 and fp16 elsewhere (V100 sm_70,
+    T4 sm_75), as upstream KohakuMossTrainer resolves ``PRECISION='auto'``. An
+    explicit ``bf16`` on a pre-Ampere card fails instead of running a bf16 GEMM
+    that cuBLAS rejects. Without a GPU, ``auto`` keeps bf16 — the historical
+    default, and nothing here runs a GEMM on a tensor core.
+    """
+    if precision == "auto":
+        if not torch.cuda.is_available():
+            return torch.bfloat16
+        return torch.bfloat16 if native_bf16(device) else torch.float16
+    if precision == "bf16":
+        if torch.cuda.is_available() and not native_bf16(device):
+            major, minor = torch.cuda.get_device_capability(device)
+            raise ValueError(
+                f"precision='bf16' needs a card with native bf16 (sm_80+), and "
+                f"this GPU is sm_{major}{minor}: use precision='fp16' or 'auto'"
+            )
+        return torch.bfloat16
+    if precision == "fp16":
+        return torch.float16
+    raise ValueError(f"precision must be auto, bf16 or fp16, not {precision!r}")
+
+
+def load_transformer(model_dir, variant="base", dtype=None, device=None, quant=""):
+    """The DiT in its compute dtype (``dtype=None``: resolved for this device).
+
+    fp16 compute turns on the fp32 residual stream: the 42-block residual
+    exceeds fp16's 65504 ceiling and overflows to NaN without it (upstream
+    ``fp16_fix=fp32_residual``; see ``MOSSImageTransformer.enable_fp32_residual``).
+    Must happen before ``compile_blocks`` — dynamo specializes on the flag.
+    """
+    if dtype is None:
+        dtype = resolve_compute_dtype("auto", device)
     tr = MOSSImageTransformer.from_pretrained(
         variant_dir(model_dir, variant) / "transformer", torch_dtype=dtype
     ).eval()
+    if dtype == torch.float16:
+        tr.enable_fp32_residual()
     if device is not None:
         tr = tr.to(device)
     if quant:

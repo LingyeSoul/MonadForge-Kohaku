@@ -521,6 +521,17 @@ class TrainRequest(Request):
         "rank GEMMs in bf16",
         choices=("bf16", "fp16", "fp32"),
     )
+    precision: str = _f(
+        "auto",
+        "DiT compute dtype: auto = bf16 on a card with native bf16 (sm_80+) and "
+        "fp16 elsewhere (V100 sm_70 / T4 sm_75, which have no bf16 GEMM). fp16 "
+        "turns on the fp32 residual stream and fp32 adapter math (the fp16 fix "
+        "upstream ships as FP16_FIX='fp32_residual'): the 42-block residual "
+        "exceeds fp16's 65504 ceiling otherwise, and a loss scaler guards the "
+        "gradient underflow",
+        choices=("auto", "bf16", "fp16"),
+        advanced=True,
+    )
     targets: str = _f(TARGETS, "fullmatch regex over linear names", advanced=True)
     sigma_mu: float = _f(
         -1.09,
