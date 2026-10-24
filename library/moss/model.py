@@ -45,12 +45,26 @@ _EPS = 1e-6
 
 
 class _RMSNorm(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, eps=_EPS, stream=True):
+        """``stream``: this norm reads a residual stream, so a fold scale ``c``
+        (``MOSSImageTransformer.enable_stream_scale``) multiplies its eps by
+        ``c²`` — RMSNorm is scale invariant except for eps. A norm that reads a
+        projection of an already-normalised value (q/k, the text refiner's own
+        stream) is ``stream=False`` and keeps its eps."""
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
+        self.stream = stream
+        self.base_eps = float(eps)
+        self.eps = float(eps)
+
+    def set_stream_scale(self, c: float) -> None:
+        """``eps = base_eps · c²`` on a stream reader, ``base_eps`` otherwise."""
+        self.eps = self.base_eps * c * c if self.stream else self.base_eps
 
     def forward(self, x):
-        y = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
+        y = x.float() * torch.rsqrt(
+            x.float().square().mean(-1, keepdim=True) + self.eps
+        )
         return y.to(x.dtype) * self.weight
 
 
@@ -73,7 +87,10 @@ class _Fused:
     seg: Tensor
 
     def take(self, rows):
-        return _Fused(self.pos[rows], self.bands, self.seg[rows])
+        """The subset's positions and one segment id per stream row: ``seg`` is
+        ``(B, T)`` and every kernel indexes it flattened, so a gathered row set
+        must flatten too (a 2-D slice would leave one id for many rows)."""
+        return _Fused(self.pos[rows], self.bands, self.seg[rows].reshape(-1))
 
 
 def _validate_skip_layers(layers, depth, name="skip_layers"):
@@ -121,19 +138,36 @@ class _TextBlock(nn.Module):
         super().__init__()
         self.heads = heads
         self.norm1, self.norm2 = _RMSNorm(dim), _RMSNorm(dim)
-        self.q_norm, self.k_norm = _RMSNorm(dim // heads), _RMSNorm(dim // heads)
+        self.q_norm, self.k_norm = (
+            _RMSNorm(dim // heads, stream=False),
+            _RMSNorm(dim // heads, stream=False),
+        )
         self.qkv = nn.Linear(dim, 3 * dim)
         self.proj = nn.Linear(dim, dim)
         self.ffn_gate, self.ffn_up = nn.Linear(dim, ffn_dim), nn.Linear(dim, ffn_dim)
         self.ffn_down = nn.Linear(ffn_dim, dim)
+        # The text stream's fold factor (1.0 = unfolded); set by
+        # ``set_stream_scale`` from ``MOSSImageTransformer.enable_stream_scale``.
+        self.stream_scale = 1.0
 
     def forward(self, x, rope, key_mask=None):
+        """``stream_scale`` folds the text stream (``c·x``): both writers multiply
+        their result, so each block maps ``c·x`` to ``c·(the unfolded output)`` —
+        the guards' ``c`` in upstream's fold. ``c == 1`` is the unfolded path."""
+        c = self.stream_scale
         q, k, v = self.qkv(self.norm1(x)).chunk(3, -1)
         q = self.q_norm(q.unflatten(-1, (self.heads, -1))).flatten(2)
         k = self.k_norm(k.unflatten(-1, (self.heads, -1))).flatten(2)
-        x = x + self.proj(_attention(q, k, v, rope, self.heads, key_mask))
+        attn = self.proj(_attention(q, k, v, rope, self.heads, key_mask))
+        x = x + (attn if c == 1.0 else c * attn)
         y = self.norm2(x)
-        return x + self.ffn_down(_situ(self.ffn_up(y), self.ffn_gate(y)))
+        ffn = self.ffn_down(_situ(self.ffn_up(y), self.ffn_gate(y)))
+        return x + (ffn if c == 1.0 else c * ffn)
+
+    def set_stream_scale(self, c: float) -> None:
+        self.stream_scale = float(c)
+        self.norm1.set_stream_scale(c)
+        self.norm2.set_stream_scale(c)
 
 
 class _TextProjection(nn.Module):
@@ -141,12 +175,22 @@ class _TextProjection(nn.Module):
         super().__init__()
         self.proj = nn.Linear(text_dim, dim)
         self.blocks = nn.ModuleList([_TextBlock(dim, ffn_dim, heads) for _ in range(2)])
+        self.stream_scale = 1.0
 
     def forward(self, x, rope, key_mask=None):
-        x = self.proj(x.to(self.proj.weight.dtype))
+        c = self.stream_scale
+        x = c * self.proj(x.to(self.proj.weight.dtype))
         for block in self.blocks:
             x = block(x, rope, key_mask)
         return x
+
+    def set_stream_scale(self, c: float) -> None:
+        """Fold the text stream: ``proj`` and every writer scaled by ``c``, each
+        stream-reading norm's eps by ``c²``, so the refiner's output is
+        ``c·(the unfolded output)``."""
+        self.stream_scale = float(c)
+        for block in self.blocks:
+            block.set_stream_scale(c)
 
 
 def _affine(y, scale, shift, ref_span):
@@ -186,7 +230,10 @@ class _Block(nn.Module):
         super().__init__()
         self.heads = heads
         self.norm1, self.norm2 = _RMSNorm(dim), _RMSNorm(dim)
-        self.q_norm, self.k_norm = _RMSNorm(dim // heads), _RMSNorm(dim // heads)
+        self.q_norm, self.k_norm = (
+            _RMSNorm(dim // heads, stream=False),
+            _RMSNorm(dim // heads, stream=False),
+        )
         self.proj = nn.ModuleDict(
             {name: nn.Linear(dim, dim, bias=False) for name in ("q", "k", "v", "o")}
         )
@@ -198,18 +245,34 @@ class _Block(nn.Module):
         # fp16-safe residual stream; see MOSSImageTransformer.enable_fp32_residual().
         # Inert (False) by default: bf16 / fp32 runs are bit-exact.
         self.fp32_residual = False
+        # The fp16 stream fold's gate factors ride ``time_conditioning`` (both gate
+        # rows of ``mod``), so the reference and fused branches see the same
+        # folded modulation; a block only owns its stream readers' eps.
+
+    def set_stream_scale(self, c: float) -> None:
+        """Fold scale ``c`` on this block: both stream readers' eps by ``c²``. The
+        gates carry ``c`` through ``time_conditioning`` and the writers stay as
+        computed, so the block's output is ``c·(the unfolded output)``."""
+        self.norm1.set_stream_scale(c)
+        self.norm2.set_stream_scale(c)
 
     def _gated_residual(self, x, branch, gate, ref_span):
-        """``x + gate · branch``, computed in fp32 when the fp16 guard is on.
+        """``x + gate · branch``, with the fp16 overflow guards.
 
         Both the sum and the gated product are what overflow: an fp16
         ``gate * branch`` past 65504 is already inf before the add, and a value
-        past 65504 has no fp16 representation at all. So the guard promotes both
-        operands, and the stream stays fp32 until a downstream matmul casts it.
+        past 65504 has no fp16 representation at all. So ``fp32_residual``
+        promotes both operands, and the stream stays fp32 until a downstream
+        matmul casts it.
+
+        On the ``online`` lane the gate carries the fold's ``c`` and the stream is
+        already ``c·x_true``, so the plain expression is the folded one and the
+        stream never leaves 16 bits — no promotion is needed because the fold
+        moved the magnitude, not the arithmetic.
         """
-        if not self.fp32_residual:
-            return x + _gated(branch, gate, ref_span)
-        return x.float() + _gated(branch.float(), gate.float(), ref_span)
+        if self.fp32_residual:
+            return x.float() + _gated(branch.float(), gate.float(), ref_span)
+        return x + _gated(branch, gate, ref_span)
 
     def forward(
         self,
@@ -229,8 +292,7 @@ class _Block(nn.Module):
             self.fused
             and ctx is not None
             and modulation.ndim == 3
-            and x.dtype in (torch.float16, torch.bfloat16)
-            and not self.fp32_residual
+            and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
         ):
             return self._forward_fused(
                 x, modulation, key_mask, ref_span, ref_isolate, ctx
@@ -268,20 +330,27 @@ class _Block(nn.Module):
         """``forward`` with the norm+modulation, qk-norm+RoPE, SiTU-GLU and gated
         residuals each collapsed into one kernel launch. Same arithmetic, fewer
         memory round trips; ``ref_span`` keeps the same tokens in the same places.
+
+        The norm reads the stream at its own dtype (a fold-scaled or fp32 stream
+        must not be cast down before the norm: that cast is itself the overflow),
+        and its output is cast to the compute dtype for the matmuls, as
+        ``reference`` does with ``_affine(...).to(dtype)``.
         """
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
         dtype = _linear_dtype(self.proj["q"])
         batch, tokens, dim = x.shape
         head_dim = dim // self.heads
         seg = ctx.seg.reshape(-1)
+        # ``contiguous``: ``x[rows]`` (per-sample skip) is a gathered row set, and
+        # the norm kernels index rows directly.
         y = ops.rms_norm_mod(
-            x.to(dtype).reshape(-1, dim),
+            x.reshape(-1, dim).contiguous(),
             self.norm1.weight,
             shift_a,
             scale_a,
             seg,
-            _EPS,
-        )
+            self.norm1.eps,
+        ).to(dtype)
         q, k = ops.qk_norm_rope(
             self.proj["q"](y).reshape(-1, self.heads, head_dim),
             self.proj["k"](y).reshape(-1, self.heads, head_dim),
@@ -289,7 +358,7 @@ class _Block(nn.Module):
             self.k_norm.weight,
             ctx.pos.reshape(-1, ctx.pos.shape[-1]),
             ctx.bands,
-            _EPS,
+            self.q_norm.eps,
         )
         v = self.proj["v"](y).reshape(batch, tokens, dim)
         attn = _attention(
@@ -304,13 +373,13 @@ class _Block(nn.Module):
         )
         x = ops.gated_residual(x, self.proj["o"](attn), gate_a, ctx.seg, 1.0)
         y = ops.rms_norm_mod(
-            x.to(dtype).reshape(-1, dim),
+            x.reshape(-1, dim).contiguous(),
             self.norm2.weight,
             shift_f,
             scale_f,
             seg,
-            _EPS,
-        )
+            self.norm2.eps,
+        ).to(dtype)
         up_gate = self.proj["ffn_up_gate"](y)
         hidden = ops.situ_glu(up_gate.reshape(-1, up_gate.shape[-1]))
         return ops.gated_residual(
@@ -448,6 +517,8 @@ class MOSSImageTransformer(ModelMixin, ConfigMixin):
         self.ref_isolate = False
         # fp16-safe residual stream; see enable_fp32_residual().
         self.fp32_residual = False
+        # fp16 stream fold; see enable_stream_scale(). 1.0 = unfolded.
+        self.stream_scale = 1.0
 
     def enable_fp32_residual(self) -> None:
         """Keep the joint residual stream in fp32 (upstream ``fp16_fix=fp32_residual``).
@@ -464,6 +535,44 @@ class MOSSImageTransformer(ModelMixin, ConfigMixin):
         for block in self.layers:
             block.fp32_residual = True
         self.fp32_residual = True
+
+    def enable_stream_scale(self, c: float) -> None:
+        """Fold a constant ``c`` into the joint and text streams (upstream
+        ``FP16_FIX='online'``).
+
+        Every reader of either stream is an RMSNorm, and RMSNorm is scale
+        invariant except for its eps: ``rms(c·x)`` with eps ``c²·eps`` equals
+        ``rms(x)`` with eps. So scaling every writer by ``c`` and every reader's
+        eps by ``c²`` leaves the function unchanged (exactly, not approximately)
+        while the stream carries ``c`` times the magnitude — the base's ~6.2e4
+        peak at ``c = 1/16`` becomes ~3.9e3, inside fp16's 65504 with room for a
+        trained LoRA. The weights are untouched, so no checkpoint, LoRA or
+        ComfyUI model needs to know; only the ``c`` at sample time must match.
+
+        Where the factor rides:
+
+        - ``video_embedder`` and the text refiner's projection + writers: their
+          output (a stream write) is multiplied, i.e. the forward multiplies the
+          linear's result rather than editing the weights;
+        - each joint block's two AdaLN gate rows: ``gate·c`` (the block writes
+          ``x + (gate·c)·branch`` = ``c·(x_true + gate·branch_true)``);
+        - ``final_norm_video``'s eps: ``c²``, so the norm's output is the
+          *unfolded* one (``rms(c·x) = c·rms(x)`` cancels) and the head's linear
+          already sees the magnitude its weights expect;
+        - the text refiner's own stream and the q/k norms are *not* stream
+          readers at their own scale — the q/k norms see normalised values, so
+          they keep eps.
+
+        ``c = 1.0`` is bit-exact to the unfolded path. It is not applied on the
+        ``fp32_residual`` lane (that guard works by dtype instead) and does
+        nothing on bf16 / fp32. Must run BEFORE ``compile_blocks`` for the same
+        reason as the residual guard.
+        """
+        self.stream_scale = float(c)
+        self.text_embedder.set_stream_scale(c)
+        self.final_norm_video.set_stream_scale(c)
+        for block in self.layers:
+            block.set_stream_scale(c)
 
     def load_training_state_dict(self, state_dict, *, prefix=""):
         """Load a consolidated raw/EMA model mapping, strictly; no silent key drops."""
@@ -499,7 +608,16 @@ class MOSSImageTransformer(ModelMixin, ConfigMixin):
         head = self.video_head_modulation(
             time.to(self.video_head_modulation.weight.dtype)
         )
-        return mod.view(batch, 6, -1), head.view(batch, 2, -1)
+        mod = mod.view(batch, 6, -1)
+        if self.stream_scale != 1.0:
+            # The fold writes ``x_true·c`` into the stream, so every writer's gate
+            # carries ``c`` (rows 2 and 5 are gate_a / gate_f of ``_Block``).
+            # Out-of-place: ``mod`` may require grad under a full finetune.
+            fold = mod.new_full((1, 6, 1), 1.0)
+            fold[:, 2] = self.stream_scale
+            fold[:, 5] = self.stream_scale
+            mod = mod * fold
+        return mod, head.view(batch, 2, -1)
 
     def ref_modulation(self, mod, n_img, ref_hw):
         """``(mod, ref_span)`` for the blocks: ``ref_span`` the reference tokens
@@ -533,8 +651,11 @@ class MOSSImageTransformer(ModelMixin, ConfigMixin):
         return torch.cat((*parts, text), 1), rope, pos.unsqueeze(0)
 
     def _embed_latent(self, latent):
+        """One stream write: the embedder's output times the fold scale, so the
+        stream enters the blocks already folded (``video_embedder`` is linear, so
+        the factor is exact in the compute dtype for a power-of-two ``c``)."""
         tokens = latent.flatten(2).transpose(1, 2)
-        return self.video_embedder(
+        return self.stream_scale * self.video_embedder(
             tokens.to(self.video_embedder.weight.dtype).contiguous()
         )
 
@@ -562,7 +683,11 @@ class MOSSImageTransformer(ModelMixin, ConfigMixin):
             ctx = _Fused(
                 pos=pos,
                 bands=self.rope.bands,
-                seg=ops.segments(x.shape[0], x.shape[1], x.device),
+                # (B, T): ``take`` slices a per-sample row subset and flattens, so the
+                # segment ids stay aligned with the gathered stream rows.
+                seg=ops.segments(x.shape[0], x.shape[1], x.device).view(
+                    x.shape[0], x.shape[1]
+                ),
             )
         for index, layer in enumerate(self.layers):
             if per_sample:
@@ -607,6 +732,9 @@ class MOSSImageTransformer(ModelMixin, ConfigMixin):
             return x.transpose(1, 2).reshape(x.shape[0], -1, height, width)
         x = self.final_norm_video(features.to(self.final_norm_video.weight.dtype))
         x = x * (1 + head_mod[:, 1, None]) + head_mod[:, 0, None]
+        # No `c` here: the fold's eps (c²·eps) makes the norm's output the
+        # unfolded one (rms(c·x) = c·rms(x) cancels), so the projection already
+        # sees the unfolded magnitude.
         x = self.final_linear_video(x.to(self.final_linear_video.weight.dtype))
         return x.transpose(1, 2).reshape(x.shape[0], -1, height, width)
 

@@ -16,9 +16,11 @@ branch) when any of these holds:
 
 - the host has no CUDA device, or `triton` does not import;
 - the DiT's parameters are not fp16 / bf16;
-- the model carries the fp32 residual stream (`enable_fp32_residual()`, the fp16 lane
-  on a pre-Ampere card): the four kernels are 16-bit, so that lane runs the reference
-  branch;
+- the model carries the fp32 residual stream (`enable_fp32_residual()`, the other fp16
+  guard): the four kernels are 16-bit, so that lane resolves the residual op at fp32
+  (`gated_residual` takes the stream dtype apart from the projection's) and the fused
+  residual GEMM takes its split path. `enable_stream_scale()` (the default `online`
+  lane) keeps the stream 16-bit, so every kernel runs normally;
 - one of the four ops has no kernel or `torch.compile` candidate on this arch.
 
 | Variable | Default | Effect |

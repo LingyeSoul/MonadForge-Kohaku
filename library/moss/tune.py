@@ -31,6 +31,7 @@ from library.moss.loader import (
     empty_cache,
     free_vram_gb,
     load_transformer,
+    resolve_compute_dtype,
 )
 from library.moss.lora import LoRANetwork
 from library.moss.ops import fuse
@@ -239,7 +240,13 @@ def run_tune(req: TuneSwapRequest) -> dict:
         flush=True,
     )
 
-    transformer = load_transformer(req.model_dir, req.model)
+    transformer = load_transformer(
+        req.model_dir,
+        req.model,
+        dtype=resolve_compute_dtype(req.precision, device),
+        fp16_fix=req.fp16_fix,
+        fp16_fix_c=req.fp16_fix_c,
+    )
     transformer.requires_grad_(False)
     network = LoRANetwork(
         transformer,

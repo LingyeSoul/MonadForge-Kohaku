@@ -94,6 +94,8 @@ _GROUP_FIELDS: dict[str, tuple[str, ...]] = {
         "compile_seq",
         "compile_mode",
         "precision",
+        "fp16_fix",
+        "fp16_fix_c",
         "lora_dtype",
         "vae_dtype",
         "batched",

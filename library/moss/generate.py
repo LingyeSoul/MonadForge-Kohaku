@@ -38,6 +38,7 @@ from library.moss.loader import (
     load_transformer,
     load_vae,
     pad_embeds,
+    resolve_compute_dtype,
 )
 from library.moss.model import decode, snapped_sigmas
 from library.moss.ops import fuse
@@ -531,6 +532,49 @@ def _write_manifest(out_dir: Path, req: GenerateRequest, records: list[dict]) ->
     return manifest
 
 
+def _resolve_lane(req, device) -> tuple[str, str, float]:
+    """``(precision, fp16_fix, fp16_fix_c)`` for this job.
+
+    The request's own values, except for a LoRA that was trained on the fp16 lane:
+    that file carries the fix it was trained with and wins, because ``online``
+    with another ``c`` is a different function. The stamped ``precision`` only
+    picks the lane when this card can actually run it — a bf16-trained LoRA is
+    sampled in fp16 on a pre-Ampere card, where bf16 is not a GEMM dtype.
+    """
+    from library.moss.loader import native_bf16
+    from library.moss.lora import train_settings
+
+    if not req.lora:
+        return req.precision, req.fp16_fix, req.fp16_fix_c
+    trained, fix, c = train_settings(resolve_under_home(req.lora))
+    precision = req.precision
+    if precision == "auto" and trained in ("fp16", "bf16"):
+        if trained == "bf16" and not native_bf16(device):
+            precision = "fp16"
+            print(
+                "[lora] trained in bf16; this card has no native bf16 GEMM, "
+                "sampling in fp16",
+                flush=True,
+            )
+        else:
+            precision = trained
+    if fix in ("online", "fp32_residual"):
+        if fix != req.fp16_fix:
+            print(
+                f"[lora] trained with fp16_fix={fix}; overriding the request's "
+                f"{req.fp16_fix}",
+                flush=True,
+            )
+        if fix == "online" and c is not None and c != req.fp16_fix_c:
+            print(
+                f"[lora] trained with fp16_fix_c={c:g}; overriding the request's "
+                f"{req.fp16_fix_c:g}",
+                flush=True,
+            )
+        return precision, fix, req.fp16_fix_c if c is None else c
+    return precision, req.fp16_fix, req.fp16_fix_c
+
+
 def _denoise_pending(req, model_dir, out_dir, pending, device) -> None:
     """TE for the pending jobs only, then the DiT; each latent hits disk as soon
     as its denoise returns, so a killed job loses at most the one in flight."""
@@ -544,12 +588,29 @@ def _denoise_pending(req, model_dir, out_dir, pending, device) -> None:
     refs = ref_latents(model_dir, refs, device) if refs else {}
 
     t0 = time.time()
-    transformer = load_transformer(model_dir, req.model, device=device, quant=req.quant)
+    precision, fix, fix_c = _resolve_lane(req, device)
+    transformer = load_transformer(
+        model_dir,
+        req.model,
+        dtype=resolve_compute_dtype(precision, device),
+        device=device,
+        quant=req.quant,
+        fp16_fix=fix,
+        fp16_fix_c=fix_c,
+    )
+    compute = transformer.layers[0].proj["q"].weight.dtype
     print(
         f"[dit] {req.model} loaded in {time.time() - t0:.1f}s, "
-        f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB",
+        f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB, "
+        f"{str(compute).removeprefix('torch.')}"
+        + (
+            f", fp16 fix {fix}" + (f" c={fix_c:g}" if fix == "online" else "")
+            if compute == torch.float16
+            else ""
+        ),
         flush=True,
     )
+
     if req.lora:
         from library.moss.lora import load_for_inference
 

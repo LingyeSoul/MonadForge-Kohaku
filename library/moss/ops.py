@@ -86,23 +86,26 @@ def describe(device, dtype: torch.dtype) -> dict[str, str]:
 
 
 def fuse(model) -> int:
-    """Switch ``model.layers`` to the fused branch; returns how many blocks took it."""
-    if getattr(model, "fp32_residual", False):
-        # The fp16-safe lane keeps the residual stream in fp32; the four block
-        # kernels are fp16/bff16-only, so the reference branch is the definition
-        # there. Say so once instead of flipping blocks the guard then skips.
-        logger.info(
-            "fused MOSS kernels off: the fp32 residual stream (fp16-safe lane) "
-            "runs the reference branch"
-        )
-        return 0
+    """Switch ``model.layers`` to the fused branch; returns how many blocks took it.
+
+    The four block ops are resolved for the model's *compute* dtype and, on the
+    ``fp32_residual`` lane, the residual op is resolved for the (fp32) stream
+    dtype: the TileLang and Triton ``gated_residual`` kernels take the stream
+    dtype apart from the projection's (``xdt``), and the fused
+    ``linear_gated_residual`` has a split path for exactly that case. So the lane
+    keeps ``rms_norm_mod`` / ``qk_norm_rope`` / ``situ_glu`` and only the
+    residual GEMM degrades to ``linear + residual kernel``.
+    """
     device = next(model.parameters(), torch.empty(0)).device
     dtype = next(model.parameters()).dtype
     if not available(device) or dtype not in _DTYPES:
         return 0
+    stream = torch.float32 if getattr(model, "fp32_residual", False) else dtype
     registry = _registry()
     for op in BLOCK_OPS:
-        usable = registry.available(op, device, dtype)
+        usable = registry.available(
+            op, device, stream if op == "gated_residual" else dtype
+        )
         if not any(
             usable.get(name) is None for name in ("tilelang", "triton", "compile")
         ):
@@ -110,6 +113,12 @@ def fuse(model) -> int:
             return 0
     for block in model.layers:
         block.fused = True
+    if stream != dtype:
+        logger.info(
+            "fused MOSS kernels: %d blocks, the fp32 residual stream runs the "
+            "split path (linear + residual kernel)",
+            len(model.layers),
+        )
     return len(model.layers)
 
 

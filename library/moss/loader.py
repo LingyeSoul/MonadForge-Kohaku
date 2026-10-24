@@ -235,13 +235,30 @@ def resolve_compute_dtype(precision="auto", device=None) -> torch.dtype:
     raise ValueError(f"precision must be auto, bf16 or fp16, not {precision!r}")
 
 
-def load_transformer(model_dir, variant="base", dtype=None, device=None, quant=""):
+def load_transformer(
+    model_dir,
+    variant="base",
+    dtype=None,
+    device=None,
+    quant="",
+    fp16_fix=None,
+    fp16_fix_c=None,
+):
     """The DiT in its compute dtype (``dtype=None``: resolved for this device).
 
-    fp16 compute turns on the fp32 residual stream: the 42-block residual
-    exceeds fp16's 65504 ceiling and overflows to NaN without it (upstream
-    ``fp16_fix=fp32_residual``; see ``MOSSImageTransformer.enable_fp32_residual``).
-    Must happen before ``compile_blocks`` — dynamo specializes on the flag.
+    fp16 compute turns on the residual-stream guard: the 42-block stream exceeds
+    fp16's 65504 ceiling and overflows to NaN without one. ``fp16_fix`` picks it
+    (upstream KohakuMossTrainer's ``FP16_FIX``):
+
+    - ``"online"`` (default; ``fp16_fix_c``, default 1/16): fold a scale ``c``
+      into the joint and text streams (``enable_stream_scale``). The stream stays
+      16-bit, so the fused kernels still run; the function is exact, and nothing
+      is written into the weights.
+    - ``"fp32_residual"``: the stream is carried in fp32 with fp16 matmuls
+      (``enable_fp32_residual``); the residual GEMM degrades to the split path.
+
+    Both must happen before ``compile_blocks`` — dynamo specializes on the flags.
+    ``dtype`` other than fp16 (bf16 / fp32) ignores the fix.
     """
     if dtype is None:
         dtype = resolve_compute_dtype("auto", device)
@@ -249,7 +266,19 @@ def load_transformer(model_dir, variant="base", dtype=None, device=None, quant="
         variant_dir(model_dir, variant) / "transformer", torch_dtype=dtype
     ).eval()
     if dtype == torch.float16:
-        tr.enable_fp32_residual()
+        from library.moss.requests import DEFAULT_FP16_FIX, DEFAULT_FP16_FIX_C
+
+        fix = DEFAULT_FP16_FIX if fp16_fix is None else fp16_fix
+        if fix == "fp32_residual":
+            tr.enable_fp32_residual()
+        elif fix == "online":
+            tr.enable_stream_scale(
+                DEFAULT_FP16_FIX_C if fp16_fix_c is None else fp16_fix_c
+            )
+        else:
+            raise ValueError(
+                f"fp16_fix must be 'online' or 'fp32_residual', not {fix!r}"
+            )
     if device is not None:
         tr = tr.to(device)
     if quant:

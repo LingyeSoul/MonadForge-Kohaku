@@ -166,19 +166,23 @@ Synthetic 1024² image + 300 text tokens (~4.4k tokens in all), LoRA rank 16, RT
 cuBLAS wants compute capability 8.0 — so `auto` resolves to fp16 there, and an explicit
 `bf16` is refused instead of failing at the first matmul.
 
-fp16 needs the fix upstream KohakuMossTrainer ships as `FP16_FIX='fp32_residual'`, and
-the trainer turns it on for you: the 42-block residual stream passes fp16's 65504
-ceiling, so the stream stays fp32 while the matmuls stay fp16; the adapter GEMMs and
-their merge run in fp32 (fp16 would round the small LoRA updates away); and a dynamic
-loss scale guards the fp16 gradients. On this lane the fused block kernels are skipped
-(they are 16-bit only), so the step runs the reference branch.
+fp16 needs a guard, and the trainer turns one on for you: `online` (the default) folds a
+stream scale `c = 1/16` so the 42-block residual stream carries a sixteenth of its
+magnitude — an exact reparameterisation, weights untouched, the stream stays 16-bit so
+the fused block kernels still run. `fp32_residual` is the other option: the stream stays
+fp32 while the matmuls stay fp16, which costs the fused residual GEMM and twice the
+stream's bytes. On both lanes the adapter GEMMs and their merge run in fp32 (fp16 would
+round the small LoRA updates away) and a dynamic loss scale guards the fp16 gradients.
 
+- **`c` must match at sample time.** It is stamped in the LoRA's metadata and `generate`
+  applies it, so a LoRA from a V100 samples correctly elsewhere.
 - **Speed**: fp16 is not a win over bf16 on an Ampere card — use `auto` there. On a V100
   it is the only supported dtype.
-- **Memory**: the fp32 residual stream and fp32 adapter math lift the step's footprint a
-  little; keep the §4.2 swap plan and check with `--fit_report`.
+- **Memory**: `online` adds one multiply per writer and keeps the stream 16-bit;
+  `fp32_residual` lifts the step's footprint by the stream. Keep the §4.2 swap plan and
+  check with `--fit_report`.
 - **Inference** (`generate`) follows the same rule: the DiT loads in the resolved dtype
-  and turns the fp32 residual on for fp16, so a LoRA trained on a V100 samples on it.
+  with the same guard, and the LoRA's stamped settings win over the request's.
 
 ---
 

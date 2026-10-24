@@ -67,22 +67,34 @@ int8 became the default re-encodes on the next `cache` run unless it passes
 |---|---|
 | `auto` (default) | bf16 on a card with native bf16 (sm_80+), fp16 on a pre-Ampere card |
 | `bf16` | explicit; refused on a pre-Ampere card (no native bf16 GEMM) |
-| `fp16` | fp16 + the fp32 residual stream + fp32 adapter math + a loss scaler |
+| `fp16` | fp16 + a residual-stream guard (see below) + fp32 adapter math + a loss scaler |
 
 A pre-Ampere card (V100 sm_70, T4 sm_75) has no bf16 GEMM: cuBLAS rejects it, and
 `torch.cuda.is_bf16_supported()`'s default (`including_emulation=True`) hides that by
 reporting a bf16 tensor can be *created*. `auto` therefore picks fp16 there, which needs
-the fix upstream KohakuMossTrainer ships as `FP16_FIX='fp32_residual'`:
+a guard — the 42-block residual stream peaks near 6.2e4 on the base weights, inside
+fp16's 65504 by ~6 % (upstream's activation probe). `--fp16_fix` picks which
+(upstream KohakuMossTrainer's `FP16_FIX`):
 
-- the 42-block residual stream passes fp16's 65504 ceiling, so the stream is kept in
-  fp32 across the blocks and the fused block kernels are skipped on this lane;
-- the frozen base stays fp16 (matmuls are fp16); adapter GEMMs and their merge are fp32
-  so the small LoRA updates are not rounded away;
-- fp16 gradients get a dynamic loss scale.
+| Value | What it does |
+|---|---|
+| `online` (default) | folds a scale `c` (default 1/16, `--fp16_fix_c`) into the joint and text streams: the stream carries `c·x`, each block's AdaLN gate rows carry `c`, every stream-reading RMSNorm's eps carries `c²`. Exact reparameterisation, weights untouched, stream stays 16-bit — so the fused block kernels still run. At `c = 1/16` the peak drops to ~3.9e3, ~16× headroom for a trained adapter |
+| `fp32_residual` | carries the stream in fp32 with fp16 matmuls. Cannot overflow from magnitude, but the fused residual GEMM degrades to `linear + residual kernel` and the stream costs twice its bytes |
 
-That is the pre-Ampere fallback, not an Ampere speed option — keep `auto`/`bf16` there
-(bf16 and fp16 run at the same tensor-core rate; fp16 only costs the fp32 guards). 16 GB
-at 1024² still needs the swap plan a bf16 16 GB card uses (`tune_swap.py` measures it).
+On both lanes the frozen base stays fp16 (matmuls are fp16), adapter GEMMs and their
+merge are fp32 so the small LoRA updates are not rounded away, and fp16 gradients get a
+dynamic loss scale.
+
+**`online` and `generate` must agree.** `c` is part of the function: a LoRA trained with
+`c = 1/16` samples correctly only when the sampler folds the same `c`. The trainer
+stamps `precision` / `fp16_fix` / `fp16_fix_c` into the LoRA's metadata and `generate`
+reads them back, overriding the request's own values with a printed note — so a LoRA
+from a V100 samples correctly on any card (as long as the compute dtype is fp16).
+
+This is the pre-Ampere fallback, not an Ampere speed option — keep `auto`/`bf16` there
+(bf16 and fp16 run at the same tensor-core rate; fp16 only costs the guards). 16 GB
+at 1024² still needs the swap plan a bf16 16 GB card uses (`tune_swap.py` measures it,
+and it now takes the same `--precision` / `--fp16_fix` so the plan matches the run).
 
 ## Training
 

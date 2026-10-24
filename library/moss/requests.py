@@ -39,6 +39,12 @@ DEFAULT_STEPS = 50
 DEFAULT_CFG = 3.0
 DEFAULT_UNCOND_SKIP = (22,)
 DEFAULT_SHIFT = 5.0
+# How an fp16 DiT keeps the residual stream inside fp16's range (upstream
+# KohakuMossTrainer's ``FP16_FIX``; see ``library/moss/model.py``).
+FP16_FIXES = ("online", "fp32_residual")
+DEFAULT_FP16_FIX = "online"
+# The base's stream peaks near 6.2e4, so c = 1/16 leaves ~3.9e3 (upstream's recipe).
+DEFAULT_FP16_FIX_C = 0.0625
 # Qwen3.5-9B weights for the text pass (``library/moss/loader.py::TE_PRECISIONS``).
 DEFAULT_TEXT_ENCODER = "int8"
 TEXT_ENCODERS = ("int8", "fp8", "bf16")
@@ -222,6 +228,29 @@ class GenerateRequest(Request):
         "the base's VRAM; LoRAs still apply on top",
         choices=("", "int8", "fp8"),
     )
+    precision: str = _f(
+        "auto",
+        "DiT compute dtype: auto = bf16 on a native-bf16 card, fp16 elsewhere "
+        "(must match the dtype the LoRA trained in: a LoRA trained on a V100 "
+        "samples in fp16)",
+        choices=("auto", "bf16", "fp16"),
+        advanced=True,
+    )
+    fp16_fix: str = _f(
+        DEFAULT_FP16_FIX,
+        "fp16 residual-stream guard; must match the LoRA's training run. online: "
+        "the stream carries a scale c (the fused kernels still run). "
+        "fp32_residual: the stream is fp32 (the fused residual GEMM is skipped)",
+        choices=FP16_FIXES,
+        advanced=True,
+    )
+    fp16_fix_c: float = _f(
+        DEFAULT_FP16_FIX_C,
+        "online: the stream scale; must equal the trainer's fp16_fix_c or the "
+        "sample is not the model that was trained",
+        advanced=True,
+    )
+
     lora: str = _f(
         "",
         "LoRA from scripts/moss/train.py (empty = none); a Base LoRA also loads on SFT",
@@ -525,11 +554,30 @@ class TrainRequest(Request):
         "auto",
         "DiT compute dtype: auto = bf16 on a card with native bf16 (sm_80+) and "
         "fp16 elsewhere (V100 sm_70 / T4 sm_75, which have no bf16 GEMM). fp16 "
-        "turns on the fp32 residual stream and fp32 adapter math (the fp16 fix "
-        "upstream ships as FP16_FIX='fp32_residual'): the 42-block residual "
-        "exceeds fp16's 65504 ceiling otherwise, and a loss scaler guards the "
-        "gradient underflow",
+        "needs an fp16_fix (the 42-block residual stream exceeds fp16's 65504 "
+        "ceiling) and a loss scaler guards the gradient underflow",
         choices=("auto", "bf16", "fp16"),
+        advanced=True,
+    )
+    fp16_fix: str = _f(
+        DEFAULT_FP16_FIX,
+        "how an fp16 DiT keeps the residual stream in range (ignored when the "
+        "compute dtype is bf16). online (default): the stream carries a scale c, "
+        "each block's two AdaLN gate rows carry c and every stream-reading "
+        "RMSNorm's eps carries c^2 (upstream FP16_FIX='online', c=1/16); the "
+        "weights are untouched, the math is exact, the stream stays 16-bit so the "
+        "fused kernels still run. fp32_residual: the stream is carried in fp32 "
+        "with fp16 matmuls (upstream FP16_FIX='fp32_residual'); cannot overflow "
+        "from magnitude, but the fused residual GEMM is skipped and the stream "
+        "costs 2x its bytes",
+        choices=FP16_FIXES,
+        advanced=True,
+    )
+    fp16_fix_c: float = _f(
+        DEFAULT_FP16_FIX_C,
+        "online: the residual stream's scale. c=1/16 leaves ~3.9e3 of headroom "
+        "from the base's ~6.2e4 peak (measured, docs/moss/README.md); lower is "
+        "safer and costs nothing but needs the same c at generate time",
         advanced=True,
     )
     targets: str = _f(TARGETS, "fullmatch regex over linear names", advanced=True)
@@ -614,6 +662,20 @@ class TuneSwapRequest(Request):
         "synthetic WxH:text_tokens instead of the cache (e.g. 1024x1024:300)",
     )
     model: str = _f("base", "which DiT to time", choices=VARIANTS)
+    precision: str = _f(
+        "auto",
+        "DiT compute dtype; must match the training run",
+        choices=("auto", "bf16", "fp16"),
+    )
+    fp16_fix: str = _f(
+        DEFAULT_FP16_FIX,
+        "fp16 residual-stream guard; must match the training run (the lane changes "
+        "the step's footprint)",
+        choices=FP16_FIXES,
+    )
+    fp16_fix_c: float = _f(
+        DEFAULT_FP16_FIX_C, "online: the stream scale", advanced=True
+    )
     rank: int = _f(32, "LoRA rank (the adapters and AdamW state take VRAM too)")
     swap_grid: str = _f(
         "8,12,16,20,24,28,32,36,40",

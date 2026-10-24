@@ -132,6 +132,9 @@ def test_fused_batched_matches_reference():
 @needs_cuda
 @torch.no_grad()
 def test_fused_per_sample_skip_matches_reference():
+    """A per-sample skip gathers the active rows; the segment ids the kernels read
+    must be gathered with them (one id per stream row), not indexed as if they were
+    still one row per sample."""
     model = _tiny("cuda", torch.bfloat16)
     x, e, mask = _inputs()
     x, e = x.cuda(), e.cuda()
@@ -139,6 +142,24 @@ def test_fused_per_sample_skip_matches_reference():
     ops.fuse(model)
     got = model.forward_batched(x, 500.0, e, mask, skip_layers=[(), (1,)])
     assert torch.allclose(got, want, atol=2e-2, rtol=2e-2)
+
+
+@needs_cuda
+def test_fused_seg_ids_follow_a_gathered_row_subset():
+    """The gathered subset's ``seg`` has one entry per stream row. Reading it as one
+    entry per sample is an out-of-bounds read in the norm kernel, so the shape is
+    the contract."""
+    from library.moss.model import _Fused
+
+    rows = torch.tensor([0], device="cuda")
+    ctx = _Fused(
+        pos=torch.zeros(2, 5, 4, device="cuda"),
+        bands=torch.ones(1, device="cuda"),
+        seg=torch.tensor([[0] * 5, [1] * 5], device="cuda"),
+    )
+    taken = ctx.take(rows)
+    assert taken.seg.shape == (5,)
+    assert taken.seg.eq(0).all()
 
 
 @needs_cuda

@@ -393,7 +393,13 @@ def train(
     kinds = {"plain": 0, "variant": 0, "empty": 0}
 
     compute = resolve_compute_dtype(req.precision, device)
-    transformer = load_transformer(req.model_dir, req.model, dtype=compute)
+    transformer = load_transformer(
+        req.model_dir,
+        req.model,
+        dtype=compute,
+        fp16_fix=req.fp16_fix,
+        fp16_fix_c=req.fp16_fix_c,
+    )
     transformer.requires_grad_(False)
     transformer.ref_timestep = req.ref_timestep if req.ref_timestep >= 0 else None
     transformer.ref_isolate = req.ref_isolate
@@ -422,15 +428,18 @@ def train(
     )
     patched = network.apply_to()
     network.to(device)
-    print(
-        f"precision {str(compute).removeprefix('torch.')}"
-        + (
-            " with the fp32 residual stream + fp32 adapter math"
-            if compute == torch.float16
-            else ""
-        ),
-        flush=True,
-    )
+    if compute == torch.float16:
+        fix = (
+            f"the stream fold c={req.fp16_fix_c:g} (online)"
+            if req.fp16_fix == "online"
+            else "the fp32 residual stream (fp32_residual)"
+        )
+        print(
+            f"precision fp16 with {fix} + fp32 adapter math",
+            flush=True,
+        )
+    else:
+        print(f"precision {str(compute).removeprefix('torch.')}", flush=True)
     detail = {
         "lora": f"{req.down_init} down"
         + (
@@ -549,7 +558,13 @@ def train(
         "plain_caption_rate": req.plain_caption_rate if n_plain else 0.0,
         "caption_variant_rate": req.caption_variant_rate if n_variant_samples else 0.0,
         "reference_latents": n_refs,
+        "precision": str(compute).removeprefix("torch."),
     }
+    if compute == torch.float16:
+        # A sample is only the trained model when the fix (and c) match.
+        meta["fp16_fix"] = req.fp16_fix
+        if req.fp16_fix == "online":
+            meta["fp16_fix_c"] = f"{req.fp16_fix_c:g}"
     if accum > 1:
         meta["grad_accum"] = accum
     if n_refs:

@@ -49,6 +49,23 @@ def ref_settings(path) -> tuple[float | None, bool]:
     )
 
 
+def train_settings(path) -> tuple[str | None, str | None, float | None]:
+    """``(precision, fp16_fix, fp16_fix_c)`` the LoRA was trained with (``None``
+    where the file does not say, i.e. a bf16 run or a file from before the
+    stamp). A sample is only the trained model when the lane matches: ``online``
+    with a different ``c`` is a different function."""
+    from safetensors import safe_open
+
+    with safe_open(str(path), framework="pt") as handle:
+        meta = handle.metadata() or {}
+    c = meta.get("fp16_fix_c")
+    return (
+        meta.get("precision"),
+        meta.get("fp16_fix"),
+        None if c is None else float(c),
+    )
+
+
 def load_for_inference(transformer, path, multiplier: float = 1.0) -> LoRANetwork:
     """``LoRANetwork.for_inference``, plus the reference settings the LoRA trained
     with (``ref_settings``) set on ``transformer``."""

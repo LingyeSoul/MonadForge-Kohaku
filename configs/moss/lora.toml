@@ -30,6 +30,8 @@ plain_caption_rate = 0.2       # layout_json cache: share of steps on the plain 
 caption_variant_rate = 0.0     # cache with embeds_v{k} (colorize probe): x (1 - plain_caption_rate) of steps
 lora_dtype = "bf16"            # bf16 | fp16 | fp32
 precision = "auto"             # auto | bf16 | fp16; auto = bf16 on sm80+, fp16 on V100/T4
+fp16_fix = "online"            # online | fp32_residual (fp16 only); online = stream scale c
+# fp16_fix_c = 0.0625          # online: the stream scale (1/16 of the base's ~6.2e4 peak)
 
 # Memory / speed (16 GB card). scripts/moss/tune_swap.py measures this machine's pair.
 blocks_to_swap = 12
