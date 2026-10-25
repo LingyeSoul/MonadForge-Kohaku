@@ -53,9 +53,13 @@ to no adaln. On the diffusion-pipe side:
 - Ecosystem LoRAs carry both `.1` and `.2` adaln LoRAs (both are Linears
   inside `Block`), plus the LLM adapter (`TransformerBlock` is in the target
   list) — more surface than our target set at equal rank.
-- Loading an ecosystem LoRA in-repo via `--lora_weight` drops its adaln +
-  LLM-adapter keys (different naming, excluded targets), so the same file
-  renders differently here and in ComfyUI.
+- Loading an ecosystem LoRA in-repo via `--lora_weight` rewrites the PEFT
+  spelling (`diffusion_model.` prefix, `lora_A`/`lora_B`, optional
+  `lora_A.default` adapter names) to the kohya layout
+  (`networks/lora_utils.py::convert_peft_lora_state_dict`) and then renames the
+  comfy adaln keys back to `adaln_up_{br}`, so its adaln and LLM-adapter rows
+  load rather than silently dropping. See `docs/structure/lora.md` §PEFT /
+  diffusion-pipe files load directly for the alpha contract.
 
 ## ComfyUI support
 

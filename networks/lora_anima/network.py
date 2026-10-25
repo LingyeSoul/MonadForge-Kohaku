@@ -1582,9 +1582,14 @@ class LoRANetwork(_NetworkMetricsMixin, torch.nn.Module):
         # rename them back or every adaln module lands in missing_keys and
         # silently trains from scratch. Mirrors factory.py. See adaln.md.
         from networks.lora_utils import (
+            convert_peft_lora_state_dict,
             has_comfy_adaln_keys,
             relayout_adaln_comfy_to_runtime,
         )
+
+        # PEFT / diffusion-pipe exports arrive as lora_A/lora_B under the
+        # checkpoint module paths; rewrite to kohya before the key probes below.
+        weights_sd = convert_peft_lora_state_dict(weights_sd, None)
 
         if has_comfy_adaln_keys(weights_sd):
             weights_sd = relayout_adaln_comfy_to_runtime(weights_sd)

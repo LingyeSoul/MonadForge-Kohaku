@@ -630,6 +630,17 @@ def create_network_from_weights(
             if isinstance(parsed_network_args, dict):
                 network_args_metadata = parsed_network_args
 
+    # PEFT / diffusion-pipe exports (``diffusion_model.*`` + ``lora_A``/``lora_B``)
+    # are rewritten to the kohya layout up front so every key scan below sees a
+    # single spelling; ``peft_alpha`` overrides a file without ``lora_alpha``.
+    from networks.lora_utils import convert_peft_lora_state_dict
+
+    _raw_peft_alpha = kwargs.get("peft_alpha")
+    weights_sd = convert_peft_lora_state_dict(
+        weights_sd,
+        float(_raw_peft_alpha) if _raw_peft_alpha not in (None, "") else None,
+    )
+
     # Canonical keys pass through; only old shortened MonadForge-Kohaku factor names
     # are rewritten to the official LyCORIS/ComfyUI layout.
     weights_sd = _normalize_native_lokr_keys(weights_sd)

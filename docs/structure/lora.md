@@ -130,6 +130,16 @@ This same key schema is why HydraLoRA's baked-down `anima_hydra.safetensors` (it
 
 Caveat: plain weight-patch LoRA only. HydraLoRA router-live inference (`hydralora.md`) writes extra keys (`router.*`, stacked `lora_ups.N.*`) that ComfyUI's stock loader silently drops — those variants need the Anima Adapter Loader custom node.
 
+### PEFT / diffusion-pipe files load directly
+
+The inverse direction is handled too: a PEFT export — `diffusion_model.*` module paths with `lora_A` / `lora_B` factors, optionally wrapped as `base_model.model.` and optionally carrying an adapter name (`lora_A.default.weight`) — is rewritten to the kohya layout on load (`networks/lora_utils.py::convert_peft_lora_state_dict`). Three boundaries call it: `factory.create_network_from_weights` (merge, warm start, kept-live inference), `LoRANetwork.load_weights` (resume), and the inference loaders in `library/inference/models.py`. No external `convert_lora` step is needed, and every downstream key scan sees one spelling.
+
+The scale is read from a per-module `lora_alpha` tensor when the file has one. Otherwise `peft_alpha` (a network arg, e.g. `--network_args peft_alpha=16`) wins; with neither, alpha defaults to the rank (scale 1.0, the LyCORIS `alpha == lora_dim` convention) and a warning names the modules. A *uniform* alpha/rank mismatch is compensable exactly with `--lora_multiplier <alpha/rank>`.
+
+Refused, not guessed: DoRA magnitude vectors (`lora_magnitude_vector` — the decompose renormalization is not reproducible here) and an `lora_B` without its `lora_A` (rank and alpha are unrecoverable). `modules_to_save` full weights are passed through untouched and simply don't attach.
+
+The converter rewrites keys only — it never invents identity. A 40-block base still refuses an unstamped export at `validate_adapter_compatibility` (inference and `make merge`); 28-block bases accept unstamped adapters.
+
 ### Merging into the DiT
 
 LoRA is a pure linear delta on `Linear`s, so it folds into the weight matrix losslessly:
