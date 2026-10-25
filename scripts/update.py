@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Update MonadForge-Kohaku from a GitHub release.
+"""Update MonadForge-Kohaku from GitHub.
 
-Downloads the release tarball from LingyeSoul/MonadForge-Kohaku, extracts it to a
-temp dir, then merges over the working tree using a 3-way reconciliation
+Resolves the newest published release tag, falling back to the head commit of
+``main`` when the repository has no releases (its state until the first tag
+ships), downloads that tarball from LingyeSoul/MonadForge-Kohaku, extracts it to
+a temp dir, then merges over the working tree using a 3-way reconciliation
 of (baseline / user / new) sha256 hashes:
 
   - Datasets, outputs, models, caches, .venv: never touched.
@@ -35,6 +37,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -56,6 +59,12 @@ for _stream in (sys.stdout, sys.stderr):
             pass
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+class UpdateSourceError(RuntimeError):
+    """GitHub could not supply an update target (missing ref, network, API)."""
+
+
 def _detect_windows_gpu_vendor() -> str | None:
     """Return 'nvidia' or 'amd' from the installed display adapters, or None."""
     try:
@@ -227,6 +236,7 @@ def _verify_windows_backend(backend: str) -> None:
 
 
 REPO = "LingyeSoul/MonadForge-Kohaku"
+API = f"https://api.github.com/repos/{REPO}"
 MANIFEST_FILE = ROOT / ".anima_release.json"
 BACKUP_ROOT = ROOT / ".anima-update-backups"
 
@@ -311,43 +321,137 @@ def _walk_tree(root: Path) -> Iterable[Path]:
             yield p
 
 
-def _resolve_release(version: str | None) -> tuple[str, str, str]:
-    """Return (label, tarball_url, body).
+def _github_headers() -> dict[str, str]:
+    """API headers; GITHUB_TOKEN/GH_TOKEN lifts the 60 requests/hour limit."""
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "anima-update",
+    }
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
-    version=None → latest tag, "main" → main branch tarball (no release body
-    available, returns ""). For tagged releases the GitHub API also returns
-    the release notes body, which we print before the confirmation prompt.
+
+def _github_json(url: str, *, missing_ok: bool) -> dict:
+    """GET one GitHub API object; ``{}`` when ``missing_ok`` and it is a 404.
+
+    Transient 5xx/network failures are retried twice with a warning; the last
+    error is raised so the CLI/GUI reports the real reason.
     """
-    if version == "main":
-        return ("main", f"https://github.com/{REPO}/archive/refs/heads/main.tar.gz", "")
+    attempts = 3
+    last_error = ""
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(url, headers=_github_headers())
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if missing_ok and e.code == 404:
+                return {}
+            last_error = f"GitHub API {url} returned {e.code} {e.reason}"
+            if e.code < 500 or attempt == attempts:
+                raise UpdateSourceError(last_error) from e
+        except urllib.error.URLError as e:
+            last_error = f"Could not reach GitHub: {e.reason}"
+            if attempt == attempts:
+                raise UpdateSourceError(last_error) from e
+        except ValueError as e:
+            raise UpdateSourceError(
+                f"GitHub API {url} returned invalid JSON: {e}"
+            ) from e
+        else:
+            if not isinstance(payload, dict):
+                raise UpdateSourceError(
+                    f"GitHub API {url} returned unexpected JSON (expected an object)"
+                )
+            return payload
+        print(f"  {last_error}; retrying ({attempt}/{attempts})")
+        time.sleep(attempt)
+    raise UpdateSourceError(last_error)
+
+
+def _release_target(
+    payload: dict, fallback_tag: str | None = None
+) -> tuple[str, str, str, str]:
+    """Return (tag, tarball_url, notes, "release") for a release payload."""
+    tag = payload.get("tag_name") or fallback_tag
+    if not tag:
+        raise UpdateSourceError("GitHub release payload has no tag_name")
+    body = (payload.get("body") or "").strip()
+    tarball = f"https://github.com/{REPO}/archive/refs/tags/{tag}.tar.gz"
+    return tag, tarball, body, "release"
+
+
+def _commit_target(query: str, label: str) -> tuple[str, str, str, str]:
+    """Return (label, tarball_url, notes, "commit") for a branch or commit sha."""
+    payload = _github_json(f"{API}/commits/{query}", missing_ok=False)
+    sha = payload.get("sha")
+    if not sha:
+        raise UpdateSourceError(f"GitHub returned no commit sha for {query!r}")
+    commit = payload.get("commit") or {}
+    message = (commit.get("message") or "").strip()
+    date = (commit.get("committer") or {}).get("date") or ""
+    header = f"Latest commit on {label} — {date}" if date else f"Latest commit on {label}"
+    body = f"{header}\n\n{message}" if message else header
+    short = sha[:7]
+    resolved = f"{label}@{short}" if label else short
+    return resolved, f"https://github.com/{REPO}/archive/{sha}.tar.gz", body, "commit"
+
+
+def _resolve_target(version: str | None) -> tuple[str, str, str, str]:
+    """Return (label, tarball_url, notes, kind).
+
+    version=None prefers the newest published release and falls back to the
+    ``main`` head commit when the repository has no releases. "main" pins that
+    head commit, a 7–40 char hex string pins that commit, and anything else
+    names a release tag (a bare tag without a release object still works).
+    """
     if version is None:
-        api = f"https://api.github.com/repos/{REPO}/releases/latest"
-    else:
-        api = f"https://api.github.com/repos/{REPO}/releases/tags/{version}"
-    req = urllib.request.Request(api, headers={"Accept": "application/vnd.github+json"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        sys.exit(f"GitHub API {api} returned {e.code} {e.reason}")
-    except urllib.error.URLError as e:
-        sys.exit(f"Could not reach GitHub: {e.reason}")
-    tag = data["tag_name"]
-    body = (data.get("body") or "").strip()
-    return tag, f"https://github.com/{REPO}/archive/refs/tags/{tag}.tar.gz", body
+        release = _github_json(f"{API}/releases/latest", missing_ok=True)
+        return _release_target(release) if release else _commit_target("main", "main")
+    if version == "main":
+        return _commit_target("main", "main")
+    if re.fullmatch(r"[0-9a-fA-F]{7,40}", version):
+        return _commit_target(version.lower(), "")
+    release = _github_json(f"{API}/releases/tags/{version}", missing_ok=True)
+    if release:
+        return _release_target(release, fallback_tag=version)
+    if _github_json(f"{API}/git/ref/tags/{version}", missing_ok=True):
+        return (
+            version,
+            f"https://github.com/{REPO}/archive/refs/tags/{version}.tar.gz",
+            "",
+            "release",
+        )
+    raise UpdateSourceError(
+        f"{REPO} has no release, tag, or commit named {version!r}; "
+        f"see https://github.com/{REPO}/tags or pass --version main"
+    )
 
 
-def _print_release_notes(tag: str, body: str) -> None:
+def _update_id(label: str | None) -> str | None:
+    """Comparable identity of a version label (``main@abc1234`` → ``abc1234``)."""
+    if not label:
+        return None
+    return label.rsplit("@", 1)[1] if "@" in label else label
+
+
+def _print_update_notes(label: str, body: str, kind: str) -> None:
     rule = "─" * 64
+    if kind == "release":
+        heading = f"Release notes — {label}"
+    else:
+        heading = f"Latest commit — {label}"
     print()
     print(rule)
-    print(f"  Release notes — {tag}")
+    print(f"  {heading}")
     print(rule)
     if body:
         for line in body.splitlines():
             print(f"  {line}" if line else "")
     else:
-        print("  (release has no description)")
+        print("  (no description)")
     print(rule)
 
 
@@ -374,10 +478,27 @@ def _confirm_update(from_tag: str | None, to_tag: str) -> bool:
 
 
 def _download(url: str, dest: Path) -> None:
-    print(f"  downloading {url}")
-    req = urllib.request.Request(url, headers={"User-Agent": "anima-update"})
-    with urllib.request.urlopen(req, timeout=300) as resp, dest.open("wb") as f:
-        shutil.copyfileobj(resp, f, length=1 << 20)
+    """Download ``url`` to ``dest``, retrying transient network failures.
+
+    codeload.github.com intermittently answers 502 on large archives; each
+    attempt reopens ``dest`` with "wb", so a partial file is never kept.
+    """
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        suffix = f" (attempt {attempt}/{attempts})" if attempt > 1 else ""
+        print(f"  downloading {url}{suffix}")
+        req = urllib.request.Request(url, headers={"User-Agent": "anima-update"})
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp, dest.open(
+                "wb"
+            ) as f:
+                shutil.copyfileobj(resp, f, length=1 << 20)
+            return
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt == attempts:
+                raise UpdateSourceError(f"could not download {url}: {e}") from e
+            print(f"  download failed ({e}); retrying")
+            time.sleep(attempt)
 
 
 def _skip_links_filter(member, path):
@@ -424,6 +545,39 @@ def _save_manifest(version: str, files: dict[str, str]) -> None:
     )
 
 
+def _git_head_sha() -> str | None:
+    """Short HEAD of the checkout; None for tarball installs without ``.git``."""
+    if not (ROOT / ".git").exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "--short=7", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() or None
+
+
+def describe_installed() -> dict:
+    """Installed build from the update baseline, else the checkout's HEAD."""
+    version, _hashes = _load_baseline()
+    if version:
+        return {"label": version, "sha": _update_id(version)}
+    sha = _git_head_sha()
+    return {"label": f"git@{sha}" if sha else None, "sha": sha}
+
+
+def describe_available() -> dict:
+    """Newest GitHub target the updater would install right now."""
+    label, _tarball_url, body, kind = _resolve_target(None)
+    detail = next((line.strip() for line in body.splitlines() if line.strip()), "")
+    return {"label": label, "sha": _update_id(label), "kind": kind, "detail": detail}
+
+
 def _print_diff(user: Path, new: Path, rel: str) -> None:
     try:
         a = user.read_text().splitlines()
@@ -443,26 +597,33 @@ def _print_diff(user: Path, new: Path, rel: str) -> None:
     print(out or "    (files differ but unified diff is empty)")
 
 
+def _conflict_hint(rel: str) -> str:
+    return (
+        f"\nconflict: {rel} (you modified it AND upstream changed it)\n"
+        "  stdin is not interactive — cannot prompt. Re-run with one of:\n"
+        "    --keep-conflicts   keep all your modified configs as-is\n"
+        "    --yes-overwrite    back up your configs, then overwrite with upstream"
+    )
+
+
 def _prompt_conflict(rel: str, user_path: Path, new_path: Path) -> str:
     """Return action: 'keep' | 'overwrite' | 'backup'."""
     # Without a real TTY (e.g. the GUI's QProcess), input() would block forever
     # on stdin nobody can write to — bail with an actionable message instead.
     if not sys.stdin.isatty():
-        sys.exit(
-            f"\nconflict: {rel} (you modified it AND upstream changed it)\n"
-            "  stdin is not a terminal — cannot prompt. Re-run with one of:\n"
-            "    --keep-conflicts   keep all your modified configs as-is\n"
-            "    --yes-overwrite    back up your configs, then overwrite with upstream"
-        )
+        sys.exit(_conflict_hint(rel))
     while True:
-        choice = (
-            input(
-                f"\n  conflict: {rel} (you modified it AND upstream changed it)\n"
-                f"    [k]eep yours / [o]verwrite with new / [b]ackup yours then overwrite / [d]iff: "
+        try:
+            choice = (
+                input(
+                    f"\n  conflict: {rel} (you modified it AND upstream changed it)\n"
+                    f"    [k]eep yours / [o]verwrite with new / [b]ackup yours then overwrite / [d]iff: "
+                )
+                .strip()
+                .lower()
             )
-            .strip()
-            .lower()
-        )
+        except EOFError:
+            sys.exit(_conflict_hint(rel))
         if choice in ("k", "keep"):
             return "keep"
         if choice in ("o", "overwrite"):
@@ -487,7 +648,7 @@ def seed_manifest(version: str | None) -> int:
     the walk in shell. Run before `uv sync` so `.venv` doesn't exist yet.
     """
     if version is None:
-        version, _, _ = _resolve_release(None)
+        version, _url, _body, _kind = _resolve_target(None)
     hashes: dict[str, str] = {}
     for p in _walk_tree(ROOT):
         rel = p.relative_to(ROOT).as_posix()
@@ -510,8 +671,8 @@ def update(
     if yes_overwrite and keep_conflicts:
         sys.exit("--yes-overwrite and --keep-conflicts are mutually exclusive")
     print(f"MonadForge-Kohaku update — repo {REPO}")
-    tag, tarball_url, body = _resolve_release(version)
-    print(f"  target: {tag}")
+    tag, tarball_url, body, kind = _resolve_target(version)
+    print(f"  target: {tag} ({kind})")
 
     baseline_version, baseline_hashes = _load_baseline()
     if baseline_version:
@@ -519,14 +680,14 @@ def update(
     else:
         print("  no baseline manifest — first run; conflicts will be prompted")
 
-    if version is None and baseline_version == tag:
+    if version is None and _update_id(baseline_version) == _update_id(tag):
         print(f"already on {tag}; nothing to do")
         return 0
 
-    # Show release notes. Skip for branch tarballs (no body) and the GUI path
-    # (--yes already showed them in the update dialog).
-    if version != "main" and not assume_yes:
-        _print_release_notes(tag, body)
+    # Show the release notes / commit message; the GUI passes --yes because
+    # its own dialog replaced this prompt.
+    if not assume_yes:
+        _print_update_notes(tag, body, kind)
 
     if not dry_run and not assume_yes and not _confirm_update(baseline_version, tag):
         return 0
@@ -783,7 +944,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Update MonadForge-Kohaku from GitHub release")
     ap.add_argument(
         "--version",
-        help='Tag to install (e.g. "v1.0"). Default: latest release. Use "main" for the main branch tarball.',
+        help="Release tag, branch, or commit sha to install. Default: the "
+        "newest release tag, falling back to the latest commit on main.",
     )
     ap.add_argument(
         "--dry-run",
@@ -818,16 +980,19 @@ def main() -> int:
         "used by the bootstrap installer. Records --version, else resolves latest tag.",
     )
     args = ap.parse_args()
-    if args.seed_manifest:
-        return seed_manifest(args.version)
-    return update(
-        version=args.version,
-        dry_run=args.dry_run,
-        yes_overwrite=args.yes_overwrite,
-        keep_conflicts=args.keep_conflicts,
-        no_sync=args.no_sync,
-        assume_yes=args.yes,
-    )
+    try:
+        if args.seed_manifest:
+            return seed_manifest(args.version)
+        return update(
+            version=args.version,
+            dry_run=args.dry_run,
+            yes_overwrite=args.yes_overwrite,
+            keep_conflicts=args.keep_conflicts,
+            no_sync=args.no_sync,
+            assume_yes=args.yes,
+        )
+    except UpdateSourceError as exc:
+        sys.exit(str(exc))
 
 
 if __name__ == "__main__":

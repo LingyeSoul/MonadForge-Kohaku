@@ -299,7 +299,7 @@ These carry routing and token insertion rather than a plain weight delta, so the
 
 ## 11. Updating
 
-Run this inside the install folder to pull the latest GitHub release and sync dependencies (no git required).
+Run this inside the install folder to pull the newest GitHub release tag (or the latest commit on `main` when no release exists) and sync dependencies (no git required).
 
 ```bash
 python tasks.py update              # Apply

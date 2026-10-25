@@ -100,8 +100,9 @@ def cmd_test_unit(extra):
 
 
 def cmd_update(extra):
-    """Update anima_lora from a GitHub release (preserves datasets/output/models;
-    prompts on configs/methods/ + configs/gui-methods/ conflicts; runs uv sync)."""
+    """Update anima_lora from the newest GitHub release tag, falling back to the
+    latest commit on main (preserves datasets/output/models; prompts on
+    configs/methods/ + configs/gui-methods/ conflicts; runs uv sync)."""
     run([PY, "scripts/update.py", *extra])
 
 

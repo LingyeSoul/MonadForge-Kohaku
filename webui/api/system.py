@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from library.config.model_paths import (
@@ -24,6 +24,43 @@ def get_runtimes():
     from library.runtime.profiles import list_runtime_profiles
 
     return {"runtimes": list_runtime_profiles(ROOT / "configs")}
+
+
+# ── Update status ──────────────────────────────────────────────
+
+
+@router.get("/update-status")
+def get_update_status(remote: bool = False):
+    """Installed build plus, with ``remote=true``, the newest GitHub target.
+
+    ``remote`` stays opt-in: the System page renders the installed label on
+    mount, and only the check button spends a GitHub API request.
+    """
+    from scripts.update import (
+        REPO,
+        UpdateSourceError,
+        describe_available,
+        describe_installed,
+    )
+
+    installed = describe_installed()
+    payload = {
+        "repo": REPO,
+        "installed": installed,
+        "available": None,
+        "up_to_date": None,
+    }
+    if not remote:
+        return payload
+    try:
+        available = describe_available()
+    except UpdateSourceError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    payload["available"] = available
+    payload["up_to_date"] = (
+        installed["sha"] is not None and installed["sha"] == available["sha"]
+    )
+    return payload
 
 
 # Model groups — the anima group reads the effective model config; every other

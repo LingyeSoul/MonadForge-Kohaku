@@ -422,8 +422,9 @@ COMMANDS = {
     ),
     "update": (
         utilities.cmd_update,
-        "Update from GitHub release (preserves datasets/output/models, prompts on "
-        "config conflicts, runs uv sync). Pass --dry-run / --version v1.0 / --no-sync.",
+        "Update from the newest GitHub release tag or main's latest commit "
+        "(preserves datasets/output/models, prompts on config conflicts, runs "
+        "uv sync). Pass --dry-run / --version <tag|sha|main> / --no-sync.",
     ),
     "vendor-sync": (
         utilities.cmd_vendor_sync,

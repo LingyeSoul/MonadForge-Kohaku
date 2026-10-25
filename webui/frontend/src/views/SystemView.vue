@@ -117,9 +117,16 @@
           </v-card-title>
           <v-card-text>
             <div class="text-body-2 mb-3">{{ t('sysUpdateDesc') }}</div>
-            <v-btn color="primary" block :loading="isRunning('update')" @click="showUpdateDlg = true">
-              {{ t('sysUpdateBtn') }}
-            </v-btn>
+            <v-list density="compact" class="mb-2">
+              <v-list-item :title="t('sysUpdateCurrent')" :subtitle="installedLabel || t('sysUpdateUnknown')" />
+              <v-list-item v-if="availableLabel" :title="t('sysUpdateAvailable')" :subtitle="availableLabel" />
+            </v-list>
+            <v-alert v-if="updateCheckError" type="error" variant="tonal" density="compact" class="mb-2">{{ updateCheckError }}</v-alert>
+            <v-alert v-else-if="updateChecked && updateStatus?.up_to_date" type="success" variant="tonal" density="compact" class="mb-2">{{ t('sysUpdateUpToDate') }}</v-alert>
+            <div class="d-flex ga-2">
+              <v-btn variant="outlined" :loading="updateChecking" @click="checkUpdates">{{ t('sysUpdateCheck') }}</v-btn>
+              <v-btn color="primary" :loading="isRunning('update')" @click="showUpdateDlg = true">{{ t('sysUpdateBtn') }}</v-btn>
+            </div>
           </v-card-text>
         </v-card>
       </v-col>
@@ -520,6 +527,55 @@ function confirmBrowser() {
   }
 }
 
+// ── Update status ─────────────────────────────────────────────
+
+interface UpdateTarget {
+  label: string | null
+  sha: string | null
+  kind?: string | null
+  detail?: string
+}
+
+interface UpdateStatus {
+  repo: string
+  installed: UpdateTarget
+  available: UpdateTarget | null
+  up_to_date: boolean | null
+}
+
+const updateStatus = ref<UpdateStatus | null>(null)
+const updateChecking = ref(false)
+const updateChecked = ref(false)
+const updateCheckError = ref('')
+
+const installedLabel = computed(() => updateStatus.value?.installed.label ?? '')
+const availableLabel = computed(() => {
+  const available = updateStatus.value?.available
+  if (!available?.label) return ''
+  return available.detail ? `${available.label} — ${available.detail}` : available.label
+})
+
+async function loadUpdateStatus(remote: boolean): Promise<void> {
+  const res = await fetch(`/api/system/update-status?remote=${remote}`)
+  const data = await res.json().catch(() => null)
+  if (!res.ok) throw new Error(data?.detail || `HTTP ${res.status}`)
+  updateStatus.value = data as UpdateStatus
+  if (remote) updateChecked.value = true
+}
+
+async function checkUpdates() {
+  if (updateChecking.value) return
+  updateChecking.value = true
+  updateCheckError.value = ''
+  try {
+    await loadUpdateStatus(true)
+  } catch (cause) {
+    updateCheckError.value = cause instanceof Error ? cause.message : String(cause)
+  } finally {
+    updateChecking.value = false
+  }
+}
+
 // ── Update dialog ──────────────────────────────────────────────
 
 const showUpdateDlg = ref(false)
@@ -529,7 +585,9 @@ const updateConflictPolicy = ref('keep')
 async function runUpdate() {
   const args: string[] = []
   if (updateDryRun.value) args.push('--dry-run')
-  if (updateConflictPolicy.value === 'overwrite') args.push('--yes-overwrite')
+  // stdin is never a TTY under the daemon, so a conflict without one of these
+  // flags kills the task instead of asking — always pick the chosen policy.
+  args.push(updateConflictPolicy.value === 'overwrite' ? '--yes-overwrite' : '--keep-conflicts')
   showUpdateDlg.value = false
   await runTask('update', args)
 }
@@ -566,6 +624,9 @@ onMounted(() => {
   window.addEventListener('beforeunload', beforeUnload)
   loadSystem()
   refreshTasks()
+  loadUpdateStatus(false).catch(cause => {
+    updateCheckError.value = cause instanceof Error ? cause.message : String(cause)
+  })
 })
 onBeforeUnmount(() => { Object.values(validateTimers).forEach(clearTimeout); browserRequest++; discardResolve?.(false); window.removeEventListener('beforeunload', beforeUnload) })
 </script>

@@ -524,7 +524,7 @@ These variants cannot be loaded through ComfyUI's default LoraLoader (because th
 ## 12. Updating
 
 ```bash
-make update              # Download latest version from GitHub release, apply, and auto-run uv sync
+make update              # Newest release tag (or the latest commit on main), then apply and auto-run uv sync
 make update -- --dry-run # Preview which files would be changed
 ```
 
