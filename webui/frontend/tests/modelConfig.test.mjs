@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { BASIC_GROUP_ID, groupModelConfigFields, modelAlgorithmItems, modelActionValues, modelFieldActive } from '../src/utils/modelConfig.ts'
+import { BASIC_GROUP_ID, groupModelConfigFields, modelAlgorithmItems, modelActionValues, modelFieldActive, modelFieldType, modelPathKind, modelPathExtensions, modelSubBlocks } from '../src/utils/modelConfig.ts'
 
 // Mirrors one field of the backend schema: `group` comes from
 // `library.lines.requests.field_group`, `advanced` from the request metadata.
@@ -33,24 +33,42 @@ test('basic fields open the page while advanced fields use the backend section',
   }
   const groups = groupModelConfigFields(schema, { train: { algo: 'lokr', compile: true, grad_checkpointing: false, blocks_to_swap: null } })
   // Panels follow the Anima order; `basic` always leads.
-  assert.deepEqual(groups.map(group => group.id), [BASIC_GROUP_ID, 'training', 'performance', 'paths', 'architecture', 'other'])
+  assert.deepEqual(groups.map(group => group.id), [BASIC_GROUP_ID, 'training', 'performance', 'paths', 'architecture', 'generate'])
   const grouped = Object.fromEntries(groups.map(group => [group.id, group.sections.map(({ section, fields }) =>
     [section, fields.map(field => field.name)])]))
-  // Everything not marked advanced — whatever section it belongs to — opens the page.
+  // Basic *training* fields open the page; the generate section keeps one panel of
+  // its own whether a knob is advanced or not, so sampling knobs never mix into
+  // the training cards.
   assert.deepEqual(grouped.basic, [
     ['train', ['cache', 'output', 'epochs', 'max_steps', 'lr', 'warmup_ratio', 'rank', 'alpha']],
-    ['generate', ['prompt', 'steps', 'seed', 'out_dir']],
   ])
   assert.deepEqual(grouped.training, [['train', ['logit_mean']]])
-  assert.deepEqual(grouped.performance, [['train', ['blocks_to_swap', 'grad_checkpointing', 'compile']], ['generate', ['spectrum', 'spectrum_w']]])
+  assert.deepEqual(grouped.performance, [['train', ['blocks_to_swap', 'grad_checkpointing', 'compile']]])
+  assert.deepEqual(grouped.generate, [['generate', ['prompt', 'steps', 'seed', 'out_dir', 'example', 'spectrum', 'spectrum_w']]])
   // `down_init` is lora-only and the draft selects lokr, so it stays stored but unrendered.
   assert.deepEqual(grouped.architecture, [['train', ['targets', 'factor']]])
-  assert.deepEqual(grouped.other, [['generate', ['example']]])
+  assert.equal(grouped.other, undefined)
   // Model paths stay in their own panel even though the section is advanced.
   assert.deepEqual(grouped.paths, [
     ['models', ['model_dir', 'dit', 'text_encoder', 'vae', 'processor', 'scheduler']],
   ])
-  assert.equal(entries(groups).length, 12 + 1 + 5 + 6 + 2 + 1)
+  assert.equal(entries(groups).length, 8 + 1 + 3 + 6 + 2 + 7)
+})
+
+test('a closed set of choices renders as a select, never as a path picker', () => {
+  // MOSS's `text_encoder` is an int8 / fp8 / bf16 precision; Qwen's is a shard
+  // folder. Rendering the MOSS one as a path let an empty value reach the API.
+  const mossPrecision = field('text_encoder', 'int8', ['int8', 'fp8', 'bf16'])
+  assert.equal(modelFieldType(mossPrecision), 'select')
+  assert.equal(modelPathKind(mossPrecision), undefined)
+
+  const qwenShards = field('text_encoder', '')
+  assert.equal(modelFieldType(qwenShards), 'path')
+  assert.equal(modelPathKind(qwenShards), 'either')
+
+  assert.equal(modelFieldType(field('src', '')), 'path')
+  assert.equal(modelFieldType(field('prompt', '')), 'str')
+  assert.equal(modelFieldType(field('rank', 32, [], { kind: 'int' })), 'int')
 })
 
 test('a section the backend adds later renders under its own name', () => {
@@ -83,7 +101,7 @@ test('future fields remain visible while irrelevant algorithm fields stay stored
   const rows = entries(groups)
   // Only the future fields render: `factor` is gated on the lokr algorithm and
   // `down_init` on lora, so neither earns a panel in the loha fixture.
-  assert.deepEqual(groups.map(group => group.id), [BASIC_GROUP_ID])
+  assert.deepEqual(groups.map(group => group.id), [BASIC_GROUP_ID, 'generate'])
   assert.equal(rows.find(row => row.group === BASIC_GROUP_ID).field, future)
   assert.equal(rows.find(row => row.section === 'generate').field, generate)
   assert.equal(rows.some(row => row.field.name === 'factor'), false)
@@ -217,4 +235,140 @@ test('the MOSS tune section renders in its own panel, not under training', () =>
   assert.deepEqual(groups.find(group => group.id === 'tune').sections, [
     { section: 'tune', fields: [swapGrid] },
   ])
+})
+
+// Mirrors the live MOSS schema: only `model_dir` is a model field, so it is the
+// sole train row routed to the models section; every other row stays in its phase.
+function mossSchema() {
+  const advanced = (values, group, options = {}) => names(values, { group, advanced: true, ...options })
+  return {
+    model_field_names: ['model_dir'],
+    cache: names('src overwrite'),
+    train: [
+      ...names('cache output model dit rank alpha lr batch_size'),
+      ...names('epochs', { value: '8' }),
+      ...names('grad_checkpointing', { value: false }),
+      ...names('algo', { value: 'lora' }),
+      ...advanced('max_steps', 'Training'),
+      ...advanced('factor down_init svd_slice svd_slice_count channel_scaling_alpha channel_stats dc_isolate channel_mean ref_timestep ref_isolate repa_weight repa_layer repa_pe_root lora_dtype targets', 'Architecture'),
+      ...advanced('optimizer warmup_ratio grad_accum save_every_epochs caption_dropout plain_caption_rate caption_variant_rate sigma_mu sigma_s sigma_cutoff max_grad_norm log_every seed', 'Training'),
+      ...advanced('sigma_uniform', 'Training', { value: 0.01 }),
+      ...advanced('token_batch precision fp16_fix fp16_fix_c activation_memory_budget blocks_to_swap fit_report expandable_segments', 'Performance'),
+      ...advanced('compile', 'Performance', { value: true }),
+      ...advanced('model_dir resume', 'Paths'),
+    ],
+    generate: [
+      ...names('prompt negative_prompt prompt_format width height steps sampler uncond_skip seed out_dir ref_image ref_scale ref_vision prompts_file example batched vae_dtype vae_compile vae shift decode_only dave dave_strength dave_tau lora_multiplier'),
+      ...names('model dit quant precision fp16_fix fp16_fix_c text_encoder lora', { value: 'styles/moss.safetensors' }),
+      ...names('cfg', { value: 3 }),
+      ...names('spectrum', { value: true }),
+      ...advanced('compile spectrum_window_size spectrum_flex_window spectrum_warmup spectrum_stop_caching_step spectrum_w spectrum_m spectrum_lam', 'Performance'),
+      ...names('model_dir', { group: 'Paths', advanced: true }),
+    ],
+    tune: [
+      ...names('cache sizes model dit precision fp16_fix fp16_fix_c rank compile batch_size token_batch swap_grid patience margin_gb tolerance reference budget_step warmup steps output seed'),
+      ...names('model_dir', { group: 'Paths', advanced: true }),
+    ],
+  }
+}
+const enabledMoss = {
+  train: { batch_size: 8, down_init: 'weight_svd', channel_scaling_alpha: 0.5, dc_isolate: true, repa_weight: 1, precision: 'fp16', fp16_fix: 'online' },
+  generate: { ref_image: 'ref.png', dave: 'auto', precision: 'fp16', fp16_fix: 'online' },
+  tune: { batch_size: 8, precision: 'fp16', fp16_fix: 'online' },
+}
+const panel = (groups, id, section = 'train') => groups.find(group => group.id === id).sections.find(entry => entry.section === section)
+const blockIds = (panelId, fields) => modelSubBlocks(panelId, fields).map(block => [block.id, block.titleKey, block.fields.length])
+
+test('the MOSS schema renders every field once and the generate wall split by meaning', () => {
+  const groups = groupModelConfigFields(mossSchema(), enabledMoss, 'moss')
+  const ids = [BASIC_GROUP_ID, 'training', 'performance', 'paths', 'architecture', 'generate', 'tune']
+  assert.deepEqual(groups.map(group => group.id), ids)
+  const section = { [BASIC_GROUP_ID]: 'train', generate: 'generate', tune: 'tune' }
+  const count = id => panel(groups, id, section[id] ?? 'train').fields.length
+  assert.deepEqual(ids.map(count), [10, 15, 9, 1, 14, 43, 21])
+  assert.deepEqual(blockIds('generate', panel(groups, 'generate', 'generate').fields), [
+    ['prompt', 'cfgSubPrompt', 5], ['sampling', 'cfgSubSampling', 9],
+    ['reference', 'cfgSubReferenceImage', 3], ['dave', 'cfgSubDave', 3],
+    ['model', 'cfgSubModel', 8], ['decode', 'cfgSubDecode', 4],
+    ['spectrum', 'cfgSubSpectrum', 8], ['output', 'cfgSubOutput', 1], ['performance', 'cfgGroupPerformance', 2],
+  ])
+  // 118 schema rows -> 114 rendered: the algo selector owns `algo`, generate/tune
+  // `model_dir` stay in the models section only, and `factor` is gated off for lora.
+  const rendered = groups.flatMap(group => group.sections.flatMap(section => section.fields))
+  assert.equal(rendered.length, 114)
+  const keys = groups.flatMap(group => group.sections.flatMap(section => section.fields.map(field => `${section.section}.${field.name}`)))
+  assert.equal(new Set(keys).size, keys.length)
+  for (const group of groups.filter(entry => entry.id !== BASIC_GROUP_ID)) {
+    for (const section of group.sections) {
+      const blocks = modelSubBlocks(group.id, section.fields)
+      const names = blocks.flatMap(block => block.fields.map(field => field.name))
+      assert.equal(names.length, section.fields.length)
+      assert.deepEqual([...names].sort(), section.fields.map(field => field.name).sort())
+    }
+  }
+})
+
+test('advanced panels render semantic sub-blocks in a deterministic order', () => {
+  const groups = groupModelConfigFields(mossSchema(), enabledMoss, 'moss')
+  const section = { generate: 'generate', paths: 'models', tune: 'tune' }
+  const blocks = (id, name = section[id] ?? 'train') => blockIds(id, panel(groups, id, name).fields)
+  assert.deepEqual(blocks('training'), [
+    ['schedule', 'cfgSubSchedule', 8], ['caption', 'cfgSubCaption', 3], ['sigma', 'cfgSubSigma', 4],
+  ])
+  assert.deepEqual(blocks('performance'), [
+    ['memory', 'cfgSubMemory', 5], ['compile', 'cfgSubCompile', 1], ['precision', 'cfgSubPrecision', 3],
+  ])
+  assert.deepEqual(blocks('architecture'), [
+    ['adapter', 'cfgSubAdapter', 5], ['channel', 'cfgSubChannel', 4], ['reference', 'cfgSubReference', 5],
+  ])
+  assert.deepEqual(blocks('paths', 'models'), [['paths', '', 1]])
+  assert.deepEqual(blocks('tune', 'tune'), [
+    ['model', 'cfgSubModel', 4], ['workload', 'cfgSubWorkload', 4],
+    ['performance', 'cfgGroupPerformance', 4], ['sweep', 'cfgSubSweep', 8], ['output', 'cfgSubOutput', 1],
+  ])
+  // Unmatched future knobs trail in the rest block instead of disappearing.
+  const [future, prompt] = [field('future_knob'), field('prompt')]
+  assert.deepEqual(blockIds('generate', [future, prompt]), [
+    ['prompt', 'cfgSubPrompt', 1], ['performance', 'cfgGroupPerformance', 1],
+  ])
+})
+
+test('MOSS adapter gates clear incompatible action values without changing the profile', () => {
+  const fields = [field('svd_slice', 0), field('svd_slice_count', 0), field('channel_scaling_alpha', 0.5), field('channel_stats', 'default-stats'), field('dc_isolate', true), field('channel_mean', 'default-mean')]
+  for (const algo of ['lokr', 'loha']) {
+    const saved = { algo, down_init: 'weight_svd', svd_slice: 2, svd_slice_count: 4, channel_scaling_alpha: 1, channel_stats: 'custom-stats', dc_isolate: true, channel_mean: 'custom-mean' }
+    const before = structuredClone(saved)
+    for (const field of fields) assert.equal(modelFieldActive('moss', 'train', field.name, saved), false)
+    const payload = modelActionValues('moss', 'train', fields, saved)
+    assert.equal(payload.svd_slice, 0)
+    assert.equal(payload.svd_slice_count, 0)
+    assert.deepEqual(saved, before)
+  }
+  for (const name of ['svd_slice', 'svd_slice_count']) {
+    assert.equal(modelFieldActive('moss', 'train', name, { algo: 'lora', down_init: 'kaiming' }), false)
+    assert.equal(modelFieldActive('moss', 'train', name, { algo: 'lora', down_init: 'weight_svd' }), true)
+  }
+  assert.equal(modelFieldActive('moss', 'train', 'channel_stats', { channel_scaling_alpha: 0 }), false)
+  assert.equal(modelFieldActive('moss', 'train', 'channel_mean', { dc_isolate: false }), false)
+})
+
+test('MOSS dependent controls follow their own phase values and decoding retains VAE overrides', () => {
+  for (const phase of ['train', 'tune']) {
+    assert.equal(modelFieldActive('moss', phase, 'token_batch', { batch_size: 1 }), false)
+    assert.equal(modelFieldActive('moss', phase, 'token_batch', { batch_size: 4 }), true)
+  }
+  assert.equal(modelFieldActive('moss', 'generate', 'dave_tau', { dave: '' }), false)
+  assert.equal(modelFieldActive('moss', 'generate', 'ref_scale', { ref_image: '' }), false)
+  assert.equal(modelFieldActive('moss', 'generate', 'fp16_fix_c', { precision: 'bf16', fp16_fix: 'online' }), false)
+  const values = { decode_only: true, vae: 'custom.safetensors', vae_dtype: 'fp32', vae_compile: true, prompt: 'unused' }
+  const fields = [field('vae', ''), field('vae_dtype', 'auto'), field('vae_compile', false), field('prompt', '')]
+  const payload = modelActionValues('moss', 'generate', fields, values)
+  assert.deepEqual(payload, { ...values, prompt: '' })
+  assert.equal(modelFieldActive('moss', 'generate', 'fp16_fix_c', { ...values, precision: 'fp16', fp16_fix: 'online' }), false)
+})
+
+test('file filters use the phase instead of sharing the training output extension', () => {
+  assert.equal(modelPathExtensions('moss', 'train', 'output'), '.safetensors')
+  assert.equal(modelPathExtensions('moss', 'tune', 'output'), '.json')
+  assert.equal(modelPathExtensions('moss', 'train', 'resume'), '.pt')
 })

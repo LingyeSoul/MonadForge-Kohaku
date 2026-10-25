@@ -49,6 +49,22 @@ def test_build_entrypoints_use_clean_ignore_scripts_install():
     assert '"--ignore-scripts"' in checker
 
 
+def test_linux_launcher_builds_frontend_when_dist_is_missing():
+    """Startup must not open a tab that 404s: build dist/ before launching."""
+    launcher = (ROOT / "start-webui-linux.sh").read_text(encoding="utf-8")
+    assert "webui/frontend/dist/index.html" in launcher
+    assert "ensure_npm_deps.mjs" in launcher
+    assert "npm run build" in launcher
+
+
+def test_lock_checker_allows_locked_tarball_hosts_on_npm_12():
+    """npm >= 12 refuses URL tarballs unless allow-remote is raised."""
+    checker = ROOT / "scripts" / "webui" / "ensure_npm_deps.mjs"
+    source = checker.read_text(encoding="utf-8")
+    assert "--allow-remote=all" in source
+    assert "npmMajorVersion" in source
+
+
 def test_lock_checker_enforces_keyv_alias_and_native_probe_boundaries():
     checker = (ROOT / "scripts" / "webui" / "ensure_npm_deps.mjs").read_text(
         encoding="utf-8"

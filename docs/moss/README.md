@@ -209,6 +209,27 @@ instead of requiring `vae/`. The DiT and text encoder still come from `--dit` /
   report (per-step loss) lands beside the LoRA.
 - **`--fit_report`** (off): trains the largest sample (longest caption) at step 1 and
   reports its peak against free VRAM, with a `--blocks_to_swap` suggestion.
+- **Run report**: `python tasks.py moss-report [--progress <file> --log <file>]` (or
+  `--json`) reads a live or finished run without touching it -- moving-average loss,
+  loss deciles, throughput, peak VRAM, epoch cadence, ETA, checkpoints and samples, plus
+  an anomaly scan (rising loss, stall, dead pid, OOM / NaN / grad spikes in the log).
+  It needs nothing but the two files, so it also works on a run whose trainer is already
+  gone. Add `--checkpoint <lora.safetensors>` to validate the saved adapter from its
+  safetensors header alone (base model, rank, per-module `alpha`, dtype lane, block
+  coverage against `ss_num_blocks`, and the per-block target matrix -- 42 x 6 = 252
+  modules for the default targets) -- no torch, no GPU, no weight load.
+- **Kernel warm-up**: `python tasks.py moss-prewarm --from-cache` times the vendored
+  Triton/tilelang kernels on the dataset's real token lengths before training so the
+  first steps reuse those tables (`--dry-run` prints the plan without CUDA). On the
+  fp16 lane and on sm70 most of that plan is not consulted -- read the payoff note in
+  `docs/moss/kernels.md` before expecting a speedup.
+- **Finishing a run**: the trainer writes `<output>.safetensors` and a `<output>.json`
+  summary at the end (no per-epoch file with `--save_every_epochs 0`). Check it with one
+  stdlib command -- `python tasks.py moss-report --progress <stream> --log <trainer log>
+  --checkpoint <output>.safetensors` -- which prints the run digest plus a `## Checkpoint`
+  block (7 checks; a bad head ends `exit 2`). Measured on the 105-image V100 run: warm-up
+  cost is zero there (first step 6.53 s, median 6.53 s over 1200 steps), so the kernel
+  prewarm above is a no-op for the fp16/SDPA lane.
 - **Caption dropout** (`--caption_dropout`, default 0): keep 0. On caststation 0.05 and 0.1
   weakened the style under CFG, because the uncond prediction picks up the style and CFG
   cancels part of it (`_archive/moss_lora/caption_dropout.md`).

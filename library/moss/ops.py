@@ -85,7 +85,7 @@ def describe(device, dtype: torch.dtype) -> dict[str, str]:
     return out
 
 
-def fuse(model) -> int:
+def fuse(model, *, fp32_adapters: bool = False) -> int:
     """Switch ``model.layers`` to the fused branch; returns how many blocks took it.
 
     The four block ops are resolved for the model's *compute* dtype and, on the
@@ -95,10 +95,23 @@ def fuse(model) -> int:
     ``linear_gated_residual`` has a split path for exactly that case. So the lane
     keeps ``rms_norm_mod`` / ``qk_norm_rope`` / ``situ_glu`` and only the
     residual GEMM degrades to ``linear + residual kernel``.
+
+    ``fp32_adapters``: the trainer's fp16-safe lane, where every adapter merge
+    returns fp32 (``merge_adapter_delta(preserve_fp32=True)``). The block ops are
+    16-bit, so a projection's fp32 output cannot feed the next 16-bit GEMM; the
+    reference branch casts at each boundary, the fused block does not. Decline
+    rather than mix dtypes inside the kernels.
     """
     device = next(model.parameters(), torch.empty(0)).device
     dtype = next(model.parameters()).dtype
     if not available(device) or dtype not in _DTYPES:
+        return 0
+    if fp32_adapters and dtype == torch.float16:
+        logger.info(
+            "fused MOSS kernels off: the fp16 lane runs adapter merges in fp32, "
+            "whose outputs the 16-bit fused ops cannot consume (the reference "
+            "branch casts at those boundaries)"
+        )
         return 0
     stream = torch.float32 if getattr(model, "fp32_residual", False) else dtype
     registry = _registry()

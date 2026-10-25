@@ -146,7 +146,7 @@ const props = defineProps<{ field: FieldMeta; modelValue?: string }>()
 const emit = defineEmits<{ update: [value: string]; 'help-click': [key: string] }>()
 const configStore = useConfigStore()
 const { t } = useI18n()
-const browserTitle = computed(() => t(props.field.path_kind === 'directory' ? 'cfSelectDirectory' : props.field.path_kind === 'either' ? 'cfSelectPath' : 'cfSelectModel'))
+const browserTitle = computed(() => t(props.field.path_kind === 'directory' ? 'cfSelectDirectory' : props.field.path_kind === 'either' ? 'cfSelectPath' : props.field.path_extensions && props.field.path_extensions !== '.safetensors' ? 'cfSelectFile' : 'cfSelectModel'))
 
 const currentValue = computed(() => props.modelValue !== undefined ? props.modelValue : configStore.getFieldValue(props.field.key) as string)
 

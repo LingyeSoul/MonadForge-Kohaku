@@ -98,7 +98,7 @@ import { useI18n } from '../composables/useI18n'
 import { useActiveModelWorkspace } from '../stores/qwenWorkspace'
 import { useAppStore } from '../stores/app'
 import { useNotifyStore } from '../stores/notify'
-import { modelFieldLabel, mossText } from '../i18n/modelWorkspace'
+import { modelFieldLabel, modelFieldReference, mossText } from '../i18n/modelWorkspace'
 import { preprocessText } from '../i18n/preprocess'
 import { useTaskStore } from '../stores/task'
 import { isModelField, type QwenField, type Values } from '../utils/qwen21'
@@ -128,7 +128,8 @@ const saved = computed(() => qwen.value.saved ? JSON.parse(qwen.value.saved) : n
 const fieldsDirty = (entries: QwenField[]) => entries.some(field => qwen.value.draft?.cache[field.name] !== saved.value?.cache[field.name])
 const pathsDirty = computed(() => fieldsDirty(pathFields.value) || qwen.value.draft?.train.cache !== saved.value?.train.cache)
 const settingsDirty = computed(() => fieldsDirty(settingsFields.value))
-const help = computed(() => Object.fromEntries(fields.value.map(field => [`cache.${field.name}`, `${modelFieldLabel(qwen.value.family, app.language, field.name, t(`qwenField_${field.name}`))}\n${field.help}`])))
+const help = computed(() => Object.fromEntries(fields.value.map(field => [`cache.${field.name}`,
+  modelFieldReference(qwen.value.family, app.language, 'cache', field, modelFieldLabel(qwen.value.family, app.language, field.name, t(`qwenField_${field.name}`), 'cache'))])))
 const cacheHint = computed(() => qwen.value.family === 'moss' ? mossText(app.language, 'cacheHint') : t('qwenCacheHint'))
 const guide = computed(() => `<p>${cacheHint.value}</p><p>${qwen.value.family === 'moss' ? mossText(app.language, 'cacheIsolation') : t('qwCacheIsolation')}</p><p>${qwen.value.family === 'moss' ? mossText(app.language, 'sourcesHint') : t('qwenSourcesHint')}</p>`)
 const tasks = computed(() => taskStore.tasks.filter(task => [`${qwen.value.family}-cache`, `${qwen.value.family}-cache-train`].includes(task.command)))

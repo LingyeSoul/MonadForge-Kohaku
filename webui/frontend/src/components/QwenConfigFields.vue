@@ -3,26 +3,21 @@
   <v-progress-linear v-if="qwen.loading" indeterminate />
   <ConfigWorkspaceLayout v-if="qwen.draft && qwen.schema" v-model:search="search" v-model:show-guide="showHelp"
     :field-count="fieldCount" filterable search-test-id="qwen-field-search" help-test-id="qwen-help-toggle">
-    <v-card v-if="basicGroup" class="mb-4 config-section" variant="flat">
-      <v-card-title class="text-subtitle-1">
-        <v-icon icon="mdi-tune" class="mr-2" />
-        {{ t(basicGroup.titleKey) }}
-        <v-chip size="x-small" class="ml-2" variant="outlined">{{ basicFieldCount }}</v-chip>
-      </v-card-title>
-      <v-card-text>
-        <QwenFields v-for="section in basicGroup.sections" :key="`basic-${section.section}`" :section="section.section" :fields="section.fields" @help="openHelp" />
-      </v-card-text>
-    </v-card>
-    <v-expansion-panels v-if="panelGroups.length" :model-value="searching ? panelGroups.map(group => group.id) : expandedGroups"
+    <v-expansion-panels v-if="groups.length" :model-value="expandedGroups"
       multiple variant="accordion" @update:model-value="onExpandedGroups">
-      <v-expansion-panel v-for="group in panelGroups" :key="group.id" :value="group.id" :data-testid="`model-config-group-${group.id}`">
+      <v-expansion-panel v-for="group in groups" :key="group.id" :value="group.id" :data-testid="`model-config-group-${group.id}`">
         <v-expansion-panel-title>
-          <v-icon icon="mdi-cog-outline" class="mr-2" size="small" />
+          <v-icon :icon="group.id === BASIC_GROUP_ID ? 'mdi-tune' : 'mdi-cog-outline'" class="mr-2" size="small" />
           {{ t(group.titleKey) }}
           <v-chip size="x-small" class="ml-2" variant="outlined">{{ group.sections.reduce((n, section) => n + section.fields.length, 0) }}</v-chip>
         </v-expansion-panel-title>
         <v-expansion-panel-text>
-          <QwenFields v-for="section in group.sections" :key="section.section" :section="section.section" :fields="section.fields" @help="openHelp" />
+          <template v-for="section in group.sections" :key="section.section">
+            <template v-for="block in visibleBlocks(group.id, section.section, section.fields)" :key="`${section.section}-${block.id}`">
+              <h3 v-if="block.titleKey" class="model-subblock-title">{{ t(block.titleKey) }}</h3>
+              <QwenFields :section="section.section" :fields="block.fields" @help="openHelp" />
+            </template>
+          </template>
           <template v-if="group.id === 'paths'">
             <v-btn data-testid="qwen-resolve" size="small" variant="text" class="mt-3" @click="inspectPaths">{{ t('qwenResolve') }}</v-btn>
             <dl v-if="paths" class="qwen-paths text-caption"><template v-for="(path, name) in paths" :key="name"><dt>{{ name }}</dt><dd>{{ path }}</dd></template></dl>
@@ -50,12 +45,13 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue'
 import { useI18n } from '../composables/useI18n'
-import { useActiveModelWorkspace } from '../stores/qwenWorkspace'
+import { useActiveModelWorkspace, type QwenSection } from '../stores/qwenWorkspace'
 import { useAppStore } from '../stores/app'
-import { modelFieldLabel, mossText } from '../i18n/modelWorkspace'
-import { requestJson, resolvedPaths } from '../utils/qwen21'
+import { modelFieldHelp, modelFieldLabel, modelFieldReference, mossText } from '../i18n/modelWorkspace'
+import { requestJson, resolvedPaths, type QwenField } from '../utils/qwen21'
 import { matchesConfigSearch } from '../utils/configSearch'
-import { BASIC_GROUP_ID, groupModelConfigFields } from '../utils/modelConfig'
+import { BASIC_GROUP_ID, groupModelConfigFields, modelFieldActive, modelSectionValues, modelSubBlocks, type ModelConfigSubBlock } from '../utils/modelConfig'
+import { useModelConfigExpansion } from '../composables/useModelConfigExpansion'
 import ConfigWorkspaceLayout from './ConfigWorkspaceLayout.vue'
 import HelpPanel from './HelpPanel.vue'
 import QwenFields from './QwenFields.vue'
@@ -65,23 +61,24 @@ const app = useAppStore()
 const { t } = useI18n()
 const search = ref<string | null>('')
 const showHelp = ref(true)
-const expandedGroups = ref<string[]>([])
-const searching = computed(() => Boolean(search.value?.trim()))
 const helpPanel = ref<InstanceType<typeof HelpPanel> | null>(null)
 const paths = ref<Record<string, string> | null>(null)
 const allGroups = computed(() => groupModelConfigFields(qwen.value.schema, qwen.value.draft, qwen.value.family))
-const fieldLabel = (name: string) => modelFieldLabel(qwen.value.family, app.language, name, t(`qwenField_${name}`))
+const fieldLabel = (section: string, name: string) => modelFieldLabel(qwen.value.family, qwen.value.family === 'moss' ? 'cn' : app.language, name, t(`qwenField_${name}`), section)
+const fieldHelp = (section: string, name: string, fallback: string) => modelFieldHelp(qwen.value.family, qwen.value.family === 'moss' ? 'cn' : app.language, name, fallback, section)
 const groups = computed(() => allGroups.value.map(group => ({ ...group, sections: group.sections.map(section => ({ ...section,
-  fields: section.fields.filter(field => matchesConfigSearch({ key: field.name, description: field.help }, search.value, [fieldLabel(field.name)])),
+  fields: section.fields.filter(field => matchesConfigSearch({ key: field.name, description: `${field.help} ${fieldHelp(section.section, field.name, '')}` }, search.value, [fieldLabel(section.section, field.name), modelFieldLabel(qwen.value.family, 'en', field.name, '', section.section)])),
 })).filter(section => section.fields.length) })).filter(group => group.sections.length))
-const basicGroup = computed(() => groups.value.find(group => group.id === BASIC_GROUP_ID))
-const panelGroups = computed(() => groups.value.filter(group => group.id !== BASIC_GROUP_ID))
-const basicFieldCount = computed(() => basicGroup.value?.sections.reduce((n, section) => n + section.fields.length, 0) ?? 0)
+const { expandedGroups, onExpandedGroups } = useModelConfigExpansion(search, computed(() => groups.value.map(group => group.id)))
 const fieldCount = computed(() => groups.value.reduce((total, group) => total + group.sections.reduce((n, section) => n + section.fields.length, 0), 0))
-const help = computed(() => Object.fromEntries(allGroups.value.flatMap(group => group.sections.flatMap(section => section.fields.map(field => [`${section.section}.${field.name}`, `${fieldLabel(field.name)}\n${field.help}`])))))
-const guide = computed(() => (qwen.value.family === 'moss' ? [mossText(app.language, 'sourcesHint'), mossText(app.language, 'autoHint'), mossText(app.language, 'generateHint'), mossText(app.language, 'unsupported'), t('qwResultIsolation')] : [t('qwenSourcesHint'), t('qwenAutoHint'), t('qwenGenerateHint'), t('qwUnsupported'), t('qwResultIsolation')]).map(text => `<p>${text}</p>`).join(''))
-function onExpandedGroups(value: unknown): void {
-  if (!searching.value && Array.isArray(value)) expandedGroups.value = value.map(String)
+const help = computed(() => Object.fromEntries(allGroups.value.flatMap(group => group.sections.flatMap(section => section.fields.map(field => [`${section.section}.${field.name}`, modelFieldReference(qwen.value.family, app.language, section.section, field, fieldLabel(section.section, field.name))])))))
+const guide = computed(() => (qwen.value.family === 'moss' ? [mossText(app.language, 'fieldReference'), mossText(app.language, 'sourcesHint'), mossText(app.language, 'autoHint'), mossText(app.language, 'generateHint'), mossText(app.language, 'unsupported'), t('qwResultIsolation')] : [t('qwenSourcesHint'), t('qwenAutoHint'), t('qwenGenerateHint'), t('qwUnsupported'), t('qwResultIsolation')]).map(text => `<p>${text}</p>`).join(''))
+/** A panel is split into labelled blocks; the active-field gate runs here so a
+ *  block whose knobs all collapse together (decode_only, spectrum off) leaves no
+ *  orphan heading behind. */
+function visibleBlocks(panel: string, section: QwenSection, fields: QwenField[]): ModelConfigSubBlock[] {
+  const values = modelSectionValues(qwen.value.schema, qwen.value.draft, section)
+  return modelSubBlocks(panel, fields.filter(field => modelFieldActive(qwen.value.family, section, field.name, values)))
 }
 async function openHelp(key: string): Promise<void> {
   showHelp.value = true
@@ -91,15 +88,22 @@ async function openHelp(key: string): Promise<void> {
 async function inspectPaths(): Promise<void> {
   const selected = qwen.value
   await selected.perform(async () => {
-    const result = resolvedPaths(await requestJson(`${selected.apiRoot}/resolve`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: { ...selected.draft?.train, ...selected.draft?.models } }) }), selected.family)
-    if (qwen.value === selected) paths.value = result
+    // MOSS keeps the VAE override out of the training request; send it so the
+    // panel shows the single file the cache/generate jobs will actually load.
+    const values = { ...selected.draft?.train, ...selected.draft?.models, ...(selected.family === 'moss' ? { vae: selected.draft?.cache?.vae ?? '' } : {}) }
+    const draft = selected.draft
+    const result = resolvedPaths(await requestJson(`${selected.apiRoot}/resolve`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values }) }), selected.family)
+    if (qwen.value === selected && selected.draft === draft) paths.value = result
   })
 }
-watch(() => [qwen.value.draft?.models, qwen.value.draft?.train.model], () => { paths.value = null }, { deep: true })
+watch(() => [qwen.value.profile, qwen.value.draft?.models, qwen.value.draft?.train, qwen.value.draft?.cache?.vae], () => { paths.value = null }, { deep: true })
 </script>
 
 <style scoped>
 .config-secondary-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding-block: 12px; border-top: 1px solid var(--border-subtle); }
+.model-subblock-title { display: flex; align-items: center; gap: 8px; margin: 16px 0 4px; font-size: var(--fs-caption); font-weight: 600; color: var(--text-secondary); }
+.model-subblock-title::after { content: ''; flex: 1; height: 1px; background: var(--border-subtle); }
+.model-subblock-title:first-of-type { margin-top: 0; }
 .qwen-paths { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 12px; font-family: var(--font-mono); }
 .qwen-paths dd { margin: 0; overflow-wrap: anywhere; }
 @media (max-width: 600px) { .qwen-paths { grid-template-columns: 1fr; } }

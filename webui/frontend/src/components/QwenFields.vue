@@ -1,6 +1,6 @@
 <template>
   <v-row class="model-fields">
-    <v-col v-for="field in visibleFields" :key="field.name" cols="12" :sm="field.multiline || section === 'models' ? 12 : 6">
+    <v-col v-for="field in visibleFields" :key="`${qwen.family}/${qwen.profile}/${section}/${field.name}`" cols="12" :sm="field.multiline || section === 'models' ? 12 : 6">
       <ConfigField :field="metadata(field)" :model-value="qwen.draft?.[section]?.[field.name]"
         @update="qwen.update(section, field.name, $event as Scalar)" @help-click="emit('help', `${section}.${field.name}`)" />
     </v-col>
@@ -13,10 +13,10 @@ import ConfigField from './ConfigField.vue'
 import { useI18n } from '../composables/useI18n'
 import { useActiveModelWorkspace, type QwenSection } from '../stores/qwenWorkspace'
 import { useAppStore } from '../stores/app'
-import { modelFieldLabel } from '../i18n/modelWorkspace'
+import { modelInputLabel } from '../i18n/modelWorkspace'
 import type { FieldMeta } from '../stores/config'
 import type { QwenField, Scalar } from '../utils/qwen21'
-import { modelFieldActive, modelSectionValues } from '../utils/modelConfig'
+import { modelFieldActive, modelFieldType, modelPathKind, modelPathExtensions, modelSectionValues } from '../utils/modelConfig'
 
 const props = defineProps<{ section: QwenSection; fields: QwenField[] }>()
 const emit = defineEmits<{ help: [key: string] }>()
@@ -26,19 +26,15 @@ const { t } = useI18n()
 const visibleFields = computed(() => props.fields.filter(field => modelFieldActive(
   qwen.value.family, props.section, field.name, modelSectionValues(qwen.value.schema, qwen.value.draft, props.section),
 )))
-const pathKinds: Record<string, 'file' | 'directory' | 'either'> = {
-  model_dir: 'directory', dit: 'either', text_encoder: 'either', vae: 'either', processor: 'directory', scheduler: 'either',
-  src: 'directory', cache: 'directory', out: 'directory', out_dir: 'directory', output: 'file', lora: 'file', prompts_file: 'file',
-}
 function metadata(field: QwenField): FieldMeta {
-  const path = pathKinds[field.name]
+  const path = modelPathKind(field)
   return {
-    key: `${props.section}.${field.name}`, label: modelFieldLabel(qwen.value.family, app.language, field.name, t(`qwenField_${field.name}`)),
+    key: `${props.section}.${field.name}`, label: modelInputLabel(qwen.value.family, app.language, field.name, t(`qwenField_${field.name}`), props.section),
     value: qwen.value.draft?.[props.section]?.[field.name], default_value: field.value,
-    field_type: path ? 'path' : field.choices.length ? 'select' : field.kind,
+    field_type: modelFieldType(field),
     description: field.nullable ? t('qwenAuto') : '', origin: 'method', group: props.section,
-    is_virtual: false, read_only: qwen.value.busy, options: field.choices, nullable: field.nullable,
-    path_kind: path, path_extensions: field.name === 'scheduler' ? '.json' : field.name === 'prompts_file' ? '.txt' : '.safetensors',
+    is_virtual: false, read_only: qwen.value.busy || qwen.value.loading, options: field.choices, nullable: field.nullable,
+    path_kind: path, path_extensions: modelPathExtensions(qwen.value.family, props.section, field.name),
     multiline: field.multiline,
   }
 }

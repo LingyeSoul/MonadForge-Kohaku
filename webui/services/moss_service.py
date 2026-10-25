@@ -79,7 +79,7 @@ def read_schema(model_fields: frozenset[str]) -> FormSchema:
                 ("generate", GenerateRequest),
                 ("tune", TuneSwapRequest),
             )
-        }
+        },
     )
 
 
@@ -103,6 +103,10 @@ def text_encoder_path(base: Path, precision: str) -> Path:
 
 
 def resolve_values(values: dict[str, Scalar]) -> ResolvedPaths:
+    # The panel posts the training form; the cache/generate `vae` override rides
+    # along for display only, so it is peeled off before TrainRequest validation.
+    values = dict(values)
+    vae = str(values.pop("vae", "") or "")
     req = request_from_values(TrainRequest, values)
     root = resolve_model_dir(req.model_dir)
     base = variant_dir(req.model_dir, "base")
@@ -116,11 +120,7 @@ def resolve_values(values: dict[str, Scalar]) -> ResolvedPaths:
         text_encoder=str(
             text_encoder_path(base, getattr(req, "text_encoder", DEFAULT_TEXT_ENCODER))
         ),
-        vae=str(
-            resolve_under_home(req.vae)
-            if getattr(req, "vae", "")
-            else base / "vae"
-        ),
+        vae=str(resolve_under_home(vae) if vae else base / "vae"),
         tokenizer=str(base / "tokenizer"),
     )
 
@@ -151,6 +151,87 @@ def require_component(path: Path, label: str) -> None:
     if not (path / "config.json").is_file():
         raise FileNotFoundError(f"{label} config.json not found: {path}")
     check_component_headers(path)
+
+
+def require_tokenizer(path: Path) -> None:
+    """The Qwen3.5 tokenizer, including the chat template the pipeline needs.
+
+    ``prompt_ids`` formats every prompt with ``add_generation_prompt=True,
+    enable_thinking=True``, which fails at run time when the folder only holds
+    ``tokenizer.json`` + ``tokenizer_config.json`` (ComfyUI ships exactly that:
+    transformers keeps the template in ``chat_template.jinja``).
+    """
+    require_directory(path, "MOSS tokenizer")
+    config = path / "tokenizer_config.json"
+    if not config.is_file():
+        raise FileNotFoundError(f"MOSS tokenizer config.json not found: {path}")
+    if (path / "chat_template.jinja").is_file():
+        return
+    if '"chat_template"' in config.read_text(encoding="utf-8"):
+        return
+    raise ValueError(
+        f"MOSS tokenizer has no chat template: {path} "
+        "(the Base pack ships chat_template.jinja; fetch it from "
+        "OpenMOSS-Team/MOSS-Image-Base/tokenizer/)"
+    )
+
+
+def quantized_te_file(precision: str) -> Path:
+    """The single quantised TE file the worker's loader reads (catalog row)."""
+    from library import downloads
+
+    names = {"int8": downloads.MOSS_TE_INT8_FILE, "fp8": downloads.MOSS_TE_FP8_FILE}
+    try:
+        return downloads.by_id()[f"moss_te_{precision}"].dest / names[precision]
+    except KeyError as exc:
+        raise ValueError(f"Unknown MOSS text encoder precision: {precision}") from exc
+
+
+def require_text_encoder(base: Path, precision: str) -> Path:
+    """Resolve and preflight the Qwen3.5-9B text encoder for ``precision``.
+
+    ``bf16`` is Base's unquantised shard folder and goes through the generic
+    component check. ``int8`` / ``fp8`` — the shipped default — are one
+    quantised file, which that check rejects on purpose (the Qwen line only
+    loads bf16), so their header is validated here instead: the MOSS
+    ``language_model.*`` namespace, one ``comfy_quant`` per quantised linear
+    with its ``weight_scale``, and the ``config.json`` the loader builds the
+    model from.
+    """
+    if precision == "bf16":
+        path = base / "text_encoder"
+        require_component(path, "MOSS text encoder")
+        return path
+    path = quantized_te_file(precision)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"MOSS text encoder file not found: {path} "
+            f"(fetch it with `make download-model ARGS=moss-te-{precision}`)"
+        )
+    if not (path.parent / "config.json").is_file():
+        raise FileNotFoundError(
+            f"MOSS text encoder config.json not found: {path.parent}"
+        )
+    header = read_header(path)
+    if not any(key.startswith("language_model.") for key in header.tensors):
+        raise ValueError(
+            f"MOSS text encoder must use the language_model.* namespace: {path}"
+        )
+    quantized = {
+        key[: -len(".comfy_quant")]
+        for key in header.tensors
+        if key.endswith(".comfy_quant")
+    }
+    if not quantized:
+        raise ValueError(f"MOSS text encoder is not quantised: {path}")
+    missing = sorted(
+        key for key in quantized if f"{key}.weight_scale" not in header.tensors
+    )
+    if missing:
+        raise ValueError(
+            f"MOSS text encoder is missing weight_scale for {missing[:3]}: {path}"
+        )
+    return path
 
 
 _DIT_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "transformer.")
@@ -233,10 +314,8 @@ def validate_paths(req) -> None:
         require_directory(resolve_under_home(req.src), "Image source")
         output_path(req.out)
         if not req.skip_text:
-            require_component(
-                text_encoder_path(base, req.text_encoder), "MOSS text encoder"
-            )
-            require_directory(base / "tokenizer", "MOSS tokenizer")
+            require_text_encoder(base, req.text_encoder)
+            require_tokenizer(base / "tokenizer")
         if not req.skip_latents:
             if req.vae:
                 require_vae_file(resolve_under_home(req.vae), "MOSS VAE")
@@ -266,10 +345,8 @@ def validate_paths(req) -> None:
                     variant_dir(req.model_dir, req.model) / "transformer",
                     "MOSS transformer",
                 )
-            require_component(
-                text_encoder_path(base, req.text_encoder), "MOSS text encoder"
-            )
-            require_directory(base / "tokenizer", "MOSS tokenizer")
+            require_text_encoder(base, req.text_encoder)
+            require_tokenizer(base / "tokenizer")
         for value in (req.lora, req.prompts_file, *req.example.split(",")):
             if value and not resolve_under_home(value.strip()).is_file():
                 raise FileNotFoundError(f"MOSS input file not found: {value}")

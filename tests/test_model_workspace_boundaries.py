@@ -193,6 +193,29 @@ def test_profile_round_trip_preserves_nullable_auto_values_and_ignores_legacy_fi
     assert "retired_field" not in restored.train
 
 
+@pytest.mark.parametrize(
+    ("workspace", "section", "field", "default"),
+    [
+        (qwen21_workspace, "train", "algo", "lora"),
+        (moss_workspace, "cache", "text_encoder", "int8"),
+    ],
+)
+def test_blank_choice_restores_the_default_instead_of_bricking_the_profile(
+    tmp_path, monkeypatch, workspace, section, field, default
+):
+    """A cleared dropdown must not turn the whole profile into a 400."""
+    monkeypatch.setattr(workspace, "resolve_under_home", lambda value: tmp_path / value)
+    profile = workspace.read_profile("default")
+    getattr(profile, section)[field] = ""
+    normalized = workspace.save_profile("copy", profile)
+    assert getattr(normalized, section)[field] == default
+    assert getattr(workspace.read_profile("copy"), section)[field] == default
+
+    getattr(profile, section)[field] = "not-a-choice"
+    with pytest.raises(ValueError, match="not-a-choice"):
+        workspace.save_profile("copy", profile)
+
+
 @pytest.mark.parametrize("svc", [qwen21_service, moss_service])
 def test_browser_output_paths_cannot_escape_model_root(tmp_path, monkeypatch, svc):
     monkeypatch.setattr(svc, "resolve_under_home", lambda value: tmp_path / value)

@@ -81,7 +81,7 @@
       :items="workspacePickerItems" :variant="Boolean(workspaceMethod)" :disabled="toolbarBusy"
       :create-label="workspaceMethod ? t('cfgNewVariant') : undefined" :empty-text="t('cfgSelectHint')"
       @select="chooseWorkspaceConfiguration" @create="openWorkspaceVariant" />
-    <QwenConfigFields v-if="!isAnima && workspaceReady" :key="workspace.family" />
+    <QwenConfigFields v-if="!isAnima && workspaceReady" :key="`${workspace.family}/${qwen.profile}`" />
     <template v-if="isAnima">
     <!-- WandB Tracking Panel -->
     <v-expansion-panels v-if="selectedVariant" v-model="wandbPanel" class="mb-4 config-tracking" variant="accordion">
@@ -533,6 +533,8 @@ const workspacePickerItems = computed(() => workspaceMethod.value ? workspaceVar
 const modelPresetLabel = computed(() => qwen.value.family === 'moss' ? mossText(appStore.language, 'hardware') : t('qwAutomaticHardware'))
 
 async function applyWorkspaceChange(change: WorkspaceChange): Promise<void> {
+  qwenCacheDialog.value = false
+  cacheProblem.value = ''
   if (change.kind === 'leave') {
     change.resolve(true)
   } else if (change.kind === 'profile') {
@@ -661,38 +663,42 @@ async function openQwenTask(taskId: string): Promise<void> {
   await router.push({ path: '/tasks', query: { task: taskId } })
 }
 async function startQwenTraining(): Promise<void> {
+  const selected = qwen.value
   if (!workspaceReady.value || toolbarBusy.value) return
   lineLaunching.value = 'train'
-  try { await qwen.value.perform(async () => {
-    if (qwen.value.dirty) await qwen.value.save()
-    const status = await qwen.value.preflight()
+  try { await selected.perform(async () => {
+    if (selected.dirty) await selected.save()
+    const status = await selected.preflight()
     if (!status.ready) {
       cacheProblem.value = [status.directory, ...status.errors, t('qwCacheSummary', { pairs: status.pairs, text: status.missing_text, latents: status.missing_latents })].join('\n')
       qwenCacheDialog.value = true
       return
     }
-    await openQwenTask(await qwen.value.submit('train', {}))
+    await openQwenTask(await selected.submit('train', {}))
   }) } finally { lineLaunching.value = null }
 }
 async function startQwenTest(): Promise<void> {
+  const selected = qwen.value
   if (!workspaceReady.value || toolbarBusy.value) return
   lineLaunching.value = 'test'
-  try { await qwen.value.perform(async () => {
-    if (qwen.value.dirty) await qwen.value.save()
-    await openQwenTask(await qwen.value.submit('generate', {}))
+  try { await selected.perform(async () => {
+    if (selected.dirty) await selected.save()
+    await openQwenTask(await selected.submit('generate', {}))
   }) } finally { lineLaunching.value = null }
 }
 async function startQwenTune(): Promise<void> {
+  const selected = qwen.value
   if (!workspaceReady.value || toolbarBusy.value) return
   lineLaunching.value = 'tune'
-  try { await qwen.value.perform(async () => {
-    if (qwen.value.dirty) await qwen.value.save()
-    await openQwenTask(await qwen.value.submit('tune', {}))
+  try { await selected.perform(async () => {
+    if (selected.dirty) await selected.save()
+    await openQwenTask(await selected.submit('tune', {}))
   }) } finally { lineLaunching.value = null }
 }
 async function chainQwenTraining(): Promise<void> {
-  await qwen.value.perform(async () => {
-    const id = await qwen.value.chain()
+  const selected = qwen.value
+  await selected.perform(async () => {
+    const id = await selected.chain()
     qwenCacheDialog.value = false
     await openQwenTask(id)
   })

@@ -34,3 +34,13 @@ def cmd_tune(extra: list[str]) -> None:
 def cmd_cache_train(extra: list[str]) -> None:
     """Cache then train in one daemon job; cache failure prevents training."""
     _run_job("moss-cache-train", "scripts.moss.workflow", extra)
+
+
+def cmd_prewarm(extra: list[str]) -> None:
+    """Tune the vendored MOSS kernels on the cache's real token lengths; --dry-run lists the plan."""
+    _run_job("moss-prewarm", "scripts.moss.prewarm_kernels", extra)
+
+
+def cmd_report(extra: list[str]) -> None:
+    """Summarize a MOSS run from its progress.jsonl plus trainer log."""
+    _run_job("moss-report", "scripts.moss.train_report", extra)

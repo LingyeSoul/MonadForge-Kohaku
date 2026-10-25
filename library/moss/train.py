@@ -736,7 +736,7 @@ def train(
             f"on {len(repa_targets)}/{len(samples)} samples",
             flush=True,
         )
-    fused = fuse(transformer)
+    fused = fuse(transformer, fp32_adapters=getattr(network, "fp32_compute", False))
     if fused:
         print(f"[kernels] fused block ops on {fused} blocks", flush=True)
     if req.compile:

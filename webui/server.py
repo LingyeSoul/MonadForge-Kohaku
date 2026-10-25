@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -36,6 +37,8 @@ from webui.services.task_service import task_service
 
 _DIST_DIR = Path(__file__).parent / "frontend" / "dist"
 _INDEX_HTML = _DIST_DIR / "index.html"
+
+logger = logging.getLogger("webui")
 
 
 _ALLOWED_ORIGINS = [
@@ -223,5 +226,12 @@ def create_app(dev: bool = False) -> FastAPI:
             ]
         )
         app.mount("/", spa_app)
+    else:
+        logger.warning(
+            "frontend build missing (%s) — serving /api/* only; every page load "
+            "will return 404. Build it with ./build-webui-win.bat, "
+            "./setup-linux.sh, or (cd webui/frontend && npm install && npm run build).",
+            _DIST_DIR,
+        )
 
     return app

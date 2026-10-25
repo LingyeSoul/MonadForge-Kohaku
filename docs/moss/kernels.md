@@ -21,11 +21,29 @@ branch) when any of these holds:
   (`gated_residual` takes the stream dtype apart from the projection's) and the fused
   residual GEMM takes its split path. `enable_stream_scale()` (the default `online`
   lane) keeps the stream 16-bit, so every kernel runs normally;
-- one of the four ops has no kernel or `torch.compile` candidate on this arch.
+- one of the four ops has no kernel or `torch.compile` candidate on this arch;
+- the run is on the **fp16 lane with fp32 adapter math** (`--precision fp16`: every
+  adapter merge returns fp32, and the 16-bit block ops cannot consume an fp32
+  projection output — the reference branch casts at those boundaries, the fused
+  block does not). Training and tuning pass `fp32_adapters=` so this declines
+  instead of failing inside the first GEMM.
+
+Compilation is gated on a probe. `compile_blocks` first runs the real
+`rms_norm_mod` plus a projection under `torch.compile` and compares the result
+with the eager one. Dynamo derives a Triton kernel's mutated-argument list by
+generating TTIR from example arguments, where a runtime scalar (a norm `eps`)
+arrives as a Python `float`; the vendored kernels call `eps.to(tl.float32)`, so on
+a torch/triton pair that hands scalars through untraced dynamo only *warns*,
+assumes every input is mutated, and the graph then feeds a fp32 buffer to the fp16
+projection (`expected mat1 and mat2 to have the same dtype ... float != c10::Half`)
+on the first step. When the probe fails, compiling is skipped with one warning and
+the fused kernels run eagerly; the reference branch, which has no Triton kernel to
+trace, always compiles. `moss-tune` exposes the same switch as `--no-compile`.
 
 | Variable | Default | Effect |
 |---|---|---|
 | `MONADFORGE_MOSS_KERNELS` | `1` | `0` forces the reference branch |
+| `MONADFORGE_MOSS_COMPILE_PROBE` | `1` | `0` compiles fused blocks without testing that dynamo can run them |
 | `MONADFORGE_MOSS_TEXT_KERNELS` | `1` | `0` keeps HF's Qwen3.5 text forward instead of the packed varlen ops |
 | `KOHAKUMOSS_KERNEL_CACHE` | `~/.cache/kohakumoss_kernels` | where the per-shape tuning decisions are stored |
 | `KOHAKUMOSS_LOG_LEVEL` | `INFO` | the vendored stack's own logger |
@@ -127,3 +145,43 @@ can be diffed in. Nothing outside `library/moss/` imports the vendor tree.
 python -m pytest tests/test_moss_kernels.py
 python -m bench.moss_kernels.bench_block_ops --compile --label <card>
 ```
+
+## Warming the tuning cache (预热)
+
+Every kernel tunes its config on first use and caches the winner under
+`<cache>/tuning/<card>-smXX-cuX.Y-torchX.Y.Z/<tag>/<kernel>.json`; `<cache>` is
+`~/.cache/library.moss.vendor.kohakumoss_kernels` unless `KOHAKUMOSS_KERNEL_CACHE`
+says otherwise. A fresh run pays that autotune inside its first training steps -- and
+when another job is resident, it times on a contended card. `scripts/moss/prewarm_kernels.py`
+replays the same op surface on scratch tensors first, at the token lengths the dataset
+actually feeds the DiT, so the first live step reuses that entry instead of autotuning
+inside the step:
+
+```bash
+.venv/bin/python -m scripts.moss.prewarm_kernels \
+    --cache post_image_dataset/moss \
+    --dit /path/moss_image_base_fp16_fixed.safetensors \
+    --precision fp16 --from-cache
+```
+
+Lengths come from the cache **headers** only (`*.moss_latent.safetensors` patch grid
+plus the longest text embedding in `*.moss_te.safetensors`, references included at
+batch 1); geometry comes from the DiT header via `library.moss.checkpoint.arch_config`
+(42 × 3072, 24 heads × 128, ffn 8192). `--from-cache` tunes only the length buckets the
+dataset hits instead of the vendor's power-of-two cascade; `--max-len` drops longer
+samples. `--dry-run` prints every `(kernel, key)` problem plus a JSON summary
+(`--json-only` for the JSON alone) without importing torch or touching CUDA.
+
+A real run refuses to start unless `nvidia-smi` reports at least 3000 MiB free
+(`--min-free-mib`), so it cannot disturb a job already training; `--allow-busy` opts
+out. The tables are per card **and** per stack tag, so warm once after a card, driver
+or torch change, not per run.
+
+What it buys depends on the lane. The four block tables are only read when `fuse`
+accepts the model; the **fp16 lane declines** (see Use), so a `--precision fp16` warm-up
+tunes tables that lane never consults. `attention_varlen` is only reached by packed
+training (`--batch-size > 1`), and on sm70 the Triton attention kernel is unavailable
+(eager fallback), so a V100 plan lists those rows but skips them. The payoff is the
+bf16 lane on sm80+ (what `fuse` accepts) and packed runs there: pass the matching
+`--precision bf16 --batch-size N`. On an sm70 card the command is still the right
+smoke test -- it says, in the summary, that nothing on this lane is tunable.

@@ -311,18 +311,33 @@ function verifyAfterInstall() {
   }
 }
 
+function npmMajorVersion() {
+  const result = runNpm(["--version"]);
+  const major = Number.parseInt(String(result.stdout || "").trim().split(".")[0], 10);
+  return Number.isFinite(major) ? major : 0;
+}
+
 function installFromLock() {
   const offline = process.argv.includes("--offline") || process.env.ANIMA_NPM_OFFLINE === "1";
   console.log(
     `[npm-security] repairing frontend tree with npm ci --ignore-scripts (${offline ? "offline" : "prefer-offline"} mode)`,
   );
-  const result = runNpm([
+  const args = [
     "ci",
     "--ignore-scripts",
     offline ? "--offline" : "--prefer-offline",
     "--no-audit",
     "--no-fund",
-  ]);
+  ];
+  // npm >= 12 defaults `allow-remote=none`, which refuses URL tarballs whose
+  // host differs from the configured registry (EALLOWREMOTE).  The lockfile is
+  // pinned to registry.npmmirror.com mirror tarballs, while a machine may have
+  // registry.npmjs.org configured — every fetch would then be blocked.  The
+  // trust gate is validateLock() above (approved https hosts, sha512
+  // integrity, pinned versions, no unreviewed lifecycle hooks), so let npm
+  // fetch exactly the URLs that gate approved.
+  if (npmMajorVersion() >= 12) args.push("--allow-remote=all");
+  const result = runNpm(args);
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
   return result.status === 0;
