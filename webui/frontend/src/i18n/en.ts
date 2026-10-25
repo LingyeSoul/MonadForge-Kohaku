@@ -856,6 +856,7 @@ export default {
 
   // Model Path Field
   cfBrowse: 'Browse',
+  cfOutputDestinationHint: 'Output destination; it does not need to exist yet. The job writes it, and submission validates the path.',
   cfSelectFile: 'Select file',
   cfSelectModel: 'Select Model File',
   cfFileExists: 'File exists',

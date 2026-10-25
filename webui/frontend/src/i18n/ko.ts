@@ -856,6 +856,7 @@ export default {
 
   // Model Path Field
   cfBrowse: '찾아보기',
+  cfOutputDestinationHint: '출력 경로는 미리 존재하지 않아도 됩니다. 실행 시 기록하며 제출 시 경로를 검증합니다.',
   cfSelectFile: '파일 선택',
   cfSelectModel: '모델 파일 선택',
   cfFileExists: '파일 존재',

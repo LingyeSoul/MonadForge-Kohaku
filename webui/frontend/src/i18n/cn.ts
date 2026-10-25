@@ -856,6 +856,7 @@ export default {
 
   // Model Path Field
   cfBrowse: '浏览',
+  cfOutputDestinationHint: '输出目标，无需预先存在；运行时写入，提交时检查路径是否合法。',
   cfSelectFile: '选择文件',
   cfSelectModel: '选择模型文件',
   cfFileExists: '文件存在',

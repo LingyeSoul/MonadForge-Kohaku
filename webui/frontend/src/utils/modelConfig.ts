@@ -63,6 +63,10 @@ export function modelPathExtensions(family: TypedModelFamily, section: string, n
   return '.safetensors'
 }
 
+export function modelPathMustExist(section: string, name: string): boolean {
+  return !['cache.out', 'train.output', 'generate.out_dir', 'tune.output'].includes(`${section}.${name}`)
+}
+
 export function modelFieldActive(family: TypedModelFamily, section: string, name: string, values: Values): boolean {
   const supplied = (key: string) => typeof values[key] === 'string' && String(values[key]).trim().length > 0
   if (family === 'moss') {

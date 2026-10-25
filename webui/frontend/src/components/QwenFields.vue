@@ -16,7 +16,7 @@ import { useAppStore } from '../stores/app'
 import { modelInputLabel } from '../i18n/modelWorkspace'
 import type { FieldMeta } from '../stores/config'
 import type { QwenField, Scalar } from '../utils/qwen21'
-import { modelFieldActive, modelFieldType, modelPathKind, modelPathExtensions, modelSectionValues } from '../utils/modelConfig'
+import { modelFieldActive, modelFieldType, modelPathKind, modelPathExtensions, modelPathMustExist, modelSectionValues } from '../utils/modelConfig'
 
 const props = defineProps<{ section: QwenSection; fields: QwenField[] }>()
 const emit = defineEmits<{ help: [key: string] }>()
@@ -35,6 +35,7 @@ function metadata(field: QwenField): FieldMeta {
     description: field.nullable ? t('qwenAuto') : '', origin: 'method', group: props.section,
     is_virtual: false, read_only: qwen.value.busy || qwen.value.loading, options: field.choices, nullable: field.nullable,
     path_kind: path, path_extensions: modelPathExtensions(qwen.value.family, props.section, field.name),
+    path_must_exist: modelPathMustExist(props.section, field.name),
     multiline: field.multiline,
   }
 }
