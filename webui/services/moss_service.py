@@ -195,6 +195,7 @@ def pin_request_paths(req: RequestT) -> RequestT:
         "model_dir",
         "lora",
         "prompts_file",
+        "resume",
     }
     values = {
         field.name: str(resolve_under_home(getattr(req, field.name)))

@@ -41,6 +41,8 @@ def validate_request(
             )
     if isinstance(req, TrainRequest):
         training_output_paths(req.output)
+        if req.resume and not resolve_under_home(req.resume).is_file():
+            raise ValueError(f"resume state not found: {req.resume}")
         if req.epochs < 1 or req.rank < 1 or req.lr <= 0 or req.max_grad_norm <= 0:
             raise ValueError(
                 "epochs, rank, learning rate and gradient limit must be positive"
@@ -54,6 +56,10 @@ def validate_request(
             raise ValueError("invalid steps, checkpoint interval or block swap count")
         if req.factor != -1 and req.factor < 1:
             raise ValueError("factor must be -1 or positive")
+        if req.batch_size < 1 or req.token_batch < 0:
+            raise ValueError("batch_size must be positive and token_batch non-negative")
+        if req.token_batch > 0 and req.batch_size < 2:
+            raise ValueError("token_batch needs batch_size >= 2")
         if (
             not 0 <= req.warmup_ratio <= 1
             or not 0 <= req.caption_dropout <= 1
@@ -101,6 +107,10 @@ def validate_request(
             raise ValueError(
                 "rank, patience and timed steps must be positive; warmup non-negative"
             )
+        if req.batch_size < 1 or req.token_batch < 0:
+            raise ValueError("batch_size must be positive and token_batch non-negative")
+        if req.token_batch > 0 and req.batch_size < 2:
+            raise ValueError("token_batch needs batch_size >= 2")
         if (
             req.margin_gb < 0
             or not 0 <= req.tolerance < 1

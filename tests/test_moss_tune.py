@@ -57,6 +57,10 @@ def test_pick_respects_margin():
     arms[2]["free_gb"] = 0.6
     assert flags(chosen) == "--blocks_to_swap 24 --activation_memory_budget 0.2"
     assert flags(arms[0]) == "--grad_checkpointing --blocks_to_swap 0"
+    assert flags(chosen, 4, 12000) == (
+        "--blocks_to_swap 24 --activation_memory_budget 0.2 "
+        "--batch_size 4 --token_batch 12000"
+    )
     assert pick(arms, margin_gb=5.0) is None
 
 

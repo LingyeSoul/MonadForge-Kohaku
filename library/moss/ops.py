@@ -169,6 +169,16 @@ def qk_norm_rope(
     )
 
 
+def attention_varlen(
+    q: Tensor, k: Tensor, v: Tensor, cu_seqlens: Tensor, max_seqlen: int, scale: float
+) -> Tensor:
+    """Packed full attention: ``q``/``k``/``v`` ``(N, H, Dh)``, one segment per
+    ``cu_seqlens`` pair; no key crosses a sample boundary."""
+    return bind("attention_varlen", q.device, q.dtype)(
+        q, k, v, cu_seqlens, max_seqlen, scale
+    )
+
+
 def situ_glu(x: Tensor) -> Tensor:
     """SiTU-GLU of the fused up/gate projection: ``x (N, 2F) = [up | gate]`` → ``(N, F)``."""
     return bind("situ_glu", x.device, x.dtype)(x)

@@ -80,6 +80,7 @@ The op surface is one thing; what the trainer and the pipeline reach is another:
 
 | capability | entry point | what it buys |
 |---|---|---|
+| `attention_varlen` | `library/moss/model.py::forward_packed`, `moss-train --batch_size` | one attention call across a token-major packed batch, with `cu_seqlens` keeping samples apart; `docs/moss/packed_batches.md` |
 | `gated_delta_rule_varlen`, `causal_conv_varlen`, `rms_norm_gated`, `attention_varlen_causal`, `rms_norm` | `library/moss/text_kernels.py`, used by `loader.encode_prompt` | the Qwen3.5 text encode runs packed; `MONADFORGE_MOSS_TEXT_KERNELS=0` keeps HF's forward |
 | `quant_linear` (int8 / e4m3 weights, per-row scales) | `library/moss/quant.py`, `moss-generate --quant {int8,fp8}` | the frozen 5B DiT base at half the VRAM; a LoRA (not LoKr) still applies on top |
 | `AdamW16`, `MuonHybrid` | `library/moss/optim/`, `moss-train --optimizer {adamw16,muon}` | 16-bit optimizer state with fp32 math, or Muon on the LoRA matrices |
@@ -93,7 +94,6 @@ are not connected, with what stands between each and this model:
 
 | capability | state | what it needs |
 |---|---|---|
-| `attention_varlen` (non-causal) | available | `forward_batched` still pads text to `s_max`; batch 1 (the trainer) and cond+uncond (`--batched`) do not pay enough to justify the packed `ref_span` / modulation rewrite |
 | `fp8_linear`, `fp8_linear_train`, MXFP8 | available | fp8 compute needs a scaling recipe, fp8 master weights and a scaler; the trainer is bf16 with fp32 masters |
 | `quant_linear_rotated` | available, not wired | this repository already ships ConvRot (`library/runtime/convrot`: W8A8 and W8A16, sylvester and regular H, `_int_mm` padding); measured on an RTX 4060 at 4096 tokens, the vendored weight-only kernel was 0.90–1.17× this repository's W8A16 time and plain `quant_linear` was faster still, so a second rotation family buys nothing |
 | fused optimizer bundle (`FusedStep`, `HostAccumulator`, streaming AdamW) | available | the trainer's optimizer surface (`library/training/`) owns grad hooks and the offload engines |

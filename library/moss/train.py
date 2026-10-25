@@ -192,6 +192,79 @@ def training_loss(transformer, latent, embeds, sigma: float, gen=None, ref=None)
     return F.mse_loss(pred.float(), target.float())
 
 
+def training_loss_packed(
+    transformer, latents, embeds, sigmas, gen=None, max_batch=None
+):
+    """Packed flow-matching loss over samples with different shapes.
+
+    ``latents`` / ``embeds`` are per-sample ``(1,C,h,w)`` / ``(1,S,4096)`` on
+    device; ``sigmas`` one σ per sample. Returns the mean loss and the per-sample
+    values, so the optimizer update weights every sample equally.
+    """
+    noises = [
+        torch.randn(
+            latent.shape, generator=gen, device=latent.device, dtype=latent.dtype
+        )
+        for latent in latents
+    ]
+    noisy = [
+        (1.0 - sigma) * latent + sigma * noise
+        for latent, noise, sigma in zip(latents, noises, sigmas)
+    ]
+    targets = [noise - latent for latent, noise in zip(latents, noises)]
+    timesteps = torch.tensor(
+        [NUM_TRAIN_TIMESTEPS * sigma for sigma in sigmas], device=latents[0].device
+    )
+    preds = transformer.forward_packed(noisy, timesteps, embeds, max_batch=max_batch)
+    per_sample = [
+        F.mse_loss(pred.float(), target.float()) for pred, target in zip(preds, targets)
+    ]
+    return torch.stack(per_sample).mean(), per_sample
+
+
+def sample_joint(s: Sample) -> int:
+    """Joint image + reference + text tokens one sample contributes."""
+    return s.n_img + s.n_ref + s.n_text
+
+
+def make_batches(
+    samples: list[Sample], batch_size: int, token_batch: int
+) -> list[list[Sample]]:
+    """Split a shuffled sample list into packed forwards.
+
+    ``batch_size`` caps the sample count; ``token_batch`` > 0 caps the joint token
+    count. The first sample of a batch always fits alone, so a single oversized
+    sample cannot deadlock the loop.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if token_batch <= 0:
+        return [
+            samples[start : start + batch_size]
+            for start in range(0, len(samples), batch_size)
+        ]
+    batches, current, tokens = [], [], 0
+    for sample in samples:
+        joint = sample_joint(sample)
+        if current and (len(current) >= batch_size or tokens + joint > token_batch):
+            batches.append(current)
+            current, tokens = [], 0
+        current.append(sample)
+        tokens += joint
+    if current:
+        batches.append(current)
+    return batches
+
+
+def max_packed_joint(samples: list[Sample], batch_size: int, token_batch: int) -> int:
+    """Upper bound on one packed batch's joint tokens, for the VRAM reserve."""
+    joints = sorted((sample_joint(s) for s in samples), reverse=True)
+    worst = sum(joints[:batch_size])
+    if token_batch > 0:
+        worst = min(worst, max(joints[0], token_batch))
+    return worst
+
+
 def checkpoint_blocks(blocks) -> None:
     """Per-block activation checkpointing around ``block.forward``."""
     for block in blocks:
@@ -304,6 +377,150 @@ def empty_prompt_embeds(req: TrainRequest) -> torch.Tensor:
     return load_file(str(path))["embeds"]
 
 
+RESUME_FORMAT = 1
+_RESUME_KEYS = (
+    "model",
+    "algo",
+    "rank",
+    "alpha",
+    "factor",
+    "targets",
+    "down_init",
+    "channel_scaling_alpha",
+    "dc_isolate",
+    "svd_slice",
+    "svd_slice_count",
+    "optimizer",
+    "lr",
+    "warmup_ratio",
+    "batch_size",
+    "token_batch",
+    "grad_accum",
+    "precision",
+    "fp16_fix",
+    "fp16_fix_c",
+    "ref_timestep",
+    "ref_isolate",
+    "caption_dropout",
+    "plain_caption_rate",
+    "caption_variant_rate",
+    "repa_weight",
+    "repa_layer",
+    "max_grad_norm",
+    "sigma_mu",
+    "sigma_s",
+    "sigma_cutoff",
+    "sigma_uniform",
+    "seed",
+)
+
+
+def resume_signature(req: TrainRequest) -> dict:
+    """Fields that must match for a state file to describe this run."""
+    return {name: getattr(req, name) for name in _RESUME_KEYS}
+
+
+def _cpu_tree(value):
+    """Move tensors in a nested state dict to CPU for a portable ``torch.save``."""
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _cpu_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cpu_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_cpu_tree(item) for item in value)
+    return value
+
+
+def save_resume_state(
+    path: Path,
+    *,
+    req: TrainRequest,
+    network,
+    optimizer,
+    lr_sched,
+    scaler,
+    step: int,
+    micro_step: int,
+    next_epoch: int,
+    rates: dict,
+    sigma_gen,
+    noise_gen,
+) -> None:
+    """Write the adapter's optimizer/RNG state beside the LoRA file.
+
+    The epoch boundary is the checkpoint boundary: a resumed run replays the
+    last completed epoch if the process died inside one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "format": RESUME_FORMAT,
+        "signature": resume_signature(req),
+        "network": network.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "lr_sched": lr_sched.state_dict(),
+        "scaler": scaler.state_dict(),
+        "step": step,
+        "micro_step": micro_step,
+        "next_epoch": next_epoch,
+        "random": random.getstate(),
+        "rates": {
+            name: rng.getstate()
+            for name, rng in rates.items()
+            if hasattr(rng, "getstate")
+        },
+        "sigma_gen": sigma_gen.get_state(),
+        "noise_gen": noise_gen.get_state(),
+    }
+    torch.save(_cpu_tree(state), path)
+
+
+def load_resume_state(
+    path: Path,
+    *,
+    req: TrainRequest,
+    network,
+    optimizer,
+    lr_sched,
+    scaler,
+    rates: dict,
+    sigma_gen,
+    noise_gen,
+) -> tuple[int, int, int]:
+    """Restore a state written by :func:`save_resume_state`; returns the counters."""
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    if state.get("format") != RESUME_FORMAT:
+        raise SystemExit(f"unsupported MOSS resume format in {path}")
+    saved = state["signature"]
+    current = resume_signature(req)
+    mismatch = {
+        key: (saved.get(key), current.get(key))
+        for key in current
+        if saved.get(key) != current.get(key)
+    }
+    if mismatch:
+        raise SystemExit(
+            "resume state does not match this run: "
+            + ", ".join(
+                f"{key} {have!r} != {want!r}" for key, (have, want) in mismatch.items()
+            )
+        )
+    network.load_state_dict(state["network"])
+    optimizer.load_state_dict(state["optimizer"])
+    lr_sched.load_state_dict(state["lr_sched"])
+    scaler.load_state_dict(state["scaler"])
+    random.setstate(state["random"])
+    for name, rng in rates.items():
+        if hasattr(rng, "setstate"):
+            rng.setstate(state["rates"][name])
+    sigma_gen.set_state(state["sigma_gen"])
+    # A CUDA generator's state is a CPU ByteTensor; moving it to the device is
+    # rejected by ``set_state``.
+    noise_gen.set_state(state["noise_gen"])
+    return int(state["step"]), int(state["micro_step"]), int(state["next_epoch"])
+
+
 def run_train(req: TrainRequest) -> Path:
     validate_request(req)
     cache_dir = resolve_under_home(req.cache)
@@ -322,8 +539,11 @@ def train(
     validate_request(req)
     torch.manual_seed(req.seed)
     random.seed(req.seed)
-    gen = torch.Generator().manual_seed(req.seed)
     device = torch.device("cuda")
+    # Sigma draws are CPU scalars; noise must be drawn by a generator on the
+    # tensor's device (a CPU generator cannot seed a CUDA randn).
+    sigma_gen = torch.Generator().manual_seed(req.seed)
+    noise_gen = torch.Generator(device=device).manual_seed(req.seed)
 
     img = sorted(s.n_img for s in samples)
     txt = sorted(s.n_text for s in samples)
@@ -339,7 +559,25 @@ def train(
             f"{ref_tok[0]}-{ref_tok[-1]} tokens",
             flush=True,
         )
-    joint = max(s.n_img + s.n_ref + s.n_text for s in samples)
+    packed = req.batch_size > 1
+    if packed and n_refs:
+        raise SystemExit(
+            "packed batching does not support reference latents (i2i); use --batch_size 1"
+        )
+    if packed and req.repa_weight > 0:
+        raise SystemExit("packed batching does not support REPA; use --batch_size 1")
+    joint = (
+        max_packed_joint(samples, req.batch_size, req.token_batch)
+        if packed
+        else max(sample_joint(s) for s in samples)
+    )
+    if packed:
+        print(
+            f"packed batches: up to {req.batch_size} samples"
+            + (f" / ~{req.token_batch} joint tokens" if req.token_batch > 0 else "")
+            + f", worst case {joint} joint tokens",
+            flush=True,
+        )
     use_plain = req.plain_caption_rate > 0
     n_plain = sum(s.load_plain is not None for s in samples) if use_plain else 0
     if n_plain:
@@ -515,9 +753,7 @@ def train(
     elif req.optimizer == "muon":
         from library.moss.optim import MuonHybrid
 
-        optimizer = MuonHybrid(
-            [{"params": params, "use_muon": True}], lr=req.lr
-        )
+        optimizer = MuonHybrid([{"params": params, "use_muon": True}], lr=req.lr)
     else:
         optimizer = torch.optim.AdamW(params, lr=req.lr)
     # fp16 gradients underflow (the loss is fp32 but W_grad is not); the scaler
@@ -530,15 +766,18 @@ def train(
     if req.grad_accum < 1:
         raise SystemExit(f"grad_accum must be >= 1, got {req.grad_accum}")
     accum = req.grad_accum
-    updates = math.ceil(total / accum)
+    # One update per `accum` forwarded batches; a packed batch carries several
+    # samples, so the estimate uses batch_size (token_batch only narrows it).
+    updates = max(1, math.ceil(total / max(1, req.batch_size) / accum))
     warmup = max(1, int(updates * req.warmup_ratio))
     lr_sched = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda update: min(1.0, (update + 1) / warmup)
     )
     epochs = math.ceil(total / len(samples))
     print(
-        f"{total} steps ({epochs} epochs x {len(samples)}), "
-        + (f"{updates} updates of {accum}, " if accum > 1 else "")
+        f"{total} samples ({epochs} epochs x {len(samples)}), "
+        + (f"batch {req.batch_size}, " if packed else "")
+        + (f"{updates} updates of {accum} batches, " if accum > 1 else "")
         + f"warmup {warmup}",
         flush=True,
     )
@@ -559,7 +798,10 @@ def train(
         "caption_variant_rate": req.caption_variant_rate if n_variant_samples else 0.0,
         "reference_latents": n_refs,
         "precision": str(compute).removeprefix("torch."),
+        "batch_size": req.batch_size,
     }
+    if req.token_batch > 0:
+        meta["token_batch"] = req.token_batch
     if compute == torch.float16:
         # A sample is only the trained model when the fix (and c) match.
         meta["fp16_fix"] = req.fp16_fix
@@ -585,6 +827,47 @@ def train(
         network.save(path, req.lora_dtype, **meta)
         return path
 
+    state_path = out_path.with_name(out_path.name + ".state.pt")
+    step, micro_step, start_epoch = 0, 0, 0
+    grad_norm = float("nan")
+    if req.resume:
+        step, micro_step, start_epoch = load_resume_state(
+            resolve_under_home(req.resume),
+            req=req,
+            network=network,
+            optimizer=optimizer,
+            lr_sched=lr_sched,
+            scaler=scaler,
+            rates=rates,
+            sigma_gen=sigma_gen,
+            noise_gen=noise_gen,
+        )
+        if step > total:
+            raise SystemExit(
+                f"resume step {step} is past this run's {total} samples; "
+                "raise --epochs or --max_steps"
+            )
+        print(
+            f"resumed {req.resume} at sample {step}, epoch {start_epoch + 1}",
+            flush=True,
+        )
+
+    def save_state(next_epoch: int) -> None:
+        save_resume_state(
+            state_path,
+            req=req,
+            network=network,
+            optimizer=optimizer,
+            lr_sched=lr_sched,
+            scaler=scaler,
+            step=step,
+            micro_step=micro_step,
+            next_epoch=next_epoch,
+            rates=rates,
+            sigma_gen=sigma_gen,
+            noise_gen=noise_gen,
+        )
+
     sink_path = command_job_path(
         str(out_path.parent.parent / "logs" / f"{out_path.stem}.progress.jsonl")
     )
@@ -594,11 +877,14 @@ def train(
 
     largest = max(samples, key=lambda s: s.n_img + s.n_ref + s.n_text)
     history, losses_all, fit = [], [], None
-    step, grad_norm = 0, float("nan")
     torch.cuda.reset_peak_memory_stats()
     t_start = time.time()
     with run_scope(sink, final_step=lambda: step):
-        for epoch in range(epochs):
+        t0_step = step
+        per_step = None
+        t_window, step_window = t_start, step
+        next_epoch = start_epoch
+        for epoch in range(start_epoch, epochs):
             order = random.sample(samples, len(samples))
             if epoch == 0 and req.fit_report:
                 # Only the largest sample moves to step 1, the worst case the fit
@@ -606,45 +892,94 @@ def train(
                 order.remove(largest)
                 order.insert(0, largest)
             losses, aligns, t_epoch = [], [], time.time()
-            for s in order:
+            if packed:
+                batches = make_batches(order, req.batch_size, req.token_batch)
+                if epoch == 0 and req.fit_report:
+                    batches = [[largest]] + make_batches(
+                        [s for s in order if s is not largest],
+                        req.batch_size,
+                        req.token_batch,
+                    )
+            else:
+                batches = [[s] for s in order]
+            for batch in batches:
                 if step >= total:
                     break
-                latent, embeds, alt, ref = get(s)
-                embeds, kind = choose_embeds(
-                    embeds,
-                    alt,
-                    s.n_variants if use_variants else 0,
-                    s.load_variant,
-                    empty,
-                    worst_case=step == 0 and req.fit_report,
-                    **rates,
-                )
-                kind = "variant" if kind.startswith("v") else kind
-                if kind in kinds:
-                    kinds[kind] += 1
-                latent = latent.unsqueeze(0).to(device, torch.float32)
-                embeds = embeds.unsqueeze(0).to(device)
-                if ref is not None:
-                    ref = ref.unsqueeze(0).to(device, torch.float32)
-                sigma = sample_sigma(
-                    gen, req.sigma_mu, req.sigma_s, req.sigma_cutoff, req.sigma_uniform
-                )
-                if repa is not None:
-                    target, grid = repa_targets.get(s.stem, (None, None))
-                    repa.prime(
-                        None if target is None else target.to(device),
-                        grid,
-                        tuple(latent.shape[-2:]),
+                if len(batch) > total - step:
+                    batch = batch[: total - step]
+                loaded = [get(s) for s in batch]
+                chosen = []
+                for s, (latent, embeds, alt, ref) in zip(batch, loaded):
+                    embeds, kind = choose_embeds(
+                        embeds,
+                        alt,
+                        s.n_variants if use_variants else 0,
+                        s.load_variant,
+                        empty,
+                        worst_case=step == 0 and req.fit_report,
+                        **rates,
                     )
-                loss = training_loss(transformer, latent, embeds, sigma, ref=ref)
-                align = repa.loss() if repa is not None else None
+                    kind = "variant" if kind.startswith("v") else kind
+                    if kind in kinds:
+                        kinds[kind] += 1
+                    chosen.append((latent, embeds, ref))
+                latents = [
+                    latent.unsqueeze(0).to(device, torch.float32)
+                    for latent, _, _ in chosen
+                ]
+                embeds = [embeds.unsqueeze(0).to(device) for _, embeds, _ in chosen]
+                refs = [
+                    None if ref is None else ref.unsqueeze(0).to(device, torch.float32)
+                    for _, _, ref in chosen
+                ]
+                sigmas = [
+                    sample_sigma(
+                        sigma_gen,
+                        req.sigma_mu,
+                        req.sigma_s,
+                        req.sigma_cutoff,
+                        req.sigma_uniform,
+                    )
+                    for _ in batch
+                ]
+                if packed:
+                    loss, per_sample = training_loss_packed(
+                        transformer,
+                        latents,
+                        embeds,
+                        sigmas,
+                        gen=noise_gen,
+                        max_batch=req.batch_size,
+                    )
+                    align = None
+                else:
+                    s = batch[0]
+                    if repa is not None:
+                        target, grid = repa_targets.get(s.stem, (None, None))
+                        repa.prime(
+                            None if target is None else target.to(device),
+                            grid,
+                            tuple(latents[0].shape[-2:]),
+                        )
+                    loss = training_loss(
+                        transformer,
+                        latents[0],
+                        embeds[0],
+                        sigmas[0],
+                        gen=noise_gen,
+                        ref=refs[0],
+                    )
+                    per_sample = [loss]
+                    align = repa.loss() if repa is not None else None
                 if align is not None:
                     scaler.scale((loss + req.repa_weight * align) / accum).backward()
                     aligns.append(align.item())
                 else:
                     scaler.scale(loss / accum).backward()
-                step += 1
-                updated = step % accum == 0 or step == total
+                started = step
+                step += len(batch)
+                micro_step += 1
+                updated = micro_step % accum == 0 or step >= total
                 if updated:
                     scaler.unscale_(optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -662,31 +997,45 @@ def train(
                         lr_sched.step()
                     optimizer.zero_grad(set_to_none=True)
                 value = loss.item()
+                per_values = [sample.item() for sample in per_sample]
+                mean_sigma = sum(sigmas) / len(sigmas)
                 sink.log(
                     {
                         "loss": value,
-                        "sigma": sigma,
+                        "sigma": mean_sigma,
                         "lr": lr_sched.get_last_lr()[0],
+                        "samples": len(batch),
                     }
                     | ({"grad_norm": grad_norm} if updated else {})
                     | ({"repa": aligns[-1]} if align is not None else {}),
                     global_step=step,
                     epoch=epoch + 1,
                 )
-                losses.append(value)
-                losses_all.append(
-                    {"step": step, "loss": value, "sigma": sigma}
-                    | ({"repa": aligns[-1]} if align is not None else {})
-                )
-                if step == 1:
+                losses.extend(per_values)
+                for offset, (sample_loss, sample_sigma_value) in enumerate(
+                    zip(per_values, sigmas)
+                ):
+                    losses_all.append(
+                        {
+                            "step": started + offset + 1,
+                            "loss": sample_loss,
+                            "sigma": sample_sigma_value,
+                        }
+                        | ({"repa": aligns[-1]} if align is not None else {})
+                    )
+                if started == 0:
                     if req.fit_report:
                         fit = report_fit(
-                            transformer, attached, s.n_img, embeds.shape[1]
+                            transformer,
+                            attached,
+                            max(s.n_img for s in batch),
+                            max(embed.shape[1] for embed in embeds),
                         )
-                    t_start = time.time()  # s/step excludes step 1's allocator warm-up
-                    t_window, step_window, per_step = t_start, 1, None
+                    t_start = time.time()  # excludes step 1's allocator warm-up
+                    t0_step = step
+                    t_window, step_window, per_step = t_start, step, None
                 eta_rate = (
-                    (time.time() - t_start) / max(1, step - 1)
+                    (time.time() - t_start) / max(1, step - t0_step)
                     if per_step is None
                     else per_step
                 )
@@ -698,19 +1047,21 @@ def train(
                         f"eta {eta // 3600}:{eta % 3600 // 60:02d}:{eta % 60:02d}",
                         flush=True,
                     )
-                if step % req.log_every == 0:
-                    # s/step over the steps since the last log line, so a recompile
-                    # stays in the window it landed in. Step 1 (compile) has none.
+                if step == total or step // req.log_every != started // req.log_every:
+                    # s/sample over the samples since the last log line, so a
+                    # recompile stays in the window it landed in. The first batch
+                    # (compile) has none.
                     now = time.time()
                     if step > step_window:
                         per_step = (now - t_window) / (step - step_window)
                         t_window, step_window = now, step
-                    rate = f" {per_step:.2f}s/step" if per_step is not None else ""
+                    rate = f" {per_step:.3f}s/sample" if per_step is not None else ""
                     if align is not None:
                         rate += f" repa {aligns[-1]:.4f}"
                     print(
                         f"  step {step}/{total} loss {value:.4f} |g| {grad_norm:.3f} "
-                        f"sigma {sigma:.3f} lr {lr_sched.get_last_lr()[0]:.2e} "
+                        f"sigma {mean_sigma:.3f} lr {lr_sched.get_last_lr()[0]:.2e} "
+                        f"batch {len(batch)} "
                         f"peak {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB"
                         f"{rate}",
                         flush=True,
@@ -736,8 +1087,12 @@ def train(
                 saved = save(f"e{epoch + 1}")
                 sink.ckpt(global_step=step, path=str(saved))
                 print(f"  saved {saved}", flush=True)
+            next_epoch = epochs if step >= total else epoch + 1
+            save_state(next_epoch)
+            print(f"  resume state {state_path}", flush=True)
 
         final = save()
+        save_state(next_epoch)
         sink.ckpt(global_step=step, path=str(final))
         seconds = time.time() - t_start
         summary = {
@@ -750,6 +1105,9 @@ def train(
             "dropout_steps": kinds["empty"],
             "minutes": seconds / 60,
             "s_per_step": seconds / max(1, step - 1),
+            "samples_per_s": step / max(seconds, 1e-9),
+            "batch_size": req.batch_size,
+            "token_batch": req.token_batch,
             "peak_allocated_gb": torch.cuda.max_memory_allocated() / 1024**3,
             "peak_reserved_gb": torch.cuda.max_memory_reserved() / 1024**3,
             "history": history,

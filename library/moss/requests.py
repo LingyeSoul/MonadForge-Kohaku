@@ -398,6 +398,13 @@ class TrainRequest(Request):
         "output/ckpt_moss/moss_lora.safetensors",
         "LoRA output path (a .json run report lands beside it)",
     )
+    resume: str = _f(
+        "",
+        "resume from the .state.pt written beside a previous run's output; "
+        "restores the adapter, optimizer, LR schedule and RNG streams at the "
+        "last completed epoch",
+        advanced=True,
+    )
     model: str = _f("base", "which DiT to train on", choices=VARIANTS)
     epochs: int = _f(8, "passes over the cache")
     max_steps: int = _f(0, "stop after this many steps (0 = epochs decide)")
@@ -483,11 +490,24 @@ class TrainRequest(Request):
         choices=("adamw", "adamw16", "muon"),
     )
     warmup_ratio: float = _f(0.05, "linear warmup, as a fraction of all steps")
+    batch_size: int = _f(
+        1,
+        "samples per packed forward. 1 keeps the per-sample loop; > 1 packs each "
+        "sample's image+text tokens into one variable-length stream (no shape "
+        "grouping, no padding), so the 42 blocks run once per batch. Reference "
+        "latents, REPA and per-sample skip layers stay on the batch-1 path",
+    )
+    token_batch: int = _f(
+        0,
+        "packed mode only: cap a batch at roughly this many joint image+text "
+        "tokens (0 = no cap, use batch_size alone). A sample larger than the cap "
+        "still gets a batch of its own; this bounds activation memory and keeps "
+        "the compiled block's token count in a narrow band",
+    )
     grad_accum: int = _f(
         1,
-        "samples per optimizer update (gradient accumulation; samples keep their "
-        "own shapes, so this is the only way past batch 1). Steps, epochs and the "
-        "loss log still count samples; warmup counts updates",
+        "batches per optimizer update (gradient accumulation). Steps, epochs and "
+        "the loss log still count samples; warmup counts updates",
     )
     save_every_epochs: int = _f(
         0,
@@ -677,6 +697,12 @@ class TuneSwapRequest(Request):
         DEFAULT_FP16_FIX_C, "online: the stream scale", advanced=True
     )
     rank: int = _f(32, "LoRA rank (the adapters and AdamW state take VRAM too)")
+    batch_size: int = _f(
+        1, "packed batch size to time; match the training run (see docs/moss/packed_batches.md)"
+    )
+    token_batch: int = _f(
+        0, "packed token cap to time; 0 = batch_size alone (needs batch_size >= 2)"
+    )
     swap_grid: str = _f(
         "8,12,16,20,24,28,32,36,40",
         "swap counts to try, ascending (at most num_layers - 2)",

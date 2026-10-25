@@ -9,7 +9,8 @@ default.
 
 One process loads the DiT once. Each arm places it with ``N`` blocks swapped,
 reads the free VRAM, picks the largest budget :func:`train.budget_for_free`
-allows, recompiles, and times ``steps`` training steps on the largest sample.
+allows, recompiles, and times ``steps`` training steps on the largest sample
+(or the largest packed batch under ``batch_size`` / ``token_batch``).
 An OOM retries one budget step lower. The sweep stops ``patience`` arms past
 the fastest so far. The recommendation is the least swap within
 ``tolerance`` of the fastest arm that still leaves ``margin_gb`` free.
@@ -40,10 +41,13 @@ from library.moss.train import (
     Sample,
     budget_for_free,
     checkpoint_blocks,
+    make_batches,
     place,
+    sample_joint,
     samples_from_cache,
     set_activation_memory_budget,
     training_loss,
+    training_loss_packed,
 )
 
 
@@ -80,13 +84,19 @@ def pick(arms: list[dict], margin_gb: float, tolerance: float = 0.02) -> dict | 
     return min(close, key=lambda a: (a["blocks_to_swap"], a["s_per_step"]))
 
 
-def flags(arm: dict) -> str:
+def flags(arm: dict, batch_size: int = 1, token_batch: int = 0) -> str:
     if arm["grad_checkpointing"]:
-        return "--grad_checkpointing --blocks_to_swap 0"
-    return (
-        f"--blocks_to_swap {arm['blocks_to_swap']} "
-        f"--activation_memory_budget {arm['budget']:g}"
-    )
+        text = "--grad_checkpointing --blocks_to_swap 0"
+    else:
+        text = (
+            f"--blocks_to_swap {arm['blocks_to_swap']} "
+            f"--activation_memory_budget {arm['budget']:g}"
+        )
+    if batch_size > 1:
+        text += f" --batch_size {batch_size}"
+    if token_batch > 0:
+        text += f" --token_batch {token_batch}"
+    return text
 
 
 def _pcie_link() -> str:
@@ -114,16 +124,21 @@ def _unwrap(blocks) -> None:
 
 
 class _Bench:
-    def __init__(self, req: TuneSwapRequest, transformer, network, sample, device):
+    def __init__(self, req: TuneSwapRequest, transformer, network, samples, device):
         self.req = req
         self.transformer = transformer
         self.params = list(network.parameters())
-        latent, embeds = sample.load()
-        self.latent = latent.unsqueeze(0).to(device, torch.float32)
-        self.embeds = embeds.unsqueeze(0).to(device)
-        ref = sample.load_ref() if sample.load_ref is not None else None
-        self.ref = None if ref is None else ref.unsqueeze(0).to(device, torch.float32)
-        self.joint = sample.n_img + sample.n_ref + sample.n_text
+        self.samples = samples
+        self.latents, self.embeds, self.refs = [], [], []
+        for sample in samples:
+            latent, embeds = sample.load()
+            self.latents.append(latent.unsqueeze(0).to(device, torch.float32))
+            self.embeds.append(embeds.unsqueeze(0).to(device))
+            ref = sample.load_ref() if sample.load_ref is not None else None
+            self.refs.append(
+                None if ref is None else ref.unsqueeze(0).to(device, torch.float32)
+            )
+        self.joint = sum(sample_joint(sample) for sample in samples)
         self.device = device
 
     def arm(self, swap: int, *, grad_checkpointing: bool = False) -> dict:
@@ -182,10 +197,25 @@ class _Bench:
             if i == req.warmup:
                 torch.cuda.synchronize()
                 start = time.perf_counter()
-            sigma = 0.25 + 0.5 * torch.rand((), generator=gen).item()
-            loss = training_loss(
-                self.transformer, self.latent, self.embeds, sigma, ref=self.ref
-            )
+            sigmas = [
+                0.25 + 0.5 * torch.rand((), generator=gen).item() for _ in self.samples
+            ]
+            if len(self.samples) == 1:
+                loss = training_loss(
+                    self.transformer,
+                    self.latents[0],
+                    self.embeds[0],
+                    sigmas[0],
+                    ref=self.refs[0],
+                )
+            else:
+                loss, _ = training_loss_packed(
+                    self.transformer,
+                    self.latents,
+                    self.embeds,
+                    sigmas,
+                    max_batch=self.req.batch_size,
+                )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(self.params, 1.0)
@@ -232,11 +262,28 @@ def run_tune(req: TuneSwapRequest) -> dict:
         samples = samples_from_cache(resolve_under_home(req.cache))
         if not samples:
             raise SystemExit(f"no cached pairs under {req.cache}")
-    sample = max(samples, key=lambda s: s.n_img + s.n_ref + s.n_text)
+    if req.batch_size > 1:
+        if any(s.load_ref is not None for s in samples):
+            raise SystemExit(
+                "packed tuning does not support reference latents (i2i); "
+                "use --batch_size 1"
+            )
+        chosen_samples = make_batches(
+            sorted(samples, key=sample_joint, reverse=True),
+            req.batch_size,
+            req.token_batch,
+        )[0]
+    else:
+        chosen_samples = [max(samples, key=sample_joint)]
     print(
-        f"timing {sample.stem}: {sample.n_img} image + {sample.n_ref} ref + "
-        f"{sample.n_text} text tokens "
-        f"(largest of {len(samples)})",
+        "timing "
+        + ", ".join(
+            f"{s.stem}: {s.n_img} image + {s.n_ref} ref + {s.n_text} text"
+            for s in chosen_samples
+        )
+        + f" ({len(chosen_samples)} sample(s), "
+        f"{sum(sample_joint(s) for s in chosen_samples)} joint tokens; "
+        f"largest of {len(samples)})",
         flush=True,
     )
 
@@ -258,7 +305,7 @@ def run_tune(req: TuneSwapRequest) -> dict:
     network.apply_to()
     network.to(device)
     max_swap = len(transformer.layers) - 2
-    bench = _Bench(req, transformer, network, sample, device)
+    bench = _Bench(req, transformer, network, chosen_samples, device)
 
     arms: list[dict] = []
     if req.reference:
@@ -282,25 +329,30 @@ def run_tune(req: TuneSwapRequest) -> dict:
     report = {
         "gpu": torch.cuda.get_device_name(device),
         "pcie": _pcie_link(),
-        "image_tokens": sample.n_img,
-        "text_tokens": sample.n_text,
+        "samples": [s.stem for s in chosen_samples],
+        "image_tokens": [s.n_img for s in chosen_samples],
+        "text_tokens": [s.n_text for s in chosen_samples],
+        "joint_tokens": bench.joint,
+        "batch_size": req.batch_size,
+        "token_batch": req.token_batch,
         "rank": req.rank,
         "margin_gb": req.margin_gb,
         "tolerance": req.tolerance,
         "arms": arms,
         "recommended": chosen,
-        "flags": flags(chosen) if chosen else None,
+        "flags": flags(chosen, req.batch_size, req.token_batch) if chosen else None,
     }
     out = resolve_under_home(req.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2))
     print(
-        f"\n{report['gpu']} ({report['pcie']}), {sample.n_img + sample.n_ref + sample.n_text} joint tokens"
+        f"\n{report['gpu']} ({report['pcie']}), {bench.joint} joint tokens "
+        f"in {len(chosen_samples)} sample(s)"
     )
     for arm in arms:
         print(_row(arm) + ("   <- recommended" if arm is chosen else ""))
     if chosen:
-        print(f"\nrecommended: {flags(chosen)}")
+        print(f"\nrecommended: {flags(chosen, req.batch_size, req.token_batch)}")
     else:
         print(
             f"\nno arm left {req.margin_gb} GB free; lower --margin_gb or train smaller"

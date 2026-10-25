@@ -31,6 +31,8 @@ const mossFields: Record<string, [string, string]> = {
   spectrum_stop_caching_step: ['Spectrum cache stop step', 'Spectrum 停止缓存步数'], spectrum_w: ['Spectrum weight', 'Spectrum 权重'],
   spectrum_m: ['Spectrum polynomial degree', 'Spectrum 多项式阶数'], spectrum_lam: ['Spectrum regularization', 'Spectrum 正则强度'],
   factor: ['LoKr factor', 'LoKr 因子'], down_init: ['Down-projection initialization', '降维投影初始化'], caption_dropout: ['Caption dropout', '标注丢弃率'],
+  batch_size: ['Packed batch size', '打包批大小'], token_batch: ['Packed token cap', '打包 token 上限'],
+  resume: ['Resume state', '续训状态文件'],
   sigma_mu: ['Noise sampling mean', '噪声采样均值'], sigma_s: ['Noise sampling deviation', '噪声采样标准差'], sigma_cutoff: ['Noise cutoff', '噪声截断'],
   sigma_uniform: ['Uniform noise mixture', '均匀噪声比例'], activation_memory_budget: ['Activation memory budget', '激活内存预算'], log_every: ['Log interval', '日志间隔'],
 }

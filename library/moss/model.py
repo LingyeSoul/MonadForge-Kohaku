@@ -93,6 +93,18 @@ class _Fused:
         return _Fused(self.pos[rows], self.bands, self.seg[rows].reshape(-1))
 
 
+@dataclass(frozen=True)
+class _Packed:
+    """What a packed token-major forward needs: one segment id per stream row,
+    the attention's ``cu_seqlens`` / launch bound, and the fused RoPE positions."""
+
+    seg: Tensor
+    cu_seqlens: Tensor
+    max_seqlen: int
+    pos: Tensor
+    bands: Tensor
+
+
 def _validate_skip_layers(layers, depth, name="skip_layers"):
     layers = () if layers is None else tuple(layers)
     if any(type(index) is not int or not 0 <= index < depth for index in layers):
@@ -131,6 +143,40 @@ def _attention(q, k, v, rope, heads, key_mask=None, ref_span=None, ref_isolate=F
         ref = F.scaled_dot_product_attention(q[:, :, s:e], k[:, :, s:e], v[:, :, s:e])
         out = torch.cat((main[:, :, :s], ref, main[:, :, s:]), 2)
     return out.transpose(1, 2).flatten(2)
+
+
+def _attention_packed(q, k, v, rope, heads, cu_seqlens, max_seqlen):
+    """Packed counterpart of ``_attention``: one ``[N, H, Dh]`` stream, with
+    ``cu_seqlens`` preventing attention from crossing a sample boundary."""
+    batch, tokens, dim = q.shape
+    if batch != 1:
+        raise ValueError("packed attention expects one packed batch dimension.")
+    shape = (batch, tokens, heads, dim // heads)
+    q = q.reshape(shape)
+    k = k.reshape(shape)
+    if rope is not None:
+        q = rotate(q, rope)
+        k = rotate(k, rope)
+    v = v.reshape(shape)
+    out = ops.attention_varlen(
+        q[0].to(v.dtype),
+        k[0].to(v.dtype),
+        v[0],
+        cu_seqlens,
+        max_seqlen,
+        (dim // heads) ** -0.5,
+    )
+    return out.reshape(batch, tokens, dim)
+
+
+def _affine_packed(y, scale, shift, seg):
+    """``y·(1 + scale[seg]) + shift[seg]`` for a ``(1, N, D)`` packed stream."""
+    return y * (1.0 + scale[seg].unsqueeze(0)) + shift[seg].unsqueeze(0)
+
+
+def _gated_packed(y, gate, seg):
+    """``y·gate[seg]`` for a ``(1, N, D)`` packed stream."""
+    return y * gate[seg].unsqueeze(0)
 
 
 class _TextBlock(nn.Module):
@@ -274,6 +320,13 @@ class _Block(nn.Module):
             return x.float() + _gated(branch.float(), gate.float(), ref_span)
         return x + _gated(branch, gate, ref_span)
 
+    def _gated_residual_packed(self, x, branch, gate, seg):
+        """Packed ``x + gate[seg]·branch``, with the same fp16 guards as the
+        per-sample path."""
+        if self.fp32_residual:
+            return x.float() + _gated_packed(branch.float(), gate.float(), seg)
+        return x + _gated_packed(branch, gate, seg)
+
     def forward(
         self,
         x,
@@ -283,11 +336,15 @@ class _Block(nn.Module):
         ref_span=None,
         ref_isolate=False,
         ctx=None,
+        packed=None,
     ):
         """``ref_span = (start, end)``: the reference tokens, if any. ``modulation``
         is ``(B,6,D)``, or ``(B,6,2,D)`` with the second set modulating the
         reference tokens. ``ref_isolate``: see ``_attention``. ``ctx`` (``_Fused``):
-        the fused branch's rope positions, bands and segment ids."""
+        the fused branch's rope positions, bands and segment ids. ``packed``:
+        the token-major variable-length path (no reference tokens, no skips)."""
+        if packed is not None:
+            return self._forward_packed(x, rope, modulation, packed)
         if (
             self.fused
             and ctx is not None
@@ -325,6 +382,98 @@ class _Block(nn.Module):
             gate_f,
             ref_span,
         )
+
+    def _forward_packed(self, x, rope, modulation, packed):
+        """``forward`` on a ``(1, N, D)`` packed stream with varlen attention."""
+        if (
+            self.fused
+            and modulation.ndim == 3
+            and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        ):
+            return self._forward_fused_packed(x, modulation, packed)
+        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
+        y = _affine_packed(self.norm1(x), scale_a, shift_a, packed.seg)
+        dtype = _linear_dtype(self.proj["q"])
+        y = y.to(dtype)
+        q = self.q_norm(self.proj["q"](y).unflatten(-1, (self.heads, -1))).flatten(2)
+        k = self.k_norm(self.proj["k"](y).unflatten(-1, (self.heads, -1))).flatten(2)
+        attn = _attention_packed(
+            q,
+            k,
+            self.proj["v"](y).to(dtype),
+            rope,
+            self.heads,
+            packed.cu_seqlens,
+            packed.max_seqlen,
+        )
+        x = self._gated_residual_packed(x, self.proj["o"](attn), gate_a, packed.seg)
+        y = _affine_packed(self.norm2(x), scale_f, shift_f, packed.seg)
+        hidden, gate = self.proj["ffn_up_gate"](y.to(dtype)).chunk(2, -1)
+        return self._gated_residual_packed(
+            x,
+            self.proj["ffn_down"](_situ(hidden, gate).to(dtype)),
+            gate_f,
+            packed.seg,
+        )
+
+    def _forward_fused_packed(self, x, modulation, packed):
+        """The fused block ops on the packed stream; the same arithmetic as
+        ``_forward_packed`` with the vendored kernels doing the elementwise work."""
+        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
+        dtype = _linear_dtype(self.proj["q"])
+        batch, tokens, dim = x.shape
+        head_dim = dim // self.heads
+        flat = x.reshape(-1, dim).contiguous()
+        y = ops.rms_norm_mod(
+            flat,
+            self.norm1.weight,
+            shift_a,
+            scale_a,
+            packed.seg,
+            self.norm1.eps,
+        ).to(dtype)
+        q, k = ops.qk_norm_rope(
+            self.proj["q"](y).reshape(-1, self.heads, head_dim),
+            self.proj["k"](y).reshape(-1, self.heads, head_dim),
+            self.q_norm.weight,
+            self.k_norm.weight,
+            packed.pos,
+            packed.bands,
+            self.q_norm.eps,
+        )
+        v = self.proj["v"](y).reshape(tokens, self.heads, head_dim)
+        attn = ops.attention_varlen(
+            q,
+            k,
+            v,
+            packed.cu_seqlens,
+            packed.max_seqlen,
+            head_dim**-0.5,
+        )
+        x = ops.gated_residual(
+            flat,
+            self.proj["o"](attn.reshape(batch, tokens, dim)).reshape(-1, dim),
+            gate_a,
+            packed.seg,
+            1.0,
+        ).reshape(batch, tokens, dim)
+        y = ops.rms_norm_mod(
+            x.reshape(-1, dim).contiguous(),
+            self.norm2.weight,
+            shift_f,
+            scale_f,
+            packed.seg,
+            self.norm2.eps,
+        ).to(dtype)
+        up_gate = self.proj["ffn_up_gate"](y)
+        hidden = ops.situ_glu(up_gate.reshape(-1, up_gate.shape[-1]))
+        return ops.gated_residual(
+            x.reshape(-1, dim),
+            self.proj["ffn_down"](hidden.reshape(batch, tokens, -1)).reshape(-1, dim),
+            gate_f,
+            packed.seg,
+            1.0,
+        ).reshape(batch, tokens, dim)
 
     def _forward_fused(self, x, modulation, key_mask, ref_span, ref_isolate, ctx):
         """``forward`` with the norm+modulation, qk-norm+RoPE, SiTU-GLU and gated
@@ -718,6 +867,23 @@ class MOSSImageTransformer(ModelMixin, ConfigMixin):
                 x = hook(index, x, n_img)
         return x
 
+    def run_layers_packed(self, x, rope, mod, packed, skip_layers=None):
+        """The 42 blocks on one packed ``(1, N, D)`` stream.
+
+        The packed trainer is text-to-image only: per-sample ``skip_layers`` and
+        the ``layer_hook`` (REPA / DAVE) need a per-sample token view, so they
+        stay on the reference path and raise here instead of silently changing
+        the arithmetic.
+        """
+        skips = _validate_skip_layers(skip_layers, len(self.layers))
+        if skips:
+            raise ValueError("packed training does not support skip_layers.")
+        if self.layer_hook is not None:
+            raise ValueError("packed training does not support layer_hook.")
+        for layer in self.layers:
+            x = layer(x, rope, mod, packed=packed)
+        return x
+
     def head(self, features, head_mod, height, width):
         """Image-token hidden state after the last block ``(B, H·W, D)`` →
         velocity ``(B, C, H, W)``. Spectrum forecasts ``features`` and calls this."""
@@ -890,6 +1056,89 @@ class MOSSImageTransformer(ModelMixin, ConfigMixin):
         if return_features:
             return features
         return self.head(features, head, height, width)
+
+    def forward_packed(self, latents, timesteps, embeddings, max_batch=None):
+        """One packed forward over samples with different image and text lengths.
+
+        ``latents``: list of ``(1, C, H, W)``; ``embeddings``: list of
+        ``(1, S, text_dim)`` at true lengths; ``timesteps``: scalar or
+        ``(B,)`` in ``1000·σ``. Returns one velocity ``(1, C, H, W)`` per sample.
+        Attention is variable-length, so rows never cross a sample boundary.
+        ``max_batch`` pads ``cu_seqlens`` with zero-length trailing segments so
+        the compiled block sees one tensor shape across a short final batch.
+        Reference latents, ``skip_layers`` and ``layer_hook`` are not expressed
+        here; the trainer keeps those runs on the per-sample path.
+        """
+        if not latents or len(latents) != len(embeddings):
+            raise ValueError("latents and embeddings need one entry per sample.")
+        if self.layer_hook is not None:
+            raise ValueError("packed forward does not support layer_hook.")
+        batch = len(latents)
+        device = latents[0].device
+        times = torch.as_tensor(timesteps, device=device, dtype=torch.float32).reshape(
+            -1
+        )
+        if times.numel() == 1:
+            times = times.expand(batch)
+        if times.numel() != batch:
+            raise ValueError("timesteps needs one value per sample.")
+        xs, ropes, poses, lengths = [], [], [], []
+        for latent, embeds in zip(latents, embeddings):
+            if latent.ndim != 4 or latent.shape[0] != 1:
+                raise ValueError("each packed latent must be (1, C, H, W).")
+            if latent.shape[1] != self.config.latent_channels:
+                raise ValueError(
+                    "latent channels must match the model's latent_channels."
+                )
+            if embeds.ndim != 3 or embeds.shape[0] != 1 or embeds.shape[1] < 1:
+                raise ValueError(
+                    "each packed embedding must be (1, S, text_dim), S >= 1."
+                )
+            x, rope, pos = self.embed_sample(latent, embeds)
+            xs.append(x)
+            ropes.append(rope)
+            poses.append(pos)
+            lengths.append(x.shape[1])
+        x = torch.cat(xs, 1)
+        rope = torch.cat(ropes, 1)
+        pos = torch.cat(poses, 1).squeeze(0)
+        seg = torch.repeat_interleave(
+            torch.arange(batch, dtype=torch.int32, device=device),
+            torch.tensor(lengths, dtype=torch.int64, device=device),
+        )
+        bounds = [0]
+        for length in lengths:
+            bounds.append(bounds[-1] + length)
+        if max_batch is not None:
+            if max_batch < batch:
+                raise ValueError("max_batch cannot be smaller than the packed batch.")
+            bounds.extend([bounds[-1]] * (max_batch + 1 - len(bounds)))
+        cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device=device)
+        # Round the launch bound so ``torch.compile`` sees a stable integer while
+        # the exact per-sample lengths stay in ``cu_seqlens``.
+        max_seqlen = (max(lengths) + 127) // 128 * 128
+        packed = _Packed(seg, cu_seqlens, max_seqlen, pos, self.rope.bands)
+        mod, head = self.time_conditioning(times, batch)
+        if max_batch is not None and batch < max_batch:
+            # Keep the per-sample modulation tensor's leading shape stable too;
+            # the trailing rows are never indexed by ``seg``.
+            mod = F.pad(mod, (0, 0, 0, 0, 0, max_batch - batch))
+            head = F.pad(head, (0, 0, 0, 0, 0, max_batch - batch))
+        x = self.run_layers_packed(x, rope, mod, packed)
+        out, start = [], 0
+        for index, latent in enumerate(latents):
+            height, width = latent.shape[-2:]
+            n_img = height * width
+            out.append(
+                self.head(
+                    x[:, start : start + n_img],
+                    head[index : index + 1],
+                    height,
+                    width,
+                )
+            )
+            start += lengths[index]
+        return out
 
 
 class MOSSImageScheduler(FlowMatchEulerDiscreteScheduler):

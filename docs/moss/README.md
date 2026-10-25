@@ -106,12 +106,18 @@ and it now takes the same `--precision` / `--fp16_fix` so the plan matches the r
 - **Time**: 30 images × 20 epochs (600 steps) takes about 18–21 min on a 5070 Ti. The
   LoRA moves line work and palette toward the set; character identity holds, including
   characters the set does not contain.
+- **Packed batches**: `--batch_size N` puts several samples in one varlen
+  forward (no shape grouping, no padding); `--token_batch T` caps a batch by
+  joint image+text tokens. The default stays `1`. Reference latents, REPA and
+  per-sample skips remain on the batch-1 path. Design and compile notes:
+  `docs/moss/packed_batches.md`.
 - **Memory**: the default plan is no checkpointing, `--blocks_to_swap 12`,
   `--activation_memory_budget 0.1`: 1.85 s/step, ~13.1 GB peak reserved, ~1.7 GB free at
   ~4.5k joint tokens. `--blocks_to_swap 24` leaves room for longer captions at the same
   speed; `--grad_checkpointing --blocks_to_swap 0` fits without swap, slower. The best swap
   count depends on the PCIe link and GPU; `tune_swap.py` times each count on the cache's
-  largest sample (about 4 min) and prints the flags to train with. Full plan table:
+  largest sample — or the largest packed batch when passed the same `--batch_size` /
+  `--token_batch` — (about 4 min) and prints the flags to train with. Full plan table:
   guidebook §4.2.
 
   ```bash
@@ -133,9 +139,12 @@ and it now takes the same `--precision` / `--fp16_fix` so the plan matches the r
   at 1024² (swap 12 / budget 0.15 ran out of memory); `tune_swap.py` measures a LoRA only.
   `--down_init` applies to `lora` only. At lr 1e-4, LoKr f8 came close to the LoRA and LoHa
   r16 overshot (palette shift, costume leakage); LoHa at lr 5e-5 is unmeasured.
-- **Checkpoints**: `--save_every_epochs N` also saves `<name>/<name>_eN.safetensors`
-  beside the final file (the last epoch is the final file). A `.json` run report
-  (per-step loss) lands beside the LoRA.
+- **Checkpoints / resume**: `--save_every_epochs N` also saves
+  `<name>/<name>_eN.safetensors` beside the final file (the last epoch is the final
+  file). `<output>.state.pt` holds the adapter, optimizer, LR schedule, scaler and
+  RNG streams at each completed epoch; `--resume <that file>` continues from the
+  next epoch. A process that died mid-epoch replays that epoch. A `.json` run
+  report (per-step loss) lands beside the LoRA.
 - **`--fit_report`** (off): trains the largest sample (longest caption) at step 1 and
   reports its peak against free VRAM, with a `--blocks_to_swap` suggestion.
 - **Caption dropout** (`--caption_dropout`, default 0): keep 0. On caststation 0.05 and 0.1
@@ -227,6 +236,7 @@ REPA, parked, `_archive/moss_lora/repa.md`); `--ref_timestep` / `--ref_isolate` 
 
 ## More
 
+- Packed batches (`--batch_size` / `--token_batch`): `docs/moss/packed_batches.md`.
 - Channel scaling and `--dc_isolate`: `docs/moss/channel_scaling.md`. DAVE: `docs/moss/dave.md`.
 - Fused block kernels (`MONADFORGE_MOSS_KERNELS`, measured numbers, the text-encoder
   varlen ops, `--quant` and `--optimizer`, what is ported but not wired):
