@@ -60,16 +60,31 @@ logger = logging.getLogger(__name__)
 
 
 def load_lora(path: str):
-    """Return (downs, ups, alphas) dicts keyed by module stem; tensors fp32."""
+    """Return (downs, ups, alphas) dicts keyed by module stem; tensors fp32.
+
+    A PEFT / diffusion-pipe export (``lora_A``/``lora_B`` under
+    ``diffusion_model.*``) is converted to the kohya key layout first; kohya
+    files keep the streaming ``safe_open`` read.
+    """
+    from networks.lora_utils import convert_peft_lora_state_dict, has_peft_lora_keys
+
     downs, ups, alphas = {}, {}, {}
     with safe_open(path, framework="pt") as f:
-        for k in f.keys():
+        keys = list(f.keys())
+        if has_peft_lora_keys(keys):
+            converted = convert_peft_lora_state_dict(
+                {k: f.get_tensor(k) for k in keys}, None
+            )
+            items = converted.items()
+        else:
+            items = ((k, f.get_tensor(k)) for k in keys)
+        for k, value in items:
             if k.endswith(".lora_down.weight"):
-                downs[k[: -len(".lora_down.weight")]] = f.get_tensor(k).float()
+                downs[k[: -len(".lora_down.weight")]] = value.float()
             elif k.endswith(".lora_up.weight"):
-                ups[k[: -len(".lora_up.weight")]] = f.get_tensor(k).float()
+                ups[k[: -len(".lora_up.weight")]] = value.float()
             elif k.endswith(".alpha"):
-                alphas[k[: -len(".alpha")]] = float(f.get_tensor(k).item())
+                alphas[k[: -len(".alpha")]] = float(value.item())
     return downs, ups, alphas
 
 

@@ -1,6 +1,6 @@
 import os
 import re
-from typing import Dict, List, Optional, Union
+from typing import Dict, Iterable, List, Optional, Union
 import torch
 from tqdm import tqdm
 from library.runtime.device import synchronize_device
@@ -68,6 +68,160 @@ def relayout_adaln_comfy_to_runtime(
 def has_comfy_adaln_keys(weights_sd: Dict[str, torch.Tensor]) -> bool:
     """True if any key is in the ComfyUI adaln layout (needs comfy→runtime rename)."""
     return any(_ADALN_COMFY_KEY_RE.match(k) for k in weights_sd)
+
+
+# PEFT / diffusion-pipe LoRA key layout → kohya (ComfyUI) key layout.
+#
+# diffusion-pipe and plain PEFT exports name the factors after the *checkpoint*
+# module path with PEFT's spelling, e.g.
+# ``diffusion_model.blocks.0.self_attn.q_proj.lora_A.weight``. Everything in
+# this repo (trainer, merge, inference) speaks the kohya layout
+# ``lora_unet_<path-with-underscores>.lora_down.weight``. ComfyUI bridges the
+# two with ``comfy.lora_convert.convert_lora``; this is the in-repo equivalent,
+# so a PEFT file loads with no external conversion step.
+#
+# Longest prefixes first: ``model.diffusion_model.`` must win over ``model.``.
+_PEFT_WRAPPER_PREFIXES = (
+    "base_model.model.",
+    "base_model.",
+    "model.diffusion_model.",
+    "diffusion_model.",
+    "model.",
+    "net.",
+)
+# PEFT factor tensors: ``<module>.lora_A.weight`` (+ optional adapter name,
+# e.g. ``.lora_A.default.weight``).
+_PEFT_FACTOR_RE = re.compile(
+    r"^(?P<module>.+?)\.(?P<factor>lora_A|lora_B)"
+    r"(?:\.(?P<adapter>[^.]+))?\.weight$"
+)
+_PEFT_ALPHA_RE = re.compile(r"^(?P<module>.+)\.lora_alpha$")
+_PEFT_DORA_RE = re.compile(
+    r"^(?P<module>.+)\.lora_magnitude_vector(?:\.(?P<adapter>[^.]+))?$"
+)
+
+
+def _strip_peft_wrapper(module: str) -> str:
+    """Drop stacked trainer wrappers (``base_model.model.diffusion_model.`` …)."""
+    stripped = module
+    while True:
+        for prefix in _PEFT_WRAPPER_PREFIXES:
+            if stripped.startswith(prefix):
+                stripped = stripped[len(prefix) :]
+                break
+        else:
+            return stripped
+
+
+def has_peft_lora_keys(weights_sd: Iterable[str]) -> bool:
+    """True if the keys carry PEFT ``lora_A`` / ``lora_B`` factors."""
+    return any(_PEFT_FACTOR_RE.match(k) for k in weights_sd)
+
+
+def convert_peft_lora_state_dict(
+    weights_sd: Dict[str, torch.Tensor],
+    alpha_override: Optional[float],
+) -> Dict[str, torch.Tensor]:
+    """Rewrite PEFT / diffusion-pipe keys to the kohya ``lora_unet_*`` layout.
+
+    Pure: a converted file comes back as a new dict, the input untouched; a file
+    already in the kohya layout (or native LoKr/LoHa/GLoKr) is returned as-is.
+
+    ``alpha_override`` wins over a per-module ``lora_alpha`` tensor. When
+    neither exists the rank is used (scale = 1.0, the LyCORIS ``alpha ==
+    lora_dim`` convention) and a warning names the affected modules — a file
+    trained with ``alpha != rank`` needs compensation (``--lora_multiplier``
+    for a uniform alpha, ``network_args peft_alpha=<a>`` otherwise).
+
+    Raises rather than guessing on DoRA magnitude vectors and on factor pairs
+    that cannot be reconstructed (an ``lora_B`` without its ``lora_A``).
+    """
+    if not has_peft_lora_keys(weights_sd):
+        return weights_sd
+
+    dora_keys = [k for k in weights_sd if _PEFT_DORA_RE.match(k)]
+    if dora_keys:
+        raise RuntimeError(
+            f"PEFT checkpoint carries {len(dora_keys)} DoRA magnitude vector(s) "
+            f"(first: {dora_keys[0]!r}). The decompose renormalization cannot be "
+            "reproduced by this repo's LoRA modules — load it in ComfyUI or "
+            "merge the file with official PEFT/LyCORIS tooling first."
+        )
+
+    alpha_by_module: Dict[str, float] = {}
+    alpha_source_keys: set[str] = set()
+    for key, value in weights_sd.items():
+        match = _PEFT_ALPHA_RE.match(key)
+        if match is None:
+            continue
+        if value.numel() != 1:
+            raise ValueError(
+                f"PEFT alpha at {key!r} is not a scalar (numel={value.numel()}); "
+                "cannot derive the per-module scale."
+            )
+        alpha_by_module[_strip_peft_wrapper(match.group("module"))] = float(
+            value.item()
+        )
+        alpha_source_keys.add(key)
+
+    converted: Dict[str, torch.Tensor] = {}
+    module_by_stem: Dict[str, str] = {}
+    for key, value in weights_sd.items():
+        match = _PEFT_FACTOR_RE.match(key)
+        if match is None:
+            continue
+        module = _strip_peft_wrapper(match.group("module"))
+        if not module:
+            raise ValueError(f"PEFT key {key!r} has no module path after prefix strip.")
+        stem = "lora_unet_" + module.replace(".", "_")
+        factor = "lora_down" if match.group("factor") == "lora_A" else "lora_up"
+        new_key = f"{stem}.{factor}.weight"
+        if new_key in converted or new_key in weights_sd:
+            raise RuntimeError(
+                f"PEFT conversion collision: {key!r} maps to {new_key!r}, which "
+                "already exists in the state dict — the file mixes both layouts "
+                "for the same module."
+            )
+        converted[new_key] = value
+        module_by_stem[stem] = module
+
+    defaulted_alphas: List[str] = []
+    for stem, module in module_by_stem.items():
+        alpha = (
+            alpha_override
+            if alpha_override is not None
+            else alpha_by_module.get(module)
+        )
+        if alpha is None:
+            down = converted.get(f"{stem}.lora_down.weight")
+            if down is None:
+                raise RuntimeError(
+                    f"PEFT module {module!r} has an lora_B factor but no lora_A — "
+                    "the rank and alpha are unrecoverable; the file is malformed."
+                )
+            alpha = float(down.shape[0])
+            defaulted_alphas.append(stem)
+        converted[f"{stem}.alpha"] = torch.tensor(float(alpha), dtype=torch.float32)
+
+    merged = {
+        key: value
+        for key, value in weights_sd.items()
+        if key not in alpha_source_keys and _PEFT_FACTOR_RE.match(key) is None
+    }
+    merged.update(converted)
+    logger.info(
+        f"PEFT LoRA: converted {len(module_by_stem)} module(s) to the "
+        "kohya/ComfyUI key layout (lora_A/lora_B → lora_down/lora_up)"
+    )
+    if defaulted_alphas:
+        logger.warning(
+            f"PEFT LoRA has no lora_alpha for {len(defaulted_alphas)} module(s) "
+            f"(first: {defaulted_alphas[0]!r}) — assuming alpha = rank "
+            "(scale 1.0). If the adapter was trained with alpha != rank, pass "
+            "network_args peft_alpha=<alpha>, or compensate a uniform mismatch "
+            "exactly with --lora_multiplier <alpha/rank>."
+        )
+    return merged
 
 
 def filter_lora_state_dict(

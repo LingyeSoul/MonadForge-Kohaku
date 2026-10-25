@@ -136,6 +136,48 @@ def test_saved_keys_match_comfy_lora_map(tmp_path):
     assert torch.allclose(_out(fresh, x, e), want, atol=1e-6)
 
 
+def _target_names(model):
+    """The runtime module names a default MOSS LoRA targets."""
+    return [
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, torch.nn.Linear) and re.fullmatch(DEFAULT_TARGETS, name)
+    ]
+
+
+def test_saved_file_stems_carry_block_index(tmp_path):
+    """A report that reads blocks out of the FILE must use the file's own naming.
+
+    The runtime name is ``layers.0.proj.q``; the file stem is
+    ``lora_unet_layers_0_proj_q`` — same block, no dot. A parser written for the
+    runtime domain silently returns zero blocks on a file, which is how a
+    per-block table ends up empty while every test stays green.
+    """
+    from safetensors import safe_open
+
+    model = _tiny(layers=6)
+    path = tmp_path / "blocks.safetensors"
+    LoRANetwork(model, rank=4, alpha=2.0).save(path, "fp32")
+
+    with safe_open(str(path), framework="pt") as handle:
+        stems = {k.split(".", 1)[0] for k in handle.keys()}
+
+    # Every stem is dot-free, so a runtime-domain regex cannot see a block.
+    assert all("." not in stem for stem in stems)
+    assert not any(re.search(r"layers\.(\d+)\.", stem) for stem in stems)
+
+    # The file-domain regex sees every block, six targets each.
+    per_block = Counter(
+        int(m[1])
+        for stem in stems
+        if (m := re.search(r"^lora_unet_layers_(\d+)_", stem)) is not None
+    )
+    assert per_block == {i: 6 for i in range(6)}
+
+    # And the stems are exactly the runtime names the adapter patched, re-keyed.
+    assert {"lora_unet_" + n.replace(".", "_") for n in _target_names(model)} == stems
+
+
 @pytest.mark.training_step
 @pytest.mark.parametrize("algo", ["lora", "lokr", "loha"])
 def test_one_step_decreases_loss(algo):

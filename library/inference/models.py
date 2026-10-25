@@ -21,6 +21,20 @@ from library.runtime.device import clean_memory_on_device
 logger = logging.getLogger(__name__)
 
 
+def _load_unet_lora_state(lora_weight_path: str) -> Dict[str, torch.Tensor]:
+    """Load a LoRA file as kohya ``lora_unet_*`` keys.
+
+    ``create_network_from_weights`` and the static-merge hook only understand
+    the kohya layout, so a PEFT / diffusion-pipe export (``diffusion_model.*``
+    + ``lora_A``/``lora_B``) is rewritten first — otherwise the caller's
+    ``lora_unet_`` filter would silently drop every key.
+    """
+    from networks.lora_utils import convert_peft_lora_state_dict
+
+    converted = convert_peft_lora_state_dict(load_file(lora_weight_path), None)
+    return {k: v for k, v in converted.items() if k.startswith("lora_unet_")}
+
+
 def _checkpoint_file_fingerprint(
     path: str,
 ) -> tuple[str, int | None, int | None, int | None, int | None, int | None]:
@@ -212,8 +226,7 @@ def attach_adapters(
         for lora_weight_path in args.lora_weight:
             with safe_open(lora_weight_path, framework="pt") as f:
                 glokr_metadata = dict(f.metadata() or {})
-            lora_sd = load_file(lora_weight_path)
-            lora_sd = {k: v for k, v in lora_sd.items() if k.startswith("lora_unet_")}
+            lora_sd = _load_unet_lora_state(lora_weight_path)
             multiplier = (
                 args.lora_multiplier
                 if isinstance(args.lora_multiplier, (int, float))
@@ -262,8 +275,7 @@ def attach_adapters(
             # __metadata__, so read it separately.
             with safe_open(lora_weight_path, framework="pt") as f:
                 lora_metadata = dict(f.metadata() or {})
-            lora_sd = load_file(lora_weight_path)
-            lora_sd = {k: v for k, v in lora_sd.items() if k.startswith("lora_unet_")}
+            lora_sd = _load_unet_lora_state(lora_weight_path)
 
             multiplier = (
                 args.lora_multiplier
@@ -308,8 +320,7 @@ def attach_adapters(
             # load_file() drops it.
             with safe_open(lora_weight_path, framework="pt") as f:
                 lora_metadata = dict(f.metadata() or {})
-            lora_sd = load_file(lora_weight_path)
-            lora_sd = {k: v for k, v in lora_sd.items() if k.startswith("lora_unet_")}
+            lora_sd = _load_unet_lora_state(lora_weight_path)
 
             multiplier = (
                 args.lora_multiplier
@@ -364,8 +375,7 @@ def attach_adapters(
         for lora_weight_path in args.lora_weight:
             with safe_open(lora_weight_path, framework="pt") as f:
                 se_metadata = dict(f.metadata() or {})
-            lora_sd = load_file(lora_weight_path)
-            lora_sd = {k: v for k, v in lora_sd.items() if k.startswith("lora_unet_")}
+            lora_sd = _load_unet_lora_state(lora_weight_path)
             multiplier = (
                 args.lora_multiplier
                 if isinstance(args.lora_multiplier, (int, float))
@@ -498,7 +508,7 @@ def load_dit_model(
         lora_weights_list = []
         for lora_weight in args.lora_weight:
             logger.info(f"Loading LoRA weight from: {lora_weight}")
-            lora_sd = load_file(lora_weight)  # load on CPU, dtype is as is
+            lora_sd = _load_unet_lora_state(lora_weight)  # load on CPU, dtype is as is
             # Native LyCORIS factorizations (LoKr/LoHa) are not foldable by
             # the static-merge hook (it only understands lora_down/lora_up)
             # — without this the adapter silently no-ops into base-model
@@ -514,9 +524,6 @@ def load_dit_model(
                     lora_weight,
                     len(native_lycoris),
                 )
-            lora_sd = {
-                k: v for k, v in lora_sd.items() if k.startswith("lora_unet_")
-            }  # only keep unet lora weights
             lora_weights_list.append(lora_sd)
     else:
         lora_weights_list = None
