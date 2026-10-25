@@ -101,7 +101,7 @@ import { useNotifyStore } from '../stores/notify'
 import { modelFieldLabel, mossText } from '../i18n/modelWorkspace'
 import { preprocessText } from '../i18n/preprocess'
 import { useTaskStore } from '../stores/task'
-import { modelFields, type QwenField, type Values } from '../utils/qwen21'
+import { isModelField, type QwenField, type Values } from '../utils/qwen21'
 import QwenFields from './QwenFields.vue'
 import HelpPanel from './HelpPanel.vue'
 import PreprocessTaskList from './PreprocessTaskList.vue'
@@ -118,7 +118,10 @@ const helpSession = ref(0)
 const refreshing = ref(false)
 const saving = ref(false)
 const submitting = ref('')
-const fields = computed(() => qwen.value.schema?.cache.filter(field => !modelFields.has(field.name)) ?? [])
+const fields = computed(() => {
+  const schema = qwen.value.schema
+  return schema ? schema.cache.filter(field => !isModelField(schema, field.name)) : []
+})
 const pathFields = computed(() => fields.value.filter(field => ['src', 'out'].includes(field.name)))
 const settingsFields = computed(() => fields.value.filter(field => !pathFields.value.includes(field)))
 const saved = computed(() => qwen.value.saved ? JSON.parse(qwen.value.saved) : null)

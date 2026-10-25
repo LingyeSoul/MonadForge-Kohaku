@@ -51,6 +51,9 @@ class ChainRequest(BaseModel):
 
 
 class FormSchema(BaseModel):
+    # See ``qwen21_service.FormSchema.model_field_names``: the browser must group
+    # by this line's own rule, which is only ``model_dir`` for MOSS.
+    model_field_names: list[str]
     cache: list[FormField]
     train: list[FormField]
     generate: list[FormField]
@@ -65,8 +68,9 @@ class ResolvedPaths(BaseModel):
     tokenizer: str
 
 
-def read_schema() -> FormSchema:
+def read_schema(model_fields: frozenset[str]) -> FormSchema:
     return FormSchema(
+        model_field_names=sorted(model_fields),
         **{
             phase: form_fields(cls)
             for phase, cls in (

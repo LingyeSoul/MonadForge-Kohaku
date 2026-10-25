@@ -30,7 +30,7 @@ class JobResponse(BaseModel):
 
 @router.get("/schema", response_model=svc.FormSchema)
 def schema() -> svc.FormSchema:
-    return svc.read_schema()
+    return svc.read_schema(workspace.MODEL_FIELDS)
 
 
 @router.post("/resolve", response_model=svc.ResolvedPaths)

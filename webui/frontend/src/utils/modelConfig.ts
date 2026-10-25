@@ -1,4 +1,4 @@
-import { modelFields, type Phase, type QwenDraft, type QwenField, type QwenSchema, type Values } from './qwen21.ts'
+import { isModelField, type Phase, type QwenDraft, type QwenField, type QwenSchema, type Values } from './qwen21.ts'
 
 export type ModelConfigSection = 'models' | 'train' | 'generate' | 'tune'
 export interface ModelConfigGroup {
@@ -115,7 +115,7 @@ export function groupModelConfigFields(schema: QwenSchema | null, draft: Partial
     return name ? name.toLowerCase().replace(/[^a-z0-9]+/g, '-') : 'other'
   }
   for (const field of schema.train) {
-    if (modelFields.has(field.name)) {
+    if (isModelField(schema, field.name)) {
       append(target(field), 'models', field)
       continue
     }
@@ -124,12 +124,12 @@ export function groupModelConfigFields(schema: QwenSchema | null, draft: Partial
     append(target(field), 'train', field)
   }
   for (const field of schema.generate) {
-    if (!modelFields.has(field.name) && modelFieldActive(family, 'generate', field.name, modelSectionValues(schema, draft, 'generate'))) append(target(field), 'generate', field)
+    if (!isModelField(schema, field.name) && modelFieldActive(family, 'generate', field.name, modelSectionValues(schema, draft, 'generate'))) append(target(field), 'generate', field)
   }
   // The MOSS swap-tuning form is its own panel and submit action; its fields
   // never belong to the training section even when the backend names a group.
   for (const field of schema.tune ?? []) {
-    if (!modelFields.has(field.name) && modelFieldActive(family, 'tune', field.name, modelSectionValues(schema, draft, 'tune'))) append('tune', 'tune', field)
+    if (!isModelField(schema, field.name) && modelFieldActive(family, 'tune', field.name, modelSectionValues(schema, draft, 'tune'))) append('tune', 'tune', field)
   }
   return groups.filter(group => group.sections.length > 0)
 }

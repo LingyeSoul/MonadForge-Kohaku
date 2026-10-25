@@ -11,7 +11,7 @@ function field(name, value) {
 }
 function schema(family) {
   const model = field('model_dir', `/models/${family}`)
-  return { train: [model, field('rank', 32)], cache: [model, field('src', `/data/${family}`)], generate: [model, field('prompt', family)], ...(family === 'moss' ? { tune: [model, field('rank', 64), field('margin_gb', 2)] } : {}) }
+  return { model_field_names: ['model_dir'], train: [model, field('rank', 32)], cache: [model, field('src', `/data/${family}`)], generate: [model, field('prompt', family)], ...(family === 'moss' ? { tune: [model, field('rank', 64), field('margin_gb', 2)] } : {}) }
 }
 function setup(t) {
   const entries = new Map()
@@ -28,6 +28,7 @@ test('action applicability follows final overrides and never overwrites hidden p
   const calls = []
   const boolField = (name, value) => ({ ...field(name, value), kind: 'bool' })
   const spec = {
+    model_field_names: ['model_dir'],
     train: [field('model_dir', '/models/qwen21'), field('algo', 'lora'), field('factor', -1), field('down_init', 'kaiming')],
     cache: [field('model_dir', '/models/qwen21'), boolField('skip_text', false), boolField('skip_latents', false), field('te_blocks_to_swap', 0)],
     generate: [field('model_dir', '/models/qwen21'), field('lora', ''), field('multipliers', '1.0,0.0'), field('true_cfg_scale', 1), field('negative_prompt', '')],
@@ -74,6 +75,34 @@ test('MOSS tuning values survive profile load, edit and serialization', () => {
   assert.deepEqual(loaded.tune, { rank: 80, margin_gb: 4 })
   assert.deepEqual(readDraft(parsed, JSON.stringify(loaded)).tune, loaded.tune)
   assert.equal(initialDraft(parseSchema(schema('qwen21'))).tune, undefined)
+})
+
+test('each line splits model fields by its own schema rule', () => {
+  const moss = parseSchema({
+    model_field_names: ['model_dir'],
+    train: [field('model_dir', '/m'), field('dit', '/m/dit'), field('rank', 32)],
+    cache: [field('model_dir', '/m'), field('text_encoder', 'int8'), field('src', '/data')],
+    generate: [field('model_dir', '/m'), field('text_encoder', 'int8'), field('prompt', 'sky')],
+  })
+  const draft = initialDraft(moss)
+  assert.deepEqual(draft.models, { model_dir: '/m' })
+  assert.equal(draft.train.dit, '/m/dit')
+  assert.equal(draft.cache.text_encoder, 'int8')
+  assert.equal(draft.generate.text_encoder, 'int8')
+  assert.deepEqual(readDraft(moss, JSON.stringify(draft)), draft)
+  const qwen = parseSchema({
+    model_field_names: ['model_dir', 'dit'],
+    train: [field('model_dir', '/q'), field('dit', '/q/dit'), field('rank', 32)],
+    cache: [], generate: [],
+  })
+  assert.deepEqual(initialDraft(qwen).models, { model_dir: '/q', dit: '/q/dit' })
+  assert.equal(initialDraft(qwen).train.dit, undefined)
+})
+
+test('a saved value missing from the form names the field instead of faking a number error', () => {
+  const parsed = parseSchema({ model_field_names: [], train: [field('rank', 32)], cache: [], generate: [] })
+  assert.throws(() => readDraft(parsed, JSON.stringify({ models: {}, train: {}, cache: {}, generate: {} })), /rank: missing from the form values/)
+  assert.throws(() => parseSchema({ model_field_names: ['dit'], train: [field('rank', 32)], cache: [], generate: [] }), /Model fields missing from the train form: dit/)
 })
 
 test('model workspaces isolate profiles and route cache and training through their own API', async t => {

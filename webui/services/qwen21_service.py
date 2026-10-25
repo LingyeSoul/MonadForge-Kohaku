@@ -69,6 +69,9 @@ class FormField(BaseModel):
 
 
 class FormSchema(BaseModel):
+    # Field names this line keeps in the profile's `models` section. The browser
+    # splits the form by this list instead of carrying its own copy of the rule.
+    model_field_names: list[str]
     cache: list[FormField]
     train: list[FormField]
     generate: list[FormField]
@@ -110,8 +113,9 @@ def form_fields(request_type: type[RequestT]) -> list[FormField]:
     return result
 
 
-def read_schema() -> FormSchema:
+def read_schema(model_fields: frozenset[str]) -> FormSchema:
     return FormSchema(
+        model_field_names=sorted(model_fields),
         cache=form_fields(CacheRequest),
         train=form_fields(TrainRequest),
         generate=form_fields(GenerateRequest),

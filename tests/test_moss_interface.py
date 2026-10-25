@@ -26,7 +26,14 @@ def test_moss_http_schema_strict_inputs_and_runtime(monkeypatch):
     with TestClient(app) as client:
         response = client.get("/moss/schema")
         assert response.status_code == 200
-        assert set(response.json()) == {"cache", "train", "generate", "tune"}
+        assert set(response.json()) == {
+            "model_field_names",
+            "cache",
+            "train",
+            "generate",
+            "tune",
+        }
+        assert response.json()["model_field_names"] == ["model_dir"]
         invalid = client.post("/moss/jobs/train", json={"values": {"rank": "16"}})
         assert invalid.status_code == 400
         assert not calls

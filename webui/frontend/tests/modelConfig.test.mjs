@@ -13,6 +13,7 @@ const entries = groups => groups.flatMap(group => group.sections.flatMap(({ sect
 
 test('basic fields open the page while advanced fields use the backend section', () => {
   const schema = {
+    model_field_names: ['model_dir', 'dit', 'text_encoder', 'vae', 'processor', 'scheduler'],
     train: [
       ...names('model_dir dit text_encoder vae processor scheduler', { group: 'Paths', advanced: true }),
       ...names('cache output', { group: 'Paths' }),
@@ -54,6 +55,7 @@ test('basic fields open the page while advanced fields use the backend section',
 
 test('a section the backend adds later renders under its own name', () => {
   const schema = {
+    model_field_names: [],
     train: [field('weird', 1, [], { group: 'Preview Sampling', advanced: true })],
     cache: [],
     generate: [],
@@ -64,7 +66,7 @@ test('a section the backend adds later renders under its own name', () => {
 })
 
 test('advanced fields without a backend section fall back to the trailing panel', () => {
-  const schema = { train: [field('orphan', 1, [], { advanced: true })], cache: [], generate: [] }
+  const schema = { model_field_names: [], train: [field('orphan', 1, [], { advanced: true })], cache: [], generate: [] }
   const groups = groupModelConfigFields(schema)
   assert.deepEqual(groups.map(group => group.id), ['other'])
   assert.equal(groups[0].titleKey, 'cfgGroupOther')
@@ -75,7 +77,7 @@ test('future fields remain visible while irrelevant algorithm fields stay stored
   const factor = field('factor', -1, [], { kind: 'int', advanced: true, group: 'Architecture' })
   const downInit = field('down_init', 'weight_svd', ['kaiming', 'weight_svd'], { group: 'Architecture' })
   const generate = field('future_generator_parameter', 'generation value', [], { group: 'Other' })
-  const schema = { train: [future, factor, downInit, field('algo', 'loha', [], { group: 'Architecture' })], cache: [], generate: [generate] }
+  const schema = { model_field_names: [], train: [future, factor, downInit, field('algo', 'loha', [], { group: 'Architecture' })], cache: [], generate: [generate] }
   const before = structuredClone(schema)
   const groups = groupModelConfigFields(schema)
   const rows = entries(groups)
@@ -93,7 +95,7 @@ test('future fields remain visible while irrelevant algorithm fields stay stored
 for (const family of ['qwen21', 'moss']) {
   for (const algo of ['lora', 'lokr', 'loha']) {
     test(`${family}/${algo} exposes only consumed adapter parameters and retains hidden values`, () => {
-      const schema = { train: [field('algo', 'lora', [], { group: 'Architecture' }), field('factor', -1, [], { group: 'Architecture' }), field('down_init', 'kaiming', [], { group: 'Architecture' }), ...names('rank alpha targets lora_dtype', { group: 'Architecture' })], cache: [], generate: [] }
+      const schema = { model_field_names: [], train: [field('algo', 'lora', [], { group: 'Architecture' }), field('factor', -1, [], { group: 'Architecture' }), field('down_init', 'kaiming', [], { group: 'Architecture' }), ...names('rank alpha targets lora_dtype', { group: 'Architecture' })], cache: [], generate: [] }
       const draft = { train: { algo, factor: 7, down_init: 'weight_svd' } }
       const before = structuredClone(draft)
       const visible = entries(groupModelConfigFields(schema, draft, family)).map(row => row.field.name)
@@ -172,7 +174,7 @@ test('same-name training and generation settings retain independent values and i
   const trainSeed = field('seed', 1, [], { group: 'Training' }), generationSeed = field('seed', 42, [], { group: 'Other' })
   const trainModel = field('model', 'base', [], { group: 'Architecture' }), generationModel = field('model', 'sft', [], { group: 'Architecture' })
   const trainCompile = field('compile', false, [], { group: 'Performance', advanced: true }), generationCompile = field('compile', true, [], { group: 'Performance', advanced: true })
-  const schema = { train: [trainSeed, trainModel, trainCompile], cache: [], generate: [generationSeed, generationModel, generationCompile] }
+  const schema = { model_field_names: [], train: [trainSeed, trainModel, trainCompile], cache: [], generate: [generationSeed, generationModel, generationCompile] }
   const rows = entries(groupModelConfigFields(schema))
   const keyed = new Map(rows.map(row => [`${row.section}.${row.field.name}`, row.field]))
   assert.equal(keyed.get('train.seed'), trainSeed)
@@ -186,13 +188,13 @@ test('same-name training and generation settings retain independent values and i
 
 test('method choices come from the schema without replacing or normalizing API values', () => {
   const choices = ['loha', 'lora', 'lokr', 'custom_adapter', 'LoRA']
-  const schema = { train: [field('algo', 'lora', choices, { group: 'Architecture' })], cache: [], generate: [] }
+  const schema = { model_field_names: [], train: [field('algo', 'lora', choices, { group: 'Architecture' })], cache: [], generate: [] }
   assert.deepEqual(modelAlgorithmItems(schema), [
     { title: 'LoHa', value: 'loha' }, { title: 'LoRA', value: 'lora' }, { title: 'LoKr', value: 'lokr' },
     { title: 'custom_adapter', value: 'custom_adapter' }, { title: 'LoRA', value: 'LoRA' },
   ])
   assert.deepEqual(choices, ['loha', 'lora', 'lokr', 'custom_adapter', 'LoRA'])
-  assert.deepEqual(modelAlgorithmItems({ train: [], cache: [], generate: [] }), [])
+  assert.deepEqual(modelAlgorithmItems({ model_field_names: [], train: [], cache: [], generate: [] }), [])
   assert.deepEqual(modelAlgorithmItems(null), [])
   assert.deepEqual(groupModelConfigFields(null), [])
 })
@@ -201,6 +203,7 @@ test('the MOSS tune section renders in its own panel, not under training', () =>
   const swapGrid = field('swap_grid', '8,12', [], { group: 'Training', advanced: true })
   const modelDir = field('model_dir', '', [], { group: 'Paths', advanced: true })
   const schema = {
+    model_field_names: ['model_dir'],
     train: [
       field('epochs', 8, [], { group: 'Training', advanced: true }),
       field('lr', 1e-4, [], { group: 'Training' }),

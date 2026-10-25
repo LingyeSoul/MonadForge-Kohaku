@@ -17,6 +17,8 @@ export interface QwenField {
   group: string | null
 }
 export interface QwenSchema {
+  /** Field names the backend keeps in the profile's `models` section. */
+  model_field_names: string[]
   cache: QwenField[]
   train: QwenField[]
   generate: QwenField[]
@@ -36,7 +38,6 @@ export interface QwenResult {
   seed: number
   prompt: string
 }
-export const modelFields = new Set(['model_dir', 'dit', 'text_encoder', 'vae', 'processor', 'scheduler'])
 export const draftKey = 'monadforge-qwen21-form-v1'
 
 function object(value: Json, label: string): JsonObject {
@@ -58,6 +59,12 @@ function number(value: Json, label: string): number {
 function scalar(value: Json, label: string): Scalar {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return value
   return number(value, label)
+}
+function names(value: Json, label: string): string[] {
+  if (!Array.isArray(value)) throw new Error(`Missing ${label}`)
+  const result = value.map(item => string(item, label))
+  if (new Set(result).size !== result.length) throw new Error(`Duplicate ${label}`)
+  return result
 }
 function field(value: Json): QwenField {
   const row = object(value, 'Qwen field')
@@ -82,21 +89,32 @@ export function parseSchema(value: Json): QwenSchema {
     if (new Set(result.map(item => item.name)).size !== result.length) throw new Error(`Duplicate ${phase} fields`)
     return result
   }
-  return { cache: fields('cache'), train: fields('train'), generate: fields('generate'), ...(row.tune ? { tune: fields('tune') } : {}) }
+  const modelFields = names(row.model_field_names, 'model fields')
+  const train = fields('train')
+  const trainNames = new Set(train.map(item => item.name))
+  // A model field the train form does not offer would silently leave the draft.
+  const orphans = modelFields.filter(name => !trainNames.has(name))
+  if (orphans.length > 0) throw new Error(`Model fields missing from the train form: ${orphans.join(', ')}`)
+  return { model_field_names: modelFields, cache: fields('cache'), train, generate: fields('generate'), ...(row.tune ? { tune: fields('tune') } : {}) }
+}
+/** The backend owns which fields live in the `models` section, and it differs per line. */
+export function isModelField(schema: QwenSchema, name: string): boolean {
+  return schema.model_field_names.includes(name)
 }
 export function initialDraft(schema: QwenSchema): QwenDraft {
   const defaults = (fields: QwenField[]): Values => Object.fromEntries(fields.map(item => [item.name, item.value]))
   return {
-    models: defaults(schema.train.filter(item => modelFields.has(item.name))),
-    cache: defaults(schema.cache.filter(item => !modelFields.has(item.name))),
-    train: defaults(schema.train.filter(item => !modelFields.has(item.name))),
-    generate: defaults(schema.generate.filter(item => !modelFields.has(item.name))),
-    ...(schema.tune ? { tune: defaults(schema.tune.filter(item => !modelFields.has(item.name))) } : {}),
+    models: defaults(schema.train.filter(item => isModelField(schema, item.name))),
+    cache: defaults(schema.cache.filter(item => !isModelField(schema, item.name))),
+    train: defaults(schema.train.filter(item => !isModelField(schema, item.name))),
+    generate: defaults(schema.generate.filter(item => !isModelField(schema, item.name))),
+    ...(schema.tune ? { tune: defaults(schema.tune.filter(item => !isModelField(schema, item.name))) } : {}),
   }
 }
 export function checkedValues(fields: QwenField[], value: Json): Values {
   const row = object(value, 'Qwen values')
   const entries = fields.map(item => {
+    if (!(item.name in row)) throw new Error(`${item.name}: missing from the form values`)
     const val = scalar(row[item.name], item.name)
     const valid = val === null ? item.nullable
       : item.kind === 'bool' ? typeof val === 'boolean'
@@ -116,11 +134,11 @@ export function readDraft(schema: QwenSchema, text: string | null): QwenDraft {
   const value: Json = JSON.parse(text)
   const row = object(value, 'Saved Qwen draft')
   return {
-    models: checkedValues(schema.train.filter(item => modelFields.has(item.name)), row.models),
-    cache: checkedValues(schema.cache.filter(item => !modelFields.has(item.name)), row.cache),
-    train: checkedValues(schema.train.filter(item => !modelFields.has(item.name)), row.train),
-    generate: checkedValues(schema.generate.filter(item => !modelFields.has(item.name)), row.generate),
-    ...(schema.tune ? { tune: checkedValues(schema.tune.filter(item => !modelFields.has(item.name)), row.tune ?? {}) } : {}),
+    models: checkedValues(schema.train.filter(item => isModelField(schema, item.name)), row.models),
+    cache: checkedValues(schema.cache.filter(item => !isModelField(schema, item.name)), row.cache),
+    train: checkedValues(schema.train.filter(item => !isModelField(schema, item.name)), row.train),
+    generate: checkedValues(schema.generate.filter(item => !isModelField(schema, item.name)), row.generate),
+    ...(schema.tune ? { tune: checkedValues(schema.tune.filter(item => !isModelField(schema, item.name)), row.tune ?? {}) } : {}),
   }
 }
 export async function requestJson(path: string, init: RequestInit): Promise<Json> {
