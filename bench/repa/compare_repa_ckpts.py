@@ -89,6 +89,9 @@ DEFAULT_LABELS = ["layer8", "layer26"]
 DEFAULT_TRAINED_LAYER = {"layer8": 8, "layer26": 26}
 
 _BLK = re.compile(r"blocks_(\d+)_")
+# MOSS-Image names its blocks ``layers.N`` (file stems ``lora_unet_layers_N_...``).
+# This reader is Anima-only; a MOSS file must be refused by name, not scored zero.
+_LAYERS_BLK = re.compile(r"layers_(\d+)_")
 
 
 # ───────────────────────────── ΔW structural analysis ──────────────────────────
@@ -99,6 +102,10 @@ def delta_w_by_block(adapter_path: str) -> dict[int, dict[str, float]]:
     and the (norm-weighted mean) stable rank ``‖ΔW‖_F²/‖ΔW‖_2²`` over the modules
     of each DiT block. Stable rank needs only the top singular value
     (``matrix_norm(ord=2)``), so no full SVD.
+
+    An empty table is never a valid answer: it reads as "this adapter changed
+    nothing", which a trained file never means. A file with no Anima block index
+    is a different model line (MOSS-Image keys blocks ``layers.N``) and raises.
     """
     sd = load_file(adapter_path)
     downs = {
@@ -106,13 +113,27 @@ def delta_w_by_block(adapter_path: str) -> dict[int, dict[str, float]]:
         for k, v in sd.items()
         if k.endswith(".lora_down.weight")
     }
+    if not downs:
+        raise ValueError(
+            f"{adapter_path}: no `.lora_down.weight` keys — this ΔW reader takes "
+            "plain LoRA files only (hydra/chimera/ortho/LoKR store other factors)."
+        )
+
+    unpaired = [base for base in downs if base + ".lora_up.weight" not in sd]
+    if unpaired:
+        raise ValueError(
+            f"{adapter_path}: {len(unpaired)} module(s) carry `.lora_down.weight` "
+            f"without `.lora_up.weight` (first: {unpaired[0]!r}); a partial ΔW "
+            "table would under-report this adapter's structural mass."
+        )
+
     out: dict[int, dict[str, float]] = {}
     for base, down in downs.items():
-        up = sd.get(base + ".lora_up.weight")
-        if up is None:
-            continue
+        up = sd[base + ".lora_up.weight"]
         m = _BLK.search(base)
         if m is None:
+            # Legitimately non-block targets (x_embedder, final_layer) contribute
+            # no block row; that is different from finding no blocks at all.
             continue
         blk = int(m.group(1))
         rank = down.shape[0]
@@ -127,6 +148,19 @@ def delta_w_by_block(adapter_path: str) -> dict[int, dict[str, float]]:
         acc["srank_w"] += srank * fro  # norm-weight the stable rank
         acc["wsum"] += fro
         acc["n"] += 1
+    if not out:
+        sample = sorted(downs)[0]
+        hint = (
+            " — its blocks are named `layers.N` (MOSS-Image), which this "
+            "Anima reader does not index"
+            if _LAYERS_BLK.search(sample) is not None
+            else ""
+        )
+        raise ValueError(
+            f"{adapter_path}: none of the {len(downs)} module(s) carries an Anima "
+            f"block index (`blocks_<n>_`); first module is {sample!r}{hint}. "
+            "Refusing to report an empty ΔW table."
+        )
     for blk, acc in out.items():
         acc["fro"] = float(np.sqrt(acc["fro2"]))
         acc["srank"] = acc["srank_w"] / (acc["wsum"] + 1e-12)
