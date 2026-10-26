@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi import FastAPI
@@ -108,7 +109,17 @@ def test_moss_resolve_shows_the_single_file_vae(tmp_path):
     resolved = moss_service.resolve_values({"vae": str(vae), "dit": str(dit)})
     assert resolved.vae == str(vae)
     assert resolved.dit == str(dit)
-    assert moss_service.resolve_values({}).vae.endswith("MOSS-Image-Base/vae")
+    default = moss_service.resolve_values({})
+    assert Path(default.vae).parts[-2:] == ("MOSS-Image-Base", "vae")
+    # A quantized TE is one file, not the catalog's folder row.
+    from library import downloads
+
+    assert default.text_encoder == str(
+        downloads.by_id()["moss_te_int8"].dest / downloads.MOSS_TE_INT8_FILE
+    )
+    assert moss_service.resolve_values({"text_encoder": "bf16"}).text_encoder == str(
+        Path(default.model_dir) / "MOSS-Image-Base" / "text_encoder"
+    )
 
 
 def test_moss_tokenizer_requires_the_chat_template(tmp_path):
@@ -128,6 +139,11 @@ def test_moss_tokenizer_requires_the_chat_template(tmp_path):
     (folder / "chat_template.jinja").unlink()
     config.write_text('{"chat_template": "{{ messages }}"}', encoding="utf-8")
     moss_service.require_tokenizer(folder)
+
+    # The key existing is not the template: `null` fails in transformers.
+    config.write_text('{"chat_template": null}', encoding="utf-8")
+    with pytest.raises(ValueError, match="chat template"):
+        moss_service.require_tokenizer(folder)
 
 
 def _quantized_te(tmp_path, prefix="language_model."):

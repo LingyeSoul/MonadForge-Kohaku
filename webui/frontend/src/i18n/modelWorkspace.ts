@@ -37,7 +37,7 @@ function isChinese(language: string): boolean {
 }
 
 /** The label for a request field; MOSS carries its own 中文 copy. */
-export function modelFieldLabel(family: string, language: string, name: string, fallback: string, section = 'train'): string {
+export function modelFieldLabel(family: string, language: string, name: string, fallback: string, section: string): string {
   const entry = family === 'moss' ? mossField(name, section) : undefined
   if (entry) return isChinese(language) ? entry[1] : entry[0]
   return fallback === `qwenField_${name}` ? name.replace(/_/g, ' ') : fallback
@@ -47,13 +47,13 @@ export function modelFieldLabel(family: string, language: string, name: string, 
  * The long help under a field. The request definitions stay the single source
  * of the English text; MOSS ships a 中文 mirror so the panel is readable in 中文.
  */
-export function modelFieldHelp(family: string, language: string, name: string, fallback: string, section = 'train'): string {
+export function modelFieldHelp(family: string, language: string, name: string, fallback: string, section: string): string {
   const entry = family === 'moss' ? mossField(name, section) : undefined
   return entry && isChinese(language) ? entry[2] : fallback
 }
 
 /** The editable MOSS form uses the exact request key, independent of locale. */
-export function modelInputLabel(family: string, language: string, name: string, fallback: string, section = 'train'): string {
+export function modelInputLabel(family: string, language: string, name: string, fallback: string, section: string): string {
   return family === 'moss' ? name : modelFieldLabel(family, language, name, fallback, section)
 }
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import errno
 import math
 import os
 import re
@@ -214,7 +215,11 @@ def _pid_alive(pid):
         return False
     except PermissionError:
         return True
-    except OSError:
+    except OSError as exc:
+        # Windows reports a vanished pid as ERROR_INVALID_PARAMETER (87) rather
+        # than ESRCH, so a dead trainer must be recognised from `winerror` too.
+        if exc.errno == errno.ESRCH or getattr(exc, "winerror", None) == 87:
+            return False
         return None
     return True
 

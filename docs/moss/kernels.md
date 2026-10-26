@@ -45,7 +45,7 @@ trace, always compiles. `moss-tune` exposes the same switch as `--no-compile`.
 | `MONADFORGE_MOSS_KERNELS` | `1` | `0` forces the reference branch |
 | `MONADFORGE_MOSS_COMPILE_PROBE` | `1` | `0` compiles fused blocks without testing that dynamo can run them |
 | `MONADFORGE_MOSS_TEXT_KERNELS` | `1` | `0` keeps HF's Qwen3.5 text forward instead of the packed varlen ops |
-| `KOHAKUMOSS_KERNEL_CACHE` | `~/.cache/kohakumoss_kernels` | where the per-shape tuning decisions are stored |
+| `KOHAKUMOSS_KERNEL_CACHE` | `~/.cache/library.moss.vendor.kohakumoss_kernels` | where the per-shape tuning decisions are stored |
 | `KOHAKUMOSS_LOG_LEVEL` | `INFO` | the vendored stack's own logger |
 
 The branch is all-or-nothing per model, and it is *the same arithmetic*: every kernel is
@@ -161,7 +161,7 @@ inside the step:
 .venv/bin/python -m scripts.moss.prewarm_kernels \
     --cache post_image_dataset/moss \
     --dit /path/moss_image_base_fp16_fixed.safetensors \
-    --precision fp16 --from-cache
+    --precision bf16 --from-cache
 ```
 
 Lengths come from the cache **headers** only (`*.moss_latent.safetensors` patch grid
@@ -169,8 +169,15 @@ plus the longest text embedding in `*.moss_te.safetensors`, references included 
 batch 1); geometry comes from the DiT header via `library.moss.checkpoint.arch_config`
 (42 × 3072, 24 heads × 128, ffn 8192). `--from-cache` tunes only the length buckets the
 dataset hits instead of the vendor's power-of-two cascade; `--max-len` drops longer
-samples. `--dry-run` prints every `(kernel, key)` problem plus a JSON summary
-(`--json-only` for the JSON alone) without importing torch or touching CUDA.
+samples. `--precision` must be the dtype the run really binds: `fp16` or `bf16` (a run
+left on `--precision auto` trains bf16 on sm80+, fp16 below). `--batch-size N` (N > 1)
+also warms the packed segment counts `train.make_batches` really builds -- a full batch
+plus its shorter tail -- over `attn_varlen_impl_*` and the varlen attention kernels.
+`--dry-run` prints every `(kernel, key)` problem plus a JSON summary (`--json-only` for
+the JSON alone) without touching CUDA (a `--dit` file still imports torch to read its
+header). `--token-batch N` matches the trainer's joint-token cap: a batch then ends
+before `--batch-size` whenever the next sample would pass it, and the warmed segment
+counts follow.
 
 A real run refuses to start unless `nvidia-smi` reports at least 3000 MiB free
 (`--min-free-mib`), so it cannot disturb a job already training; `--allow-busy` opts
@@ -183,5 +190,6 @@ tunes tables that lane never consults. `attention_varlen` is only reached by pac
 training (`--batch-size > 1`), and on sm70 the Triton attention kernel is unavailable
 (eager fallback), so a V100 plan lists those rows but skips them. The payoff is the
 bf16 lane on sm80+ (what `fuse` accepts) and packed runs there: pass the matching
-`--precision bf16 --batch-size N`. On an sm70 card the command is still the right
-smoke test -- it says, in the summary, that nothing on this lane is tunable.
+`--precision bf16 --batch-size N` (or leave `--precision auto`). On an sm70 card the
+command is still the right smoke test -- it says, in the summary, that nothing on this
+lane is tunable.

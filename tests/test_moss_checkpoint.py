@@ -281,6 +281,35 @@ def test_custom_rope_base_is_recovered_from_rope_bands(tmp_path):
     assert torch.equal(loaded.rope.bands, model.rope.bands)
 
 
+def test_custom_rope_base_survives_a_key_prefix(tmp_path):
+    model = tiny(num_heads=2, rope_base=5000.0)
+    path = write(
+        tmp_path / "rope.safetensors",
+        comfy_state(model, prefix="model.diffusion_model."),
+    )
+    assert checkpoint.arch_config(path)["rope_base"] == 5000.0
+
+
+def test_16_bit_rope_bands_need_a_sidecar(tmp_path):
+    """A half-precision bands table cannot say which base it came from."""
+    model = tiny(num_heads=2, rope_base=5000.0)
+    state = comfy_state(model)
+    state["rope.bands"] = state["rope.bands"].to(torch.float16)
+    path = write(tmp_path / "rope.safetensors", state)
+    with pytest.raises(CheckpointFormatError, match="cannot be recovered exactly"):
+        checkpoint.arch_config(path)
+    Path(f"{path}.json").write_text(json.dumps({"rope_base": 5000.0}), encoding="utf-8")
+    assert checkpoint.arch_config(path)["rope_base"] == 5000.0
+
+
+def test_a_sidecar_must_agree_with_fp32_rope_bands(tmp_path):
+    model = tiny(num_heads=2, rope_base=5000.0)
+    path = write(tmp_path / "rope.safetensors", comfy_state(model))
+    Path(f"{path}.json").write_text(json.dumps({"rope_base": 6000.0}), encoding="utf-8")
+    with pytest.raises(CheckpointFormatError, match="disagrees"):
+        checkpoint.arch_config(path)
+
+
 def test_dit_must_be_a_safetensors_file_not_a_folder(tmp_path):
     with pytest.raises(ValueError, match="folder"):
         load_transformer("", dit=str(tmp_path), dtype=torch.float32)
@@ -332,6 +361,15 @@ def test_service_preflight_refuses_a_non_moss_safetensors(tmp_path):
     path = tmp_path / "other.safetensors"
     save_file({"bogus.weight": torch.ones(2, 2)}, str(path))
     with pytest.raises(ValueError, match="not a MOSS-Image DiT"):
+        moss_service.validate_paths(TrainRequest(dit=str(path)))
+
+
+def test_service_preflight_refuses_a_dtype_the_loader_would_refuse(tmp_path):
+    """The browser check is the loader's whitelist, not a quantized blacklist."""
+    state = comfy_state(tiny())
+    state["layers.0.proj.o.weight"] = torch.ones(32, 32, dtype=torch.int64)
+    path = write(tmp_path / "int64.safetensors", state)
+    with pytest.raises(ValueError, match="Unsupported"):
         moss_service.validate_paths(TrainRequest(dit=str(path)))
 
 

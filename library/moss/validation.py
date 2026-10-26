@@ -8,7 +8,13 @@ from pathlib import Path
 
 from library.env import resolve_under_home
 
-from .requests import CacheRequest, GenerateRequest, TrainRequest, TuneSwapRequest
+from .requests import (
+    CacheRequest,
+    ColorizeCacheRequest,
+    GenerateRequest,
+    TrainRequest,
+    TuneSwapRequest,
+)
 
 
 def training_output_paths(output: str) -> tuple[Path, Path]:
@@ -41,12 +47,18 @@ def validate_single_file(value: str, field: str) -> None:
 
 
 def validate_dit(dit: str) -> None:
-    """Kept as the named DiT check the requests have always used."""
+    """`--dit`: the single-file replacement for `--model`'s transformer folder."""
     validate_single_file(dit, "dit")
 
 
 def validate_request(
-    req: CacheRequest | GenerateRequest | TrainRequest | TuneSwapRequest,
+    req: (
+        CacheRequest
+        | ColorizeCacheRequest
+        | GenerateRequest
+        | TrainRequest
+        | TuneSwapRequest
+    ),
 ) -> None:
     for field in dataclasses.fields(req):
         value = getattr(req, field.name)
@@ -60,7 +72,11 @@ def validate_request(
             raise ValueError(
                 "resolution must be at least 16 and max_text_tokens positive"
             )
-    if isinstance(req, CacheRequest):
+        # `--vae` is only opened for the latent pass, so a skip must not
+        # require it (the browser preflight makes the same allowance).
+        if not req.skip_latents:
+            validate_single_file(req.vae, "vae")
+    if isinstance(req, ColorizeCacheRequest):
         validate_single_file(req.vae, "vae")
     if isinstance(req, TrainRequest):
         validate_dit(req.dit)
@@ -100,7 +116,9 @@ def validate_request(
         ):
             raise ValueError("invalid sigma distribution or logging interval")
     if isinstance(req, GenerateRequest):
-        validate_dit(req.dit)
+        # `decode_only` never opens the DiT; the VAE and out_dir are all it reads.
+        if not req.decode_only:
+            validate_dit(req.dit)
         validate_single_file(req.vae, "vae")
         if req.width <= 0 or req.height <= 0 or req.width % 16 or req.height % 16:
             raise ValueError("width and height must be positive multiples of 16")

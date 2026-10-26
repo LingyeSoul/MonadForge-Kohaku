@@ -11,6 +11,8 @@ import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { installArgs } from "./npm_args.mjs";
+
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const frontendDir = resolve(scriptDir, "../../webui/frontend");
 const lockPath = resolve(frontendDir, "package-lock.json");
@@ -313,8 +315,16 @@ function verifyAfterInstall() {
 
 function npmMajorVersion() {
   const result = runNpm(["--version"]);
+  if (result.error || result.status === null) {
+    fail(`npm could not be started (${result.error?.message ?? "unknown error"})`);
+  }
   const major = Number.parseInt(String(result.stdout || "").trim().split(".")[0], 10);
-  return Number.isFinite(major) ? major : 0;
+  if (!Number.isFinite(major) || result.status !== 0) {
+    fail(
+      `npm --version failed (status ${result.status}): ${String(result.stderr || "").trim()}`,
+    );
+  }
+  return major;
 }
 
 function installFromLock() {
@@ -322,22 +332,11 @@ function installFromLock() {
   console.log(
     `[npm-security] repairing frontend tree with npm ci --ignore-scripts (${offline ? "offline" : "prefer-offline"} mode)`,
   );
-  const args = [
-    "ci",
-    "--ignore-scripts",
-    offline ? "--offline" : "--prefer-offline",
-    "--no-audit",
-    "--no-fund",
-  ];
-  // npm >= 12 defaults `allow-remote=none`, which refuses URL tarballs whose
-  // host differs from the configured registry (EALLOWREMOTE).  The lockfile is
-  // pinned to registry.npmmirror.com mirror tarballs, while a machine may have
-  // registry.npmjs.org configured — every fetch would then be blocked.  The
-  // trust gate is validateLock() above (approved https hosts, sha512
-  // integrity, pinned versions, no unreviewed lifecycle hooks), so let npm
-  // fetch exactly the URLs that gate approved.
-  if (npmMajorVersion() >= 12) args.push("--allow-remote=all");
+  const args = installArgs(npmMajorVersion(), offline);
   const result = runNpm(args);
+  if (result.error || result.status === null) {
+    fail(`npm ci could not be started (${result.error?.message ?? "unknown error"})`);
+  }
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
   return result.status === 0;

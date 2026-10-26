@@ -77,8 +77,9 @@ _MODEL_DIR_HELP = f"folder holding MOSS-Image-Base/ and MOSS-Image-SFT/ (default
 _DIT_HELP = (
     "DiT from a single .safetensors file instead of --model's transformer/ folder "
     "(ComfyUI layout: fused proj.qkv, optional model.diffusion_model. prefix, and an "
-    "fp16-fix fold in the metadata is undone on load). The text encoder / VAE still "
-    "come from --model_dir; quantized single files are refused"
+    "fp16-fix fold in the metadata is undone on load). The text encoder / VAE that "
+    "cache and generate load still come from --model_dir; quantized single files "
+    "are refused"
 )
 _VAE_HELP = (
     "VAE from a single .safetensors file instead of --model_dir's "
@@ -181,7 +182,9 @@ class ColorizeCacheRequest(Request):
         "sparse captions + 1: embeds_v1 … embeds_v{variants-1} hold tag-dropped "
         "colour captions (at least 2)",
     )
-    tag_dropout: float = _f(0.8, "share of the colour caption's tags a sparse caption drops")
+    tag_dropout: float = _f(
+        0.8, "share of the colour caption's tags a sparse caption drops"
+    )
     seed: int = _f(0, "RNG seed of the pair draw, holdout and sparse captions")
     staging: str = _f(
         "post_image_dataset/i2i/colorize/staging",
@@ -207,7 +210,9 @@ class ColorizeCacheRequest(Request):
         advanced=True,
     )
     te_file: str = _f(
-        "", "quantized TE file instead of the catalog's (fp8 / int8 only)", advanced=True
+        "",
+        "quantized TE file instead of the catalog's (fp8 / int8 only)",
+        advanced=True,
     )
     vae: str = _f("", _VAE_HELP)
     model_dir: str = _f("", _MODEL_DIR_HELP, advanced=True)
@@ -785,7 +790,8 @@ class TuneSwapRequest(Request):
         group="Performance",
     )
     batch_size: int = _f(
-        1, "packed batch size to time; match the training run (see docs/moss/packed_batches.md)"
+        1,
+        "packed batch size to time; match the training run (see docs/moss/packed_batches.md)",
     )
     token_batch: int = _f(
         0, "packed token cap to time; 0 = batch_size alone (needs batch_size >= 2)"

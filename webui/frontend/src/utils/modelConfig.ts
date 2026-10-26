@@ -32,7 +32,6 @@ const PANEL_TITLE_KEYS: Record<string, string> = {
   other: 'cfgGroupOther',
 }
 
-/** Match the actual request consumers, not whether a field happens to be in the schema. */
 /** Which picker a path-shaped field gets. Keyed by request field name. */
 export const PATH_KINDS: Record<string, 'file' | 'directory' | 'either'> = {
   model_dir: 'directory', dit: 'either', text_encoder: 'either', vae: 'either', processor: 'directory', scheduler: 'either',
@@ -51,8 +50,12 @@ export function modelFieldType(field: QwenField): 'path' | 'select' | QwenField[
   return PATH_KINDS[field.name] ? 'path' : field.kind
 }
 
-export function modelPathKind(field: QwenField): 'file' | 'directory' | 'either' | undefined {
-  return field.choices.length > 0 ? undefined : PATH_KINDS[field.name]
+export function modelPathKind(family: TypedModelFamily, field: QwenField): 'file' | 'directory' | 'either' | undefined {
+  if (field.choices.length > 0) return undefined
+  // MOSS's `dit` / `vae` replace a folder with one file; the Qwen line takes
+  // either a component folder or a single file for the same field names.
+  if (family === 'moss' && (field.name === 'dit' || field.name === 'vae')) return 'file'
+  return PATH_KINDS[field.name]
 }
 
 export function modelPathExtensions(family: TypedModelFamily, section: string, name: string): string {
@@ -63,7 +66,9 @@ export function modelPathExtensions(family: TypedModelFamily, section: string, n
   return '.safetensors'
 }
 
-export function modelPathMustExist(section: string, name: string): boolean {
+export function modelPathMustExist(section: string, name: string, values: Values): boolean {
+  // `decode_only` reads `<out_dir>/latents/`; every other generate output is written.
+  if (section === 'generate' && name === 'out_dir') return values.decode_only === true
   return !['cache.out', 'train.output', 'generate.out_dir', 'tune.output'].includes(`${section}.${name}`)
 }
 

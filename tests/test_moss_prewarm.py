@@ -165,18 +165,10 @@ def test_plan_default_buckets(tmp_path):
     cache = _fake_cache(tmp_path)
     plan, _, _ = _plan(cache)
 
-    # attention: one key per power-of-two length bucket up to the longest joint
+    # lengths reported for the power-of-two cascade up to the longest joint
     assert plan.lengths == (64, 128, 256, 268, 650, 1500)
-    attention = [p for p in plan.problems if p.op == "attention_varlen"]
-    assert len(attention) == 5 * len(plan.lengths)
-    assert {p.kernel for p in attention} == {
-        "attn_varlen_fwd_triton",
-        "attn_varlen_dkdv_triton",
-        "attn_varlen_dq_triton",
-        "attn_varlen_fused_triton",
-        "attn_varlen_bwd_strategy_triton",
-    }
-    assert "torch.float16-h24-d128-L1024-S1" in {p.key for p in attention}
+    # batch 1 runs torch SDPA, so no attention_varlen table is warmed
+    assert not [p for p in plan.problems if p.op == "attention_varlen"]
 
     # blocks: one run per (op, row bucket); 650 and 268 share the 1024 bucket
     blocks = [p for p in plan.problems if p.op != "attention_varlen"]
@@ -193,21 +185,16 @@ def test_plan_default_buckets(tmp_path):
         "triton_gated_residual_bwd",
         "d3072-torch.float16-False-n2048",
     ) in keys
-    assert len(plan.runs) == len(plan.lengths) + 4 * 2
+    assert len(plan.runs) == 4 * 2
 
 
 def test_plan_from_cache_uses_observed_lengths_only(tmp_path):
     cache = _fake_cache(tmp_path)
     plan, _, _ = _plan(cache, from_cache=True)
 
-    # one key per observed length bucket: 268 -> L512, 650 -> L1024, 1500 -> L2048
+    # only the observed lengths: 268 -> L512, 650 -> L1024, 1500 -> L2048
     assert plan.lengths == (268, 650, 1500)
-    attention = [p for p in plan.problems if p.op == "attention_varlen"]
-    assert len(attention) == 3 * 5
-    assert {p.key for p in attention} == {
-        f"torch.float16-h24-d128-L{bucket}-S1" for bucket in (512, 1024, 2048)
-    }
-    assert len(plan.runs) == 3 + 8
+    assert len(plan.runs) == 4 * 2  # blocks only at batch 1
 
 
 def test_plan_max_len_drops_long_samples(tmp_path):
@@ -225,18 +212,82 @@ def test_plan_max_len_rejects_everything(tmp_path):
         _plan(cache, max_len=100)
 
 
-def test_plan_packed_ignores_refs(tmp_path):
+def test_plan_packed_refuses_reference_latents(tmp_path):
+    """`train.py` exits on refs at batch > 1, so the plan must not warm them."""
     cache = _fake_cache(tmp_path)
-    plan, _, _ = _plan(cache, batch_size=8)
+    with pytest.raises(ValueError, match="reference latents need --batch-size 1"):
+        _plan(cache, batch_size=8)
 
+
+def test_plan_packed_segment_counts_follow_make_batches(tmp_path):
+    """Segments are the batch sizes `make_batches` builds: a full batch + tail."""
+    from dataclasses import replace
+
+    cache = _fake_cache(tmp_path)
+    samples, _ = prewarm.read_cache_samples(cache)
+    ref_free = [replace(sample, ref_tokens=0) for sample in samples]
+    assert prewarm.reachable_segments(3, 1) == [1]
+    assert prewarm.reachable_segments(3, 2) == [1, 2]
+    assert prewarm.reachable_segments(4, 2) == [2]
+    assert prewarm.reachable_segments(1, 8) == [1]
+    assert prewarm.reachable_segments(2, 8) == [2]
+    # a token cap ends a batch early; the warmed set is its upper bound
+    assert prewarm.reachable_segments(8, 8, token_batch=250, longest=100) == [1, 2]
+
+    plan = prewarm.build_plan(
+        cache,
+        ref_free,
+        prewarm.MOSS_IMAGE_GEOMETRY,
+        "test",
+        "fp16",
+        2,
+        False,
+    )
     attention = [p for p in plan.problems if p.op == "attention_varlen"]
+    # both segment counts occur, so both keys must be warmed at every length
     assert {p.key for p in attention} == {
-        f"torch.float16-h24-d128-L{bucket}-S8"
+        f"torch.float16-h24-d128-L{bucket}-S{segments}"
         for bucket in (64, 128, 256, 512, 1024, 2048)
+        for segments in (1, 2)
     }
-    # the reference latent no longer rides the stream at batch > 1
-    assert any("reference latents are ignored" in note for note in plan.notes)
+    assert {p.kernel for p in attention} == {
+        "attn_varlen_impl_triton",
+        "attn_varlen_fwd_triton",
+        "attn_varlen_dkdv_triton",
+        "attn_varlen_dq_triton",
+        "attn_varlen_fused_triton",
+        "attn_varlen_bwd_strategy_triton",
+    }
     assert any("fp16 lane" in note for note in plan.notes)
+
+
+def test_reachable_segments_match_train_make_batches():
+    """The planner and the trainer must agree on how many segments a batch has."""
+    from library.moss.train import make_batches
+
+    class Sample:
+        n_img = n_ref = n_text = 1
+
+    def built(count, batch_size, token_batch):
+        return sorted(
+            {
+                len(batch)
+                for batch in make_batches([Sample()] * count, batch_size, token_batch)
+            }
+        )
+
+    for count in range(1, 13):
+        for batch_size in (1, 2, 3, 4, 8):
+            assert prewarm.reachable_segments(count, batch_size) == built(
+                count, batch_size, 0
+            )
+    # a token cap can only shrink batches, so its counts are a superset
+    for count in range(2, 13):
+        for batch_size in (2, 4, 8):
+            planned = set(prewarm.reachable_segments(count, batch_size, 400, 1, 1))
+            assert {
+                prewarm._segment_bucket(size) for size in built(count, batch_size, 400)
+            } <= planned
 
 
 def test_plan_bf16_keys(tmp_path):
@@ -344,9 +395,9 @@ def test_main_dry_run_needs_no_gpu(tmp_path, monkeypatch, capsys):
     assert prewarm.main(["--cache", str(cache), "--dry-run", "--json-only"]) == 0
     summary = json.loads(capsys.readouterr().out)
     assert summary["dry_run"] is True
-    assert summary["counts"]["problems"] == 46
-    assert summary["counts"]["runs"] == 14
-    assert summary["counts"]["would_tune"] == 46
+    assert summary["counts"]["problems"] == 16
+    assert summary["counts"]["runs"] == 8
+    assert summary["counts"]["would_tune"] == 16
     # the vendor's real tables live elsewhere; the fake cache has no card dir
     assert summary["tuning_cache"]["cards"] == []
 
@@ -388,6 +439,6 @@ def test_dry_run_as_a_module(tmp_path, repo_root):
     )
     assert proc.returncode == 0, proc.stderr
     summary = json.loads(proc.stdout)
-    assert summary["counts"]["problems"] == 46
-    assert summary["counts"]["would_tune"] == 46
+    assert summary["counts"]["problems"] == 16
+    assert summary["counts"]["would_tune"] == 16
     assert summary["lengths"]["joint_max"] == 1500

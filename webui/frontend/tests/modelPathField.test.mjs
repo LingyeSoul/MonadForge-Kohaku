@@ -25,7 +25,7 @@ function setup(t, section, name, value) {
     if (name === '../composables/useI18n') return { useI18n: () => ({ t: key => key }) }
     throw new Error(`Unexpected import: ${name}`)
   }, exports)
-  const props = vue.reactive({ modelValue: value, field: { key: `${section}.${name}`, path_kind: 'file', path_must_exist: modelPathMustExist(section, name), read_only: false } })
+  const props = vue.reactive({ modelValue: value, field: { key: `${section}.${name}`, path_kind: 'file', path_must_exist: modelPathMustExist(section, name, {}), read_only: false } })
   const scope = vue.effectScope()
   const field = scope.run(() => exports.default.setup(props, { expose() {}, emit() {} }))
   t.after(() => { for (const fn of cleanup) fn(); scope.stop() })

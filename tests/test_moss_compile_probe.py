@@ -106,7 +106,7 @@ def test_the_probe_is_cached_and_honours_the_opt_out(monkeypatch):
     # runs on a CUDA host (this suite runs on CPU too).
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(loader, "_PROBE", None)
-    monkeypatch.setattr(loader, "_probe_triton_compile", lambda: False)
+    monkeypatch.setattr(loader, "_probe_triton_compile", lambda: (False, False))
     assert loader.triton_compile_ok() is False
 
     def probed_twice():
@@ -118,3 +118,16 @@ def test_the_probe_is_cached_and_honours_the_opt_out(monkeypatch):
     monkeypatch.setattr(loader, "_PROBE", None)
     monkeypatch.setenv(loader.PROBE_ENV, "0")
     assert loader.triton_compile_ok() is True
+
+
+def test_a_transient_probe_failure_is_not_cached(monkeypatch):
+    """An OOM while probing says nothing about the torch/triton pair."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(loader, "_PROBE", None)
+    monkeypatch.setattr(loader, "_probe_triton_compile", lambda: (False, True))
+    assert loader.triton_compile_ok() is False
+    assert loader._PROBE is None
+
+    monkeypatch.setattr(loader, "_probe_triton_compile", lambda: (True, False))
+    assert loader.triton_compile_ok() is True
+    assert loader._PROBE is True

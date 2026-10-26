@@ -386,8 +386,12 @@ def triton_compile_ok() -> bool:
     if not torch.cuda.is_available():
         _PROBE = True  # nothing to fuse without a card; fuse() declines anyway
         return True
-    _PROBE = _probe_triton_compile()
-    return _PROBE
+    healthy, transient = _probe_triton_compile()
+    # A transient failure (the probe could not run, e.g. OOM) says nothing about
+    # this torch/triton pair, so it must not be cached as a permanent verdict.
+    if not transient:
+        _PROBE = healthy
+    return healthy
 
 
 def _probe_matches(reference: torch.Tensor, got: torch.Tensor) -> bool:
@@ -419,6 +423,7 @@ def _probe_triton_compile() -> bool:
         return y @ proj
 
     rows, dim = 16, 256
+    transient = False
     try:
         device = torch.device("cuda")
         x = torch.randn(rows, dim, device=device, dtype=torch.float16)
@@ -432,6 +437,13 @@ def _probe_triton_compile() -> bool:
         got = torch.compile(forward, dynamic=True)(*args)
         healthy = _probe_matches(reference, got)
         reason = "compiled result differs from the eager one" if not healthy else ""
+    except torch.cuda.OutOfMemoryError as err:
+        # Not a torch/triton incompatibility: the card could not run the probe.
+        # Report it, but do not poison the once-per-process cache with a verdict
+        # that says nothing about this stack.
+        healthy = False
+        transient = True
+        reason = f"{type(err).__name__}: {str(err).splitlines()[0][:200]}"
     except Exception as err:  # noqa: BLE001 — any failure means do not compile
         healthy = False
         reason = f"{type(err).__name__}: {str(err).splitlines()[0][:200]}"
@@ -443,7 +455,7 @@ def _probe_triton_compile() -> bool:
             reason,
             PROBE_ENV,
         )
-    return healthy
+    return healthy, transient
 
 
 def compile_blocks(blocks) -> None:

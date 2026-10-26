@@ -68,6 +68,7 @@ console.log(JSON.stringify(outputs));
         input=moss_service.read_schema(moss_workspace.MODEL_FIELDS).model_dump_json(),
         capture_output=True,
         text=True,
+        encoding="utf-8",
         cwd=ROOT,
         timeout=30,
         check=True,

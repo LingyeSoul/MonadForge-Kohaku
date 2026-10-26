@@ -217,7 +217,20 @@ def run_colorize_cache(req) -> Path:
         req.vae,
     )
 
-    todo = [j for j in jobs if not ref_path(j[0], j[3]).exists()]
+    stamp = moss_cache.vae_stamp(req.vae)
+
+    def ref_current(stem, held, w, h) -> bool:
+        path = ref_path(stem, held)
+        if not path.is_file():
+            return False
+        meta = moss_cache.cache_metadata(path)
+        return (
+            meta.get("target") == f"{w}x{h}"
+            and meta.get("ref_scale") == str(req.ref_scale)
+            and meta.get("vae", "") == stamp
+        )
+
+    todo = [j for j in jobs if not ref_current(j[0], j[3], *j[4])]
     if todo:
         from library.moss.loader import load_vae
         from library.moss.model import encode as vae_encode
@@ -236,6 +249,7 @@ def run_colorize_cache(req) -> Path:
                     "target": f"{w}x{h}",
                     "ref_scale": str(req.ref_scale),
                     "condition": str(cond),
+                    "vae": stamp,
                 },
             )
             print(f"  ref {i}/{len(todo)} {stem}: {w}x{h} -> {rw}x{rh}", flush=True)

@@ -226,6 +226,15 @@ def test_validation_rejects_a_missing_vae(tmp_path):
         validate_request(GenerateRequest(vae=missing, prompt="x"))
 
 
+def test_a_pass_that_never_opens_the_file_does_not_require_it(tmp_path):
+    """`--skip-latents` never loads the VAE and `--decode-only` never loads the DiT."""
+    missing = str(tmp_path / "nope.safetensors")
+    validate_request(CacheRequest(vae=missing, skip_latents=True, skip_text=True))
+    validate_request(
+        GenerateRequest(decode_only=True, dit=missing, out_dir=str(tmp_path))
+    )
+
+
 @pytest.mark.parametrize("name", ("cache", "generate", "colorize"))
 def test_entry_points_forward_the_vae_to_the_loader(name):
     """Every `load_vae` call must carry `vae=` (or the file would be ignored)."""

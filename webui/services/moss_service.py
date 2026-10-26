@@ -103,13 +103,16 @@ def text_encoder_path(base: Path, precision: str) -> Path:
 
 
 def resolve_values(values: dict[str, Scalar]) -> ResolvedPaths:
-    # The panel posts the training form; the cache/generate `vae` override rides
-    # along for display only, so it is peeled off before TrainRequest validation.
+    # The panel posts the training form; the `vae` / `text_encoder` overrides are
+    # not TrainRequest fields (they belong to the cache / generate phases), so
+    # they ride along for display only and are peeled off before validation.
     values = dict(values)
     vae = str(values.pop("vae", "") or "")
+    text_encoder = str(values.pop("text_encoder", "") or "")
     req = request_from_values(TrainRequest, values)
     root = resolve_model_dir(req.model_dir)
     base = variant_dir(req.model_dir, "base")
+    precision = text_encoder or DEFAULT_TEXT_ENCODER
     return ResolvedPaths(
         model_dir=str(root),
         dit=str(
@@ -118,7 +121,9 @@ def resolve_values(values: dict[str, Scalar]) -> ResolvedPaths:
             else variant_dir(req.model_dir, req.model) / "transformer"
         ),
         text_encoder=str(
-            text_encoder_path(base, getattr(req, "text_encoder", DEFAULT_TEXT_ENCODER))
+            text_encoder_path(base, precision)
+            if precision == "bf16"
+            else quantized_te_file(precision)
         ),
         vae=str(resolve_under_home(vae) if vae else base / "vae"),
         tokenizer=str(base / "tokenizer"),
@@ -167,7 +172,16 @@ def require_tokenizer(path: Path) -> None:
         raise FileNotFoundError(f"MOSS tokenizer config.json not found: {path}")
     if (path / "chat_template.jinja").is_file():
         return
-    if '"chat_template"' in config.read_text(encoding="utf-8"):
+    try:
+        declared = json.loads(config.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"MOSS tokenizer config.json is not JSON: {config} ({exc})"
+        ) from exc
+    template = declared.get("chat_template") if isinstance(declared, dict) else None
+    if (isinstance(template, str) and template.strip()) or (
+        isinstance(template, dict) and template
+    ):
         return
     raise ValueError(
         f"MOSS tokenizer has no chat template: {path} "
@@ -181,10 +195,18 @@ def quantized_te_file(precision: str) -> Path:
     from library import downloads
 
     names = {"int8": downloads.MOSS_TE_INT8_FILE, "fp8": downloads.MOSS_TE_FP8_FILE}
-    try:
-        return downloads.by_id()[f"moss_te_{precision}"].dest / names[precision]
-    except KeyError as exc:
-        raise ValueError(f"Unknown MOSS text encoder precision: {precision}") from exc
+    if precision not in names:
+        raise ValueError(
+            f"Unknown MOSS text encoder precision: {precision!r}; "
+            f"expected one of {tuple(names)}"
+        )
+    row = downloads.by_id().get(f"moss_te_{precision}")
+    if row is None:
+        raise ValueError(
+            f"MOSS text encoder asset row moss_te_{precision} is missing from the "
+            "catalog; re-run `make download-model ARGS=moss-te-" + precision + "`"
+        )
+    return row.dest / names[precision]
 
 
 def require_text_encoder(base: Path, precision: str) -> Path:
@@ -235,6 +257,9 @@ def require_text_encoder(base: Path, precision: str) -> Path:
 
 
 _DIT_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "transformer.")
+# Must stay in step with `library.moss.checkpoint._SUPPORTED_DTYPES`; duplicated
+# because that module imports torch and the browser preflight must stay torch-free.
+_WEIGHT_DTYPES = ("F16", "BF16", "F32")
 
 
 def require_weights_file(path: Path, label: str) -> None:
@@ -242,7 +267,8 @@ def require_weights_file(path: Path, label: str) -> None:
 
     Header-only and torch-free, so the browser form can check the file before a
     GPU job is queued; the worker's loader re-validates every key and shape
-    (`library.moss.checkpoint`).
+    (`library.moss.checkpoint`). The dtype check is the loader's whitelist, not a
+    quantized blacklist: a file the worker would refuse must fail here too.
     """
     if path.is_dir():
         raise ValueError(
@@ -254,12 +280,15 @@ def require_weights_file(path: Path, label: str) -> None:
         raise ValueError(f"{label} must be a .safetensors file: {path}")
     header = read_header(path)
     for key, tensor in header.tensors.items():
-        if key.endswith((".comfy_quant", ".weight_scale")) or tensor.dtype.startswith(
-            ("F8", "I8", "U8")
-        ):
+        if key.endswith((".comfy_quant", ".weight_scale")):
             raise ValueError(
                 f"Quantized {label} is unsupported: {path}; select 16-bit weights "
-                f"({key}, {tensor.dtype})"
+                f"({key})"
+            )
+        if tensor.dtype not in _WEIGHT_DTYPES:
+            raise ValueError(
+                f"Unsupported {label}: {path}; select 16-bit weights "
+                f"(BF16 / FP16 / FP32), got {key} = {tensor.dtype}"
             )
     names = set(header.tensors)
     for prefix in _DIT_PREFIXES:
@@ -291,12 +320,15 @@ def require_vae_file(path: Path, label: str) -> None:
     for key, tensor in header.tensors.items():
         if key.endswith(".num_batches_tracked"):
             continue
-        if key.endswith((".comfy_quant", ".weight_scale")) or tensor.dtype.startswith(
-            ("F8", "I8", "U8")
-        ):
+        if key.endswith((".comfy_quant", ".weight_scale")):
             raise ValueError(
                 f"Quantized {label} is unsupported: {path}; select 16-bit weights "
-                f"({key}, {tensor.dtype})"
+                f"({key})"
+            )
+        if tensor.dtype not in _WEIGHT_DTYPES:
+            raise ValueError(
+                f"Unsupported {label}: {path}; select 16-bit weights "
+                f"(BF16 / FP16 / FP32), got {key} = {tensor.dtype}"
             )
     names = set(header.tensors)
     diffusers_layout = {"encoder.conv_in.weight", "decoder.conv_in.weight"} <= names

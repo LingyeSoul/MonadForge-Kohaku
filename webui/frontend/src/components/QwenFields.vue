@@ -27,7 +27,8 @@ const visibleFields = computed(() => props.fields.filter(field => modelFieldActi
   qwen.value.family, props.section, field.name, modelSectionValues(qwen.value.schema, qwen.value.draft, props.section),
 )))
 function metadata(field: QwenField): FieldMeta {
-  const path = modelPathKind(field)
+  const values = modelSectionValues(qwen.value.schema, qwen.value.draft, props.section)
+  const path = modelPathKind(qwen.value.family, field)
   return {
     key: `${props.section}.${field.name}`, label: modelInputLabel(qwen.value.family, app.language, field.name, t(`qwenField_${field.name}`), props.section),
     value: qwen.value.draft?.[props.section]?.[field.name], default_value: field.value,
@@ -35,7 +36,7 @@ function metadata(field: QwenField): FieldMeta {
     description: field.nullable ? t('qwenAuto') : '', origin: 'method', group: props.section,
     is_virtual: false, read_only: qwen.value.busy || qwen.value.loading, options: field.choices, nullable: field.nullable,
     path_kind: path, path_extensions: modelPathExtensions(qwen.value.family, props.section, field.name),
-    path_must_exist: modelPathMustExist(props.section, field.name),
+    path_must_exist: modelPathMustExist(props.section, field.name, values),
     multiline: field.multiline,
   }
 }

@@ -115,9 +115,10 @@ What the loader handles, all from the header before any weight is read:
 - fused `layers.N.proj.qkv.weight` split into q / k / v (ComfyUI's chunk order);
 - a `model.diffusion_model.` / `diffusion_model.` / `transformer.` key prefix stripped;
 - the architecture inferred from the tensor shapes — `rope_base` comes back out of
-  the file's own `rope.bands`, so no `config.json` is required (a `<file>.json`
-  beside it — `foo.json` or `foo.safetensors.json` — overrides the inference and
-  must agree with it);
+  the file's own `rope.bands` when that table is fp32. A 16-bit table (or one with
+  a single band) cannot state the base exactly, so those files need a `<file>.json`
+  sidecar — `foo.json` or `foo.safetensors.json` — with `{"rope_base": …}`; every
+  other key in it must agree with the inferred shapes;
 - an **fp16-fix fold undone on load**. `moss_image_base_fp16_fixed` carries
   `kohakumoss_fp16_fix` (c = 1/16) with the fold baked into its weights; loading
   divides it back out (exact for a power-of-two c), so the LoRA trains in the

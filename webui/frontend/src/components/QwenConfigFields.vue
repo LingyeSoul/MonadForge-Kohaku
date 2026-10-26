@@ -88,15 +88,19 @@ async function openHelp(key: string): Promise<void> {
 async function inspectPaths(): Promise<void> {
   const selected = qwen.value
   await selected.perform(async () => {
-    // MOSS keeps the VAE override out of the training request; send it so the
-    // panel shows the single file the cache/generate jobs will actually load.
-    const values = { ...selected.draft?.train, ...selected.draft?.models, ...(selected.family === 'moss' ? { vae: selected.draft?.cache?.vae ?? '' } : {}) }
+    // MOSS keeps the VAE and text-encoder overrides out of the training request;
+    // send them so the panel shows the single files the jobs will actually load.
+    const values = {
+      ...selected.draft?.train,
+      ...selected.draft?.models,
+      ...(selected.family === 'moss' ? { vae: selected.draft?.cache?.vae ?? '', text_encoder: selected.draft?.cache?.text_encoder ?? '' } : {}),
+    }
     const draft = selected.draft
     const result = resolvedPaths(await requestJson(`${selected.apiRoot}/resolve`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values }) }), selected.family)
     if (qwen.value === selected && selected.draft === draft) paths.value = result
   })
 }
-watch(() => [qwen.value.profile, qwen.value.draft?.models, qwen.value.draft?.train, qwen.value.draft?.cache?.vae], () => { paths.value = null }, { deep: true })
+watch(() => [qwen.value.profile, qwen.value.draft?.models, qwen.value.draft?.train, qwen.value.draft?.cache?.vae, qwen.value.draft?.cache?.text_encoder], () => { paths.value = null }, { deep: true })
 </script>
 
 <style scoped>

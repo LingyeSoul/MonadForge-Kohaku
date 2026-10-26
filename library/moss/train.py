@@ -378,8 +378,12 @@ def empty_prompt_embeds(req: TrainRequest) -> torch.Tensor:
 
 
 RESUME_FORMAT = 1
+# `dit` arrived with the single-file DiT; a state file written before it has no
+# `dit` key, and an empty one is exactly what those runs trained on.
+_RESUME_DEFAULTS = {"dit": ""}
 _RESUME_KEYS = (
     "model",
+    "dit",
     "algo",
     "rank",
     "alpha",
@@ -476,6 +480,19 @@ def save_resume_state(
     torch.save(_cpu_tree(state), path)
 
 
+def resume_mismatch(saved: dict, current: dict) -> dict:
+    """The keys a saved state disagrees on.
+
+    ``dit`` arrived after the first resume format, so a state file written before
+    it has no key: an empty ``dit`` is exactly what those runs trained on.
+    """
+    return {
+        key: (saved.get(key, _RESUME_DEFAULTS.get(key)), current[key])
+        for key in current
+        if saved.get(key, _RESUME_DEFAULTS.get(key)) != current[key]
+    }
+
+
 def load_resume_state(
     path: Path,
     *,
@@ -494,11 +511,7 @@ def load_resume_state(
         raise SystemExit(f"unsupported MOSS resume format in {path}")
     saved = state["signature"]
     current = resume_signature(req)
-    mismatch = {
-        key: (saved.get(key), current.get(key))
-        for key in current
-        if saved.get(key) != current.get(key)
-    }
+    mismatch = resume_mismatch(saved, current)
     if mismatch:
         raise SystemExit(
             "resume state does not match this run: "

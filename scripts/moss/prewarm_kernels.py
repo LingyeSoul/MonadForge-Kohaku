@@ -80,8 +80,14 @@ ATTENTION_BWD_TABLES = (
     "attn_varlen_fused_triton",
     "attn_varlen_bwd_strategy_triton",
 )
+# The dispatcher `attention_varlen` looks at *before* any kernel: its key carries
+# the backward flag (`-g0` / `-g1`). Bucket rules: MOSS trains, so `-g1`.
+ATTENTION_IMPL_TABLES = ("attn_varlen_impl_triton",)
 
 _VARIANT_RE = re.compile(r"embeds_v[1-9][0-9]*")
+# A tuning table is a small JSON object of key -> winner; anything larger is not
+# one, and reading it would only waste memory.
+MAX_TABLE_BYTES = 4 * 1024 * 1024
 
 
 def _pow2(n: int, floor: int) -> int:
@@ -364,7 +370,9 @@ def _block_keys(
     raise ValueError(f"unknown block op {op!r}")
 
 
-def _lane_notes(precision: str, batch_size: int, has_refs: bool) -> tuple[str, ...]:
+def _lane_notes(
+    precision: str, batch_size: int, token_batch: int = 0
+) -> tuple[str, ...]:
     notes = []
     if precision == "fp16":
         notes.append(
@@ -376,12 +384,46 @@ def _lane_notes(precision: str, batch_size: int, has_refs: bool) -> tuple[str, .
             "batch 1: blocks use torch SDPA, so attention_varlen is not called "
             "(the packed path needs --batch-size > 1)"
         )
-    if has_refs and batch_size > 1:
+    if token_batch > 0:
         notes.append(
-            "reference latents are ignored with --batch-size > 1 "
-            "(packed training rejects them)"
+            f"token_batch {token_batch}: a batch also ends when the next sample "
+            "would pass the cap, so the warmed segment counts are its upper bound"
         )
     return tuple(notes)
+
+
+def reachable_segments(
+    sample_count: int,
+    batch_size: int,
+    token_batch: int = 0,
+    shortest: int = 0,
+    longest: int = 0,
+) -> list[int]:
+    """The packed-batch segment counts a run over these samples can produce.
+
+    Without a token cap ``train.make_batches`` fills every batch to
+    ``batch_size`` and leaves at most one shorter tail, so exactly those two
+    sizes occur (a dataset smaller than the batch never reaches it). With
+    ``--token-batch`` a batch ends as soon as the next sample would pass the cap,
+    which depends on the shuffled order, so the reachable counts are the vendor
+    ``prewarm.segment_counts`` bound: one segment of the longest sample leaves
+    ``(token_batch - longest) // shortest`` more.
+    """
+    if batch_size < 2 or sample_count < 2:
+        return [1]
+    if token_batch <= 0:
+        if sample_count < batch_size:
+            return [sample_count]
+        tail = sample_count % batch_size
+        return sorted({batch_size, tail} - {0})
+    short = min(shortest or longest, longest) if longest else 1
+    most = max(1, min(batch_size, 1 + (token_batch - longest) // short))
+    out, count = [], 1
+    while True:
+        out.append(min(count, most))
+        if count >= most:
+            return out
+        count *= 2
 
 
 def build_plan(
@@ -393,6 +435,7 @@ def build_plan(
     batch_size: int,
     from_cache: bool,
     max_len: int = 0,
+    token_batch: int = 0,
 ) -> Plan:
     """The problems and runs for the active samples (no CUDA, no tensor math)."""
     if precision not in DTYPE_NAMES:
@@ -400,6 +443,14 @@ def build_plan(
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
     include_ref = batch_size == 1
+    refs = [sample.stem for sample in samples if sample.ref_tokens]
+    if refs and not include_ref:
+        # `train.py` refuses this outright, so a plan for it warms shapes no run
+        # will ever request.
+        raise ValueError(
+            "reference latents need --batch-size 1 (packed batching does not "
+            f"support them; {len(refs)} sample(s) carry one, e.g. {refs[0]})"
+        )
     kept: list[Sample] = []
     skipped: list[tuple[str, int]] = []
     for sample in samples:
@@ -414,13 +465,16 @@ def build_plan(
         )
     dtype = DTYPE_NAMES[precision]
     joints = sorted({sample.stream_tokens(include_ref) for sample in kept})
-    has_refs = any(sample.ref_tokens for sample in kept)
+    segments = reachable_segments(
+        len(kept), batch_size, token_batch, joints[0], joints[-1]
+    )
 
     problems: list[Problem] = []
     runs: list[object] = []
 
-    # Attention: one run per length bucket (the vendor's power-of-two cascade
-    # unless --from-cache keeps only lengths the dataset actually feeds).
+    # Attention: one run per (length bucket, segment count). `--from-cache` keeps
+    # only lengths the dataset actually feeds; the segment counts are the ones
+    # `train.make_batches` really builds (a full batch plus a shorter tail).
     candidates = (
         list(joints) if from_cache else _pow2_buckets(max(joints), LENGTH_FLOOR)
     )
@@ -428,24 +482,26 @@ def build_plan(
     used_lengths: list[int] = []
     for length in candidates:
         bucket = _pow2(length, LENGTH_FLOOR)
-        key = _attention_key(dtype, geometry, length, batch_size)
-        if key in seen_attention:
-            continue
-        seen_attention.add(key)
         in_bucket = [j for j in joints if _pow2(j, LENGTH_FLOOR) == bucket]
         rep = max(in_bucket) if in_bucket else length
-        runs.append(
-            AttentionRun("attention_varlen", rep, batch_size, (rep,) * batch_size)
-        )
-        used_lengths.append(rep)
-        problems.extend(
-            Problem("attention_varlen", "fwd", table, key, rep, batch_size)
-            for table in ATTENTION_FWD_TABLES
-        )
-        problems.extend(
-            Problem("attention_varlen", "bwd", table, key, rep, batch_size)
-            for table in ATTENTION_BWD_TABLES
-        )
+        if rep not in used_lengths:
+            used_lengths.append(rep)
+        # At batch 1 the blocks run `torch.scaled_dot_product_attention`; no
+        # `attention_varlen` call happens, so those tables are not warmed.
+        for count in segments if batch_size > 1 else ():
+            key = _attention_key(dtype, geometry, rep, count)
+            if key in seen_attention:
+                continue
+            seen_attention.add(key)
+            runs.append(AttentionRun("attention_varlen", rep, count, (rep,) * count))
+            problems.extend(
+                Problem("attention_varlen", "fwd", table, key, rep, count)
+                for table in (*ATTENTION_IMPL_TABLES, *ATTENTION_FWD_TABLES)
+            )
+            problems.extend(
+                Problem("attention_varlen", "bwd", table, key, rep, count)
+                for table in ATTENTION_BWD_TABLES
+            )
 
     # Blocks: one run per (op, row bucket); the representative is the largest
     # observed joint in the bucket.
@@ -457,10 +513,15 @@ def build_plan(
     for op in BLOCK_OPS:
         for bucket in sorted(row_buckets):
             rows = row_buckets[bucket] * batch_size
-            runs.append(BlockRun(op, rows, batch_size))
-            fwd, bwd = _block_keys(op, geometry, dtype, rows)
-            problems.append(Problem(op, "fwd", fwd[0], fwd[1], rows, batch_size))
-            problems.append(Problem(op, "bwd", bwd[0], bwd[1], rows, batch_size))
+            for count in segments:
+                if rows % count:
+                    # `ops.segments` splits the stream evenly; a batch whose rows
+                    # do not divide never builds this shape.
+                    continue
+                runs.append(BlockRun(op, rows, count))
+                fwd, bwd = _block_keys(op, geometry, dtype, rows)
+                problems.append(Problem(op, "fwd", fwd[0], fwd[1], rows, count))
+                problems.append(Problem(op, "bwd", bwd[0], bwd[1], rows, count))
 
     return Plan(
         cache_dir=cache_dir,
@@ -475,7 +536,7 @@ def build_plan(
         lengths=tuple(used_lengths),
         problems=tuple(problems),
         runs=tuple(runs),
-        notes=_lane_notes(precision, batch_size, has_refs),
+        notes=_lane_notes(precision, batch_size, token_batch),
     )
 
 
@@ -494,9 +555,13 @@ def tuning_root() -> Path:
 
 
 def cached_problems(
-    root: Path, problems: Sequence[Problem]
+    root: Path, problems: Sequence[Problem], only: set[str] | None = None
 ) -> tuple[dict[tuple[str, str], str], list[str]]:
-    """{(kernel, key): "<card>/<tag>"} already on disk, plus the card dirs."""
+    """{(kernel, key): "<card>/<tag>"} already on disk, plus the card dirs.
+
+    `only` restricts the lookup to those card keys: the tables are per card **and**
+    per stack tag, so a hit found under another card says nothing about this run.
+    """
     wanted = {(problem.kernel, problem.key) for problem in problems}
     kernels = {problem.kernel for problem in problems}
     hits: dict[tuple[str, str], str] = {}
@@ -505,14 +570,20 @@ def cached_problems(
         return hits, cards
     for card in sorted(path for path in root.iterdir() if path.is_dir()):
         cards.append(card.name)
+        if only is not None and card.name not in only:
+            continue
         for tag in sorted(path for path in card.iterdir() if path.is_dir()):
             for kernel in kernels:
                 table = tag / f"{kernel}.json"
                 if not table.is_file():
                     continue
                 try:
+                    if table.stat().st_size > MAX_TABLE_BYTES:
+                        continue
                     rows = json.loads(table.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(rows, dict):
                     continue
                 for key in rows:
                     if (kernel, key) in wanted:
@@ -549,18 +620,25 @@ def summarize(
     run_seconds: Sequence[float] | None = None,
     failures: Sequence[dict] | None = None,
     skipped_ops: Sequence[str] = (),
+    before: dict[tuple[str, str], str] | None = None,
 ) -> dict:
+    """The JSON summary. `cached` is the state *after* the run; `before` is the
+    lookup made before it started, so a row that was absent then and present now
+    is `tuned` rather than `cached`."""
+    was_cached = cached if before is None else before
     problems = []
     for problem in plan.problems:
-        hit = (problem.kernel, problem.key) in cached
+        ident = (problem.kernel, problem.key)
         if any(problem.op == op for op in skipped_ops):
             state = "skipped"
-        elif hit:
+        elif ident in was_cached:
             state = "cached"
         elif dry_run:
             state = "would tune"
+        elif ident in cached:
+            state = "tuned"
         else:
-            state = "pending"
+            state = "failed"
         problems.append(
             {
                 "op": problem.op,
@@ -578,7 +656,7 @@ def summarize(
         "cached": sum(1 for item in problems if item["state"] == "cached"),
         "would_tune": sum(1 for item in problems if item["state"] == "would tune"),
         "tuned": sum(1 for item in problems if item["state"] == "tuned"),
-        "pending": sum(1 for item in problems if item["state"] == "pending"),
+        "failed": sum(1 for item in problems if item["state"] == "failed"),
         "skipped": sum(1 for item in problems if item["state"] == "skipped"),
     }
     return {
@@ -820,6 +898,7 @@ def run_plan(
     import torch
 
     from library.moss import ops
+    from library.moss.vendor.kohakumoss_kernels.hardware.device import planning_device
     from library.moss.vendor.kohakumoss_kernels.registry import Bound, exercise
 
     def say(message: str) -> None:
@@ -835,6 +914,10 @@ def run_plan(
         f"GPU         {name}  ({memory.used_mib} MiB used / "
         f"{memory.total_mib} MiB total, {memory.free_mib} MiB free)"
     )
+    # The tables live under `<cache>/tuning/<card>/<stack tag>/`; only this card's
+    # directory can describe this run (another card's hit is a different problem).
+    card = planning_device(device).key
+    say(f"card        {card}")
 
     backends = {}
     skipped_ops = []
@@ -885,7 +968,7 @@ def run_plan(
         say(f"tuned       {run.op:<16} {where:<28} {elapsed:6.2f}s")
         torch.cuda.empty_cache()
 
-    after, _ = cached_problems(tuning_root(), plan.problems)
+    after, _ = cached_problems(tuning_root(), plan.problems, only={card})
     merged = dict(cached)
     merged.update(after)
     return {
@@ -937,13 +1020,25 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--precision",
         default="fp16",
         choices=sorted(DTYPE_NAMES),
-        help="compute dtype the warm-up binds (match the training run)",
+        help=(
+            "compute dtype the warm-up binds: pass the dtype the run really uses "
+            "(a run with --precision auto trains bf16 on sm80+, fp16 below)"
+        ),
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=1,
         help="samples per batch; >1 also warms packed attention segments",
+    )
+    parser.add_argument(
+        "--token-batch",
+        type=int,
+        default=0,
+        help=(
+            "joint-token cap per packed batch the run uses (0 = no cap); narrows "
+            "the warmed segment counts like train.make_batches"
+        ),
     )
     parser.add_argument(
         "--max-len",
@@ -984,7 +1079,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     quiet = args.json_only
     if not args.dry_run:
-        memory = check_gpu_free(args.min_free_mib, args.allow_busy)
+        try:
+            memory = check_gpu_free(args.min_free_mib, args.allow_busy)
+        except ValueError as exc:
+            # nvidia-smi missing or unreadable: a message, not a traceback.
+            raise SystemExit(str(exc)) from exc
     cache_dir = resolve_under_home(args.cache)
     try:
         samples, warnings = read_cache_samples(cache_dir)
@@ -1008,6 +1107,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.batch_size,
             args.from_cache,
             args.max_len,
+            args.token_batch,
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
@@ -1034,6 +1134,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_seconds=result["seconds"],
         failures=result["failures"],
         skipped_ops=result["skipped_ops"],
+        before=cached,
     )
     print(json.dumps(summary, indent=2), flush=True)
     if not quiet:
@@ -1041,7 +1142,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"done: {summary['counts']['tuned']} tuned, "
             f"{summary['counts']['cached']} already cached, "
             f"{summary['counts']['skipped']} skipped, "
-            f"{len(result['failures'])} failed",
+            f"{summary['counts']['failed']} not stored",
             flush=True,
         )
     return 0 if not result["failures"] else 2

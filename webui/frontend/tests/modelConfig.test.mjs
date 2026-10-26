@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { BASIC_GROUP_ID, groupModelConfigFields, modelAlgorithmItems, modelActionValues, modelFieldActive, modelFieldType, modelPathKind, modelPathExtensions, modelSubBlocks } from '../src/utils/modelConfig.ts'
+import { BASIC_GROUP_ID, groupModelConfigFields, modelAlgorithmItems, modelActionValues, modelFieldActive, modelFieldType, modelPathKind, modelPathExtensions, modelPathMustExist, modelSubBlocks } from '../src/utils/modelConfig.ts'
 
 // Mirrors one field of the backend schema: `group` comes from
 // `library.lines.requests.field_group`, `advanced` from the request metadata.
@@ -60,11 +60,16 @@ test('a closed set of choices renders as a select, never as a path picker', () =
   // folder. Rendering the MOSS one as a path let an empty value reach the API.
   const mossPrecision = field('text_encoder', 'int8', ['int8', 'fp8', 'bf16'])
   assert.equal(modelFieldType(mossPrecision), 'select')
-  assert.equal(modelPathKind(mossPrecision), undefined)
+  assert.equal(modelPathKind('moss', mossPrecision), undefined)
+  // MOSS replaces the DiT / VAE folder with one file; Qwen accepts either.
+  assert.equal(modelPathKind('moss', field('dit', '')), 'file')
+  assert.equal(modelPathKind('moss', field('vae', '')), 'file')
+  assert.equal(modelPathKind('qwen21', field('dit', '')), 'either')
+  assert.equal(modelPathKind('qwen21', field('vae', '')), 'either')
 
   const qwenShards = field('text_encoder', '')
   assert.equal(modelFieldType(qwenShards), 'path')
-  assert.equal(modelPathKind(qwenShards), 'either')
+  assert.equal(modelPathKind('qwen21', qwenShards), 'either')
 
   assert.equal(modelFieldType(field('src', '')), 'path')
   assert.equal(modelFieldType(field('prompt', '')), 'str')
@@ -371,4 +376,13 @@ test('file filters use the phase instead of sharing the training output extensio
   assert.equal(modelPathExtensions('moss', 'train', 'output'), '.safetensors')
   assert.equal(modelPathExtensions('moss', 'tune', 'output'), '.json')
   assert.equal(modelPathExtensions('moss', 'train', 'resume'), '.pt')
+  // The reference-image picker passes a list; file_service splits it.
+  assert.equal(modelPathExtensions('moss', 'generate', 'ref_image'), '.png,.jpg,.jpeg,.webp,.bmp')
+})
+
+test('decode-only reads its output folder, so that one must already exist', () => {
+  assert.equal(modelPathMustExist('generate', 'out_dir', {}), false)
+  assert.equal(modelPathMustExist('generate', 'out_dir', { decode_only: true }), true)
+  assert.equal(modelPathMustExist('generate', 'out_dir', { decode_only: false }), false)
+  assert.equal(modelPathMustExist('train', 'output', { decode_only: true }), false)
 })

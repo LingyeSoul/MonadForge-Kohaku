@@ -102,8 +102,8 @@ def prefix_of(keys: list[str]) -> str:
 
 def _layout(
     head: Mapping[str, tuple[str, tuple[int, ...]]],
-) -> tuple[str, dict[str, tuple[str, int | None, str, tuple[int, ...]]], int]:
-    """`(prefix, name -> (source key, qkv chunk, dtype, shape), hint count)`.
+) -> tuple[str, dict[str, tuple[str, int | None, str, tuple[int, ...]]]]:
+    """`(prefix, name -> (source key, qkv chunk, dtype, shape))`.
 
     Fused joint q / k / v are split into three names (the source tensor is read
     once per layer by :func:`read_state`); derived keys and ComfyUI's runtime
@@ -112,13 +112,11 @@ def _layout(
     raw = list(head)
     prefix = prefix_of(raw)
     mapping: dict[str, tuple[str, int | None, str, tuple[int, ...]]] = {}
-    hints = 0
     for key, (dtype, shape) in head.items():
         name = key[len(prefix) :]
         if name in DERIVED:
             continue
         if _RUNTIME_HINT.match(name):
-            hints += 1
             continue
         m = FUSED_QKV.match(name)
         if m is None:
@@ -132,7 +130,7 @@ def _layout(
         part = (shape[0] // 3, *shape[1:])
         for index, layer in enumerate("qkv"):
             mapping[f"{m.group(1)}.{layer}.weight"] = (key, index, dtype, part)
-    return prefix, mapping, hints
+    return prefix, mapping
 
 
 def fold_record(path: str | Path) -> dict | None:
@@ -155,33 +153,58 @@ def fold_record(path: str | Path) -> dict | None:
         raise CheckpointFormatError(
             f"{Path(path).name}: {FOLD_KEY} is not JSON ({exc})"
         ) from exc
+    name = Path(path).name
     scales = record.get("scales", record.get("c"))
     if scales is None:
-        raise CheckpointFormatError(f"{Path(path).name}: {FOLD_KEY} has no c / scales")
+        raise CheckpointFormatError(f"{name}: {FOLD_KEY} has no c / scales")
+    if isinstance(scales, bool) or not isinstance(scales, (int, float, list, tuple)):
+        raise CheckpointFormatError(
+            f"{name}: {FOLD_KEY} scales must be a number or a list of numbers, "
+            f"got {type(scales).__name__}"
+        )
     if isinstance(scales, (int, float)):
         c = float(scales)
     else:
-        values = [float(value) for value in scales]
+        try:
+            values = [float(value) for value in scales]
+        except (TypeError, ValueError) as exc:
+            raise CheckpointFormatError(
+                f"{name}: {FOLD_KEY} scales are not numbers ({exc})"
+            ) from exc
+        if not values:
+            raise CheckpointFormatError(f"{name}: {FOLD_KEY} scales are empty")
         if len(set(values)) != 1:
             raise CheckpointFormatError(
-                f"{Path(path).name}: per-block fold scales {values} are unsupported; "
+                f"{name}: per-block fold scales {values} are unsupported; "
                 "load a uniform-gate fp16-fix file (or the un-folded weights)"
             )
         c = values[0]
     if not c > 0:
-        raise CheckpointFormatError(f"{Path(path).name}: fold c={c!r} is not positive")
+        raise CheckpointFormatError(f"{name}: fold c={c!r} is not positive")
     via = str(record.get("via", "gate"))
     if via != "gate":
         raise CheckpointFormatError(
-            f"{Path(path).name}: fold via={via!r} is unsupported (only the uniform "
+            f"{name}: fold via={via!r} is unsupported (only the uniform "
             "'gate' fold the fp16-fix files carry can be undone)"
         )
-    pregate = record.get("pregate") or (1.0, 1.0)
+    pregate = record.get("pregate")
+    if pregate is None:
+        pregate = (1.0, 1.0)
+    if not isinstance(pregate, (list, tuple)) or len(pregate) != 2:
+        raise CheckpointFormatError(
+            f"{name}: {FOLD_KEY} pregate must be [s_attn, s_ffn], got {pregate!r}"
+        )
+    try:
+        s_attn, s_ffn = (float(value) for value in pregate)
+    except (TypeError, ValueError) as exc:
+        raise CheckpointFormatError(
+            f"{name}: {FOLD_KEY} pregate is not numeric ({exc})"
+        ) from exc
     return {
         "c": c,
         "via": via,
-        "s_attn": float(record.get("s_attn", pregate[0])),
-        "s_ffn": float(record.get("s_ffn", pregate[1])),
+        "s_attn": float(record.get("s_attn", s_attn)),
+        "s_ffn": float(record.get("s_ffn", s_ffn)),
         "eps": str(record.get("eps", "stock")),
     }
 
@@ -209,28 +232,62 @@ def assert_compute_weights(path: str | Path) -> None:
             )
 
 
-def _rope_base(path: Path, head: Mapping[str, tuple[str, tuple[int, ...]]]) -> float:
-    """`rope_base` from the file's own `rope.bands` (`bands[i] = base**(-i/n)`)."""
-    if "rope.bands" not in head:
-        return _KNOWN_ROPE_BASE
+def _rope_base(
+    path: Path,
+    head: Mapping[str, tuple[str, tuple[int, ...]]],
+    prefix: str,
+    declared: float | None,
+) -> float:
+    """`rope_base` from the file's own `rope.bands` (`bands[i] = base**(-i/n)`).
+
+    Only an fp32 table reconstructs the base exactly. A 16-bit table loses
+    enough mantissa that the round trip lands 0.1 %–20 % off (the exponent
+    amplifies the band's own rounding), and a one-entry table says nothing about
+    the base at all; those files must name the base in their `<file>.json`
+    sidecar. Guessing would shift every RoPE frequency of the run without a
+    single warning, so it is refused instead.
+    """
+    key = f"{prefix}rope.bands"
+    source = head.get(key)
+    if source is None:
+        return _KNOWN_ROPE_BASE if declared is None else float(declared)
+    dtype = source[0]
     with _open(path) as handle:
-        bands = handle.get_tensor("rope.bands").float()
+        bands = handle.get_tensor(key).float()
     n = int(bands.numel())
     if abs(float(bands[0]) - 1.0) > 1e-3:
         raise CheckpointFormatError(
-            f"{path.name}: rope.bands is not the expected base**(-i/n) table"
+            f"{path.name}: {key} is not the expected base**(-i/n) table"
         )
     if n < 2:
-        # One band is base-independent (only the exponent-0 entry), so a tiny
-        # model's table cannot tell a custom base from the default.
-        return _KNOWN_ROPE_BASE
+        # A one-entry table holds only the exponent-0 band (1.0), which is the
+        # same for every base: the default is the only thing it can mean.
+        return _KNOWN_ROPE_BASE if declared is None else float(declared)
+    if dtype != "F32":
+        if declared is not None:
+            return float(declared)
+        raise CheckpointFormatError(
+            f"{path.name}: stores {key} as {dtype}, so rope_base cannot be "
+            f'recovered exactly; put {{"rope_base": <value>}} in '
+            f"{path.name}.json (or load a file that keeps rope.bands in fp32)"
+        )
     base = float((1.0 / float(bands[1])) ** n)
     rounded = round(base)
-    if rounded > 0 and abs(base / rounded - 1.0) < 1e-6:
+    if not (rounded > 0 and abs(base / rounded - 1.0) < 1e-6):
         # The table is fp32, so the reconstruction carries a few ulps of error;
         # every shipped base is a whole number (10000 for MOSS-Image).
-        return float(rounded)
-    return base
+        if declared is None:
+            raise CheckpointFormatError(
+                f"{path.name}: rope.bands reconstructs rope_base={base!r}, not a "
+                f'whole number; put {{"rope_base": <value>}} in {path.name}.json'
+            )
+        return float(declared)
+    if declared is not None and abs(float(declared) - rounded) > 1e-6 * rounded:
+        raise CheckpointFormatError(
+            f"{path.name}.json disagrees with {path.name}: rope_base="
+            f"{declared!r}, the fp32 bands say {float(rounded)!r}"
+        )
+    return float(rounded)
 
 
 def _sidecars(path: Path) -> list[Path]:
@@ -248,18 +305,41 @@ def _sidecars(path: Path) -> list[Path]:
     ]
 
 
+def _declared(path: Path) -> dict:
+    """The one config sidecar beside `path` (empty when there is none)."""
+    sidecars = _sidecars(path)
+    if len(sidecars) > 1:
+        raise CheckpointFormatError(
+            f"{path.name}: two config sidecars ({sidecars[0].name}, "
+            f"{sidecars[1].name}) — keep one"
+        )
+    if not sidecars:
+        return {}
+    sibling = sidecars[0]
+    try:
+        declared = json.loads(sibling.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise CheckpointFormatError(f"{sibling.name} is not JSON ({exc})") from exc
+    if not isinstance(declared, dict):
+        raise CheckpointFormatError(f"{sibling.name} is not a JSON object")
+    return declared
+
+
 def arch_config(path: str | Path, head=None) -> dict:
     """`MOSSImageTransformer` kwargs, inferred from the file's tensor shapes.
 
     A `<file>.json` beside the checkpoint — `foo.json` or the literal
     `foo.safetensors.json`, a diffusers `config.json` the user copied over —
-    overrides the inference and must agree with it. There is one MOSS-Image
-    architecture (42 joint blocks, 2 text-refiner blocks), so an unknown shape
-    is an error rather than a guess.
+    may **override** `rope_base`, the one value a 16-bit file cannot state
+    exactly. Every other key is read from the shapes, so a sidecar that
+    disagrees with them is an error (a wrong architecture must not load).
+    There is one MOSS-Image architecture (42 joint blocks, 2 text-refiner
+    blocks), so an unknown shape is an error rather than a guess.
     """
     path = Path(path)
     head = head if head is not None else header(path)
-    _prefix, mapping, _hints = _layout(head)
+    declared = _declared(path)
+    prefix, mapping = _layout(head)
 
     def shape(name: str) -> tuple[int, ...]:
         if name not in mapping:
@@ -301,31 +381,21 @@ def arch_config(path: str | Path, head=None) -> dict:
         "text_dim": shape("text_embedder.proj.weight")[1],
         "freq_dim": shape("time_embedding.0.weight")[1],
         "latent_channels": shape("video_embedder.weight")[1],
-        "rope_base": _rope_base(path, head),
     }
-    sidecars = _sidecars(path)
-    if len(sidecars) > 1:
+    declared_base = declared.pop("rope_base", None)
+    if declared_base is not None and not isinstance(declared_base, (int, float)):
         raise CheckpointFormatError(
-            f"{path.name}: two config sidecars ({sidecars[0].name}, "
-            f"{sidecars[1].name}) — keep one"
+            f"{path.name}.json: rope_base must be a number, got {declared_base!r}"
         )
-    if sidecars:
-        sibling = sidecars[0]
-        try:
-            declared = json.loads(sibling.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise CheckpointFormatError(f"{sibling.name} is not JSON ({exc})") from exc
-        updates = {}
-        for key, value in cfg.items():
-            if key not in declared:
-                continue
-            if declared[key] != value:
-                raise CheckpointFormatError(
-                    f"{sibling.name} disagrees with {path.name}: {key}="
-                    f"{declared[key]!r}, the file says {value!r}"
-                )
-            updates[key] = declared[key]
-        cfg.update(updates)
+    cfg["rope_base"] = _rope_base(path, head, prefix, declared_base)
+    for key, value in declared.items():
+        if key not in cfg:
+            continue
+        if cfg[key] != value:
+            raise CheckpointFormatError(
+                f"{path.name}.json disagrees with {path.name}: {key}="
+                f"{value!r}, the file says {cfg[key]!r}"
+            )
     return cfg
 
 
@@ -339,7 +409,7 @@ def inspect(
     before a single weight is read.
     """
     head = header(path)
-    _prefix, mapping, _hints = _layout(head)
+    _prefix, mapping = _layout(head)
     missing = [name for name in expected if name not in mapping and name not in DERIVED]
     unexpected = [name for name in mapping if name not in expected]
     if missing or unexpected:

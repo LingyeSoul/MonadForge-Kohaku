@@ -19,12 +19,14 @@ leaves two files per image in one flat folder.
     {stem}_{W}x{H}.moss_latent.safetensors
         latent  (128, H/16, W/16) fp32: packed 2×2 and BN-normalised, exactly what
                 the DiT consumes (``model.encode``, the inverse of the decode)
-        metadata: width, height, source, source_size, source_mtime, vae_dtype, resampled
+        metadata: width, height, source, source_size, source_mtime, vae_dtype,
+                  vae (a single-file VAE's identity; "" for the folder VAE), resampled
 
     {stem}.moss_ref.safetensors  (``--pairs`` only)
         latent  (128, h, w) fp32: the pair's condition image, fitted to the
                 target's ``W×H`` and then to 1/``ref_scale`` of its sides
-        metadata: width, height, target, ref_scale, condition, condition_mtime
+        metadata: width, height, target, ref_scale, condition, condition_mtime,
+                  vae
 
 ``W×H`` is the pixel size the latent was encoded at. Text is never padded: the
 DiT slices each context to its true length and the image's rope frame coordinate
@@ -35,8 +37,9 @@ length, ``encoder`` and (under ``layout_json``) ``plain_caption_sha256`` match, 
 a caption edit re-encodes that caption only. A re-encode keeps the file's caption
 variants while its caption is unchanged; after a caption edit they are stale and
 dropped, with a warning. A latent file is current while it is newer than its
-source image; a latent at a different size for the same stem is deleted when the
-new one is written. ``--overwrite`` re-encodes everything.
+source image **and** carries the same single-file ``vae`` stamp; a latent at a
+different size for the same stem is deleted when the new one is written.
+``--overwrite`` re-encodes everything.
 
 Sizing (``target_size``): native aspect, both sides multiples of 16, area at most
 ``resolution²``, **never upscaled**. An image whose sides are already multiples
@@ -579,6 +582,26 @@ def cache_text(
     return {"encoded": len(todo), "load_s": t_load, "encode_s": t_enc, "peak_gib": peak}
 
 
+def vae_stamp(vae: str) -> str:
+    """Identity of a single-file VAE; "" for the folder VAE (no file to stamp)."""
+    if not vae:
+        return ""
+    path = resolve_under_home(vae)
+    stat = path.stat()
+    return f"{path.name}:{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def cache_metadata(path: Path) -> dict:
+    """The metadata block of a cache safetensors file."""
+    with safe_open(path, "pt") as handle:
+        return handle.metadata() or {}
+
+
+def cached_vae(path: Path) -> str:
+    """The ``vae`` stamp a cache file carries ("" when it predates the flag)."""
+    return cache_metadata(path).get("vae", "")
+
+
 def cache_latents(
     pairs,
     out_dir,
@@ -594,12 +617,17 @@ def cache_latents(
     from library.moss.model import encode
 
     plan = []
+    stamp = vae_stamp(vae)
     for p in pairs:
         with Image.open(p.image) as im:
             size = im.size
         w, h = target_size(*size, resolution)
         path = out_dir / f"{p.stem}_{w}x{h}{LATENT_SUFFIX}"
-        current = path.exists() and path.stat().st_mtime >= p.image.stat().st_mtime
+        current = (
+            path.exists()
+            and path.stat().st_mtime >= p.image.stat().st_mtime
+            and cached_vae(path) == stamp
+        )
         if overwrite or not current:
             plan.append((p, size, w, h, path))
     if not plan:
@@ -633,6 +661,7 @@ def cache_latents(
                 "source_size": f"{size[0]}x{size[1]}",
                 "source_mtime": str(p.image.stat().st_mtime),
                 "vae_dtype": vae_dtype,
+                "vae": stamp,
                 "resampled": str(fitted is not image),
             },
         )
@@ -679,6 +708,7 @@ def cache_refs(
     from library.moss.model import encode
 
     plan = []
+    stamp = vae_stamp(vae)
     for p in pairs:
         with Image.open(p.image) as im:
             w, h = target_size(*im.size, resolution)
@@ -686,10 +716,11 @@ def cache_refs(
         path = out_dir / f"{p.stem}{REF_SUFFIX}"
         current = False
         if path.exists() and path.stat().st_mtime >= cond.stat().st_mtime:
-            with safe_open(path, "pt") as f:
-                meta = f.metadata() or {}
-            current = meta.get("target") == f"{w}x{h}" and meta.get("ref_scale") == str(
-                ref_scale
+            meta = cache_metadata(path)
+            current = (
+                meta.get("target") == f"{w}x{h}"
+                and meta.get("ref_scale") == str(ref_scale)
+                and meta.get("vae", "") == stamp
             )
         if overwrite or not current:
             plan.append((p.stem, cond, w, h, path))
@@ -713,6 +744,7 @@ def cache_refs(
                 "ref_scale": str(ref_scale),
                 "condition": str(cond),
                 "condition_mtime": str(cond.stat().st_mtime),
+                "vae": stamp,
             },
         )
         print(f"  refs {i}/{len(plan)} {stem}: {w}x{h} -> {rw}x{rh}", flush=True)
