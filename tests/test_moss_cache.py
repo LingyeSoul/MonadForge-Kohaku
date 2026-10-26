@@ -398,3 +398,23 @@ def test_cache_text_keeps_variants_of_an_unchanged_caption(
         assert keys == {"embeds", "embeds_v1"}
         assert (meta["caption_v1"], meta["variant_prefix"]) == ("hair", "4")
         assert torch.equal(read_te(path, "embeds_v1")[4:], tail)
+
+
+def test_a_switched_vae_file_invalidates_the_latent_cache(tmp_path):
+    """A latent is only current while the same single-file VAE encoded it."""
+    from library.moss.cache import cached_vae, vae_stamp
+
+    assert vae_stamp("") == ""
+    vae = tmp_path / "vae.safetensors"
+    vae.write_bytes(b"x")
+    before = vae_stamp(str(vae))
+    assert before
+    path = tmp_path / f"a{LATENT_SUFFIX}"
+    save_file({"latent": torch.zeros(2)}, str(path), metadata={"vae": before})
+    assert cached_vae(path) == before
+    # A legacy file (no stamp) is current for the folder VAE only.
+    legacy = tmp_path / f"b{LATENT_SUFFIX}"
+    save_file({"latent": torch.zeros(2)}, str(legacy), metadata={})
+    assert cached_vae(legacy) == ""
+    vae.write_bytes(b"yy")
+    assert vae_stamp(str(vae)) != before

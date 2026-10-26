@@ -23,7 +23,9 @@ function createModelWorkspace(family: 'qwen21' | 'moss') {
   const configProfile = ref('')
   const profileAlgorithms = ref<Record<string, string>>({})
   const error = ref('')
-  const loading = ref(false)
+  const initializing = ref(false)
+  const profileLoads = ref(0)
+  const loading = computed(() => initializing.value || profileLoads.value > 0)
   const busy = ref(false)
   const cache = ref<CacheStatus | null>(null)
   const legacyAvailable = ref(family === 'qwen21' && localStorage.getItem(draftKey) !== null)
@@ -65,16 +67,19 @@ function createModelWorkspace(family: 'qwen21' | 'moss') {
   async function loadProfileData(name: string, method: string): Promise<boolean> {
     if (!schema.value) throw new Error(`${modelLabel(family)} schema has not loaded`)
     const seq = ++loadSeq
-    const result = await requestJson(`${apiRoot}/profiles/${encodeURIComponent(name)}`, {})
-    if (seq !== loadSeq) return false // a newer switch already superseded this request
-    const parsed = readDraft(schema.value, JSON.stringify(result))
-    checkSelectedMethod(parsed, method)
-    localStorage.setItem(storageKey, name)
-    draft.value = parsed
-    saved.value = JSON.stringify(parsed)
-    profile.value = name
-    cache.value = null
-    return true
+    profileLoads.value++
+    try {
+      const result = await requestJson(`${apiRoot}/profiles/${encodeURIComponent(name)}`, {})
+      if (seq !== loadSeq) return false // a newer switch already superseded this request
+      const parsed = readDraft(schema.value, JSON.stringify(result))
+      checkSelectedMethod(parsed, method)
+      localStorage.setItem(storageKey, name)
+      draft.value = parsed
+      saved.value = JSON.stringify(parsed)
+      profile.value = name
+      cache.value = null
+      return true
+    } finally { profileLoads.value-- }
   }
   async function loadProfile(name: string): Promise<void> {
     if (await loadProfileData(name, configProfile.value ? configMethod.value : '')) {
@@ -111,12 +116,12 @@ function createModelWorkspace(family: 'qwen21' | 'moss') {
     if (await loadProfileData(name, method)) configProfile.value = name
   }
   async function initialize(): Promise<void> {
-    loading.value = true
+    initializing.value = true
     try {
       schema.value = parseSchema(await requestJson(`${apiRoot}/schema`, {}))
       profiles.value = profileNames(await requestJson(`${apiRoot}/profiles`, {}))
       await loadProfile(profile.value)
-    } finally { loading.value = false }
+    } finally { initializing.value = false }
   }
   async function ensureLoaded(): Promise<void> {
     if (draft.value) return
@@ -125,25 +130,30 @@ function createModelWorkspace(family: 'qwen21' | 'moss') {
   }
   async function save(): Promise<void> {
     if (!draft.value || !schema.value) throw new Error(`${modelLabel(family)} workspace has not loaded`)
-    if (configProfile.value) checkSelectedMethod(draft.value, configMethod.value)
-    const body = await requestJson(`${apiRoot}/profiles/${encodeURIComponent(profile.value)}`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(draft.value),
+    const name = profile.value, seq = loadSeq, source = draft.value
+    const method = configProfile.value ? configMethod.value : ''
+    checkSelectedMethod(source, method)
+    const body = await requestJson(`${apiRoot}/profiles/${encodeURIComponent(name)}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(source),
     })
     const parsed = readDraft(schema.value, JSON.stringify(body))
-    if (configProfile.value) checkSelectedMethod(parsed, configMethod.value)
-    draft.value = parsed
-    saved.value = JSON.stringify(draft.value)
-    localStorage.setItem(storageKey, profile.value)
+    checkSelectedMethod(parsed, method)
     ++catalogSeq
-    profiles.value = [...new Set([...profiles.value, profile.value])].sort()
+    profiles.value = [...new Set([...profiles.value, name])].sort()
     if (typeof parsed.train.algo === 'string') {
-      profileAlgorithms.value = { ...profileAlgorithms.value, [profile.value]: parsed.train.algo }
+      profileAlgorithms.value = { ...profileAlgorithms.value, [name]: parsed.train.algo }
     }
+    // The response belongs to the profile and draft that initiated the save.
+    if (seq !== loadSeq || profile.value !== name) return
+    if (draft.value === source) draft.value = parsed
+    saved.value = JSON.stringify(parsed)
+    localStorage.setItem(storageKey, name)
   }
   function createProfile(name: string): void {
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) throw new Error('Profile name: 1–64 letters, digits, underscores or hyphens')
     if (profiles.value.includes(name)) throw new Error(`Profile already exists: ${name}`)
     profile.value = name
+    ++loadSeq
     saved.value = ''
   }
   function beginConfigProfile(name: string, copyCurrent = true): void {
@@ -164,10 +174,13 @@ function createModelWorkspace(family: 'qwen21' | 'moss') {
       configMethod: configMethod.value, configProfile: configProfile.value,
       profiles: profiles.value, profileAlgorithms: profileAlgorithms.value,
     }
+    let createdSeq: number | undefined
     try {
       beginConfigProfile(name, copyCurrent)
+      createdSeq = loadSeq
       await save()
     } catch (cause) {
+      if (createdSeq !== undefined && (createdSeq !== loadSeq || profile.value !== name)) throw cause
       profile.value = previous.profile
       draft.value = previous.draft
       saved.value = previous.saved
@@ -204,9 +217,11 @@ function createModelWorkspace(family: 'qwen21' | 'moss') {
     cache.value = null
   }
   async function inspectCache(): Promise<void> {
-    cache.value = cacheStatus(await requestJson(`${apiRoot}/cache-status`, {
+    const source = draft.value, seq = loadSeq
+    const result = cacheStatus(await requestJson(`${apiRoot}/cache-status`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: values('cache') }),
     }))
+    if (seq === loadSeq && draft.value === source) cache.value = result
   }
   async function preflight(): Promise<CacheStatus> {
     return cacheStatus(await requestJson(`${apiRoot}/preflight`, {
@@ -215,16 +230,18 @@ function createModelWorkspace(family: 'qwen21' | 'moss') {
   }
   async function submit(phase: Phase, overrides: Values): Promise<string> {
     if (family === 'qwen21' && phase === 'tune') throw new Error('Qwen-Image 2.1 has no tune form')
+    const submitted = values(phase, overrides)
     const runtime_profile = await useModelWorkspace().runtimeForSubmit()
     return jobId(await requestJson(`${apiRoot}/jobs/${phase}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: values(phase, overrides), runtime_profile }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: submitted, runtime_profile }),
     }))
   }
   async function chain(): Promise<string> {
+    const cacheValues = values('cache'), trainValues = values('train')
     const runtime_profile = await useModelWorkspace().runtimeForSubmit()
     return jobId(await requestJson(`${apiRoot}/chain`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cache: { values: values('cache') }, train: { values: values('train') }, runtime_profile }),
+      body: JSON.stringify({ cache: { values: cacheValues }, train: { values: trainValues }, runtime_profile }),
     }))
   }
   async function perform(action: () => Promise<void>): Promise<void> {

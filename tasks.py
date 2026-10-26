@@ -593,6 +593,14 @@ COMMANDS = {
     "moss-cache-train": (moss.cmd_cache_train, "MOSS: cache then train in one queued job"),
     "moss-generate": (moss.cmd_generate, "MOSS: generate images"),
     "moss-tune": (moss.cmd_tune, "MOSS: tune block swapping (runs training steps)"),
+    "moss-prewarm": (
+        moss.cmd_prewarm,
+        "MOSS: warm the kernel tuning tables for this cache",
+    ),
+    "moss-report": (
+        moss.cmd_report,
+        "MOSS: summarize a run from progress.jsonl + log",
+    ),
     "qwen21-processor": (
         qwen21.cmd_processor,
         "Download only Qwen-Image-2.1 tokenizer/processor assets",

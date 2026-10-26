@@ -29,6 +29,12 @@ from webui.services.config_storage import atomic_write_text
 PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
+def _declares_choices(cls: type, key: str) -> bool:
+    """Whether a request field declares a closed set of values."""
+    definition = getattr(cls, "__dataclass_fields__", {}).get(key)
+    return definition is not None and definition.metadata.get("choices") is not None
+
+
 @dataclass(frozen=True)
 class ProfileStore:
     """One line's profile tree."""
@@ -89,7 +95,9 @@ class ProfileStore:
         """Validate every section against its request and re-collect the model keys.
 
         A missing optional key restores the request default; a value outside a
-        field's ``choices`` is refused here rather than at submission time.
+        field's ``choices`` is refused here rather than at submission time. An
+        empty string on a ``choices`` field counts as "unset" — a form that
+        cleared its dropdown must not make the whole profile unreadable.
         """
         models: dict[str, Any] = {
             key: value
@@ -102,14 +110,18 @@ class ProfileStore:
                 key: value
                 for key, value in getattr(profile, name).items()
                 if key not in self.model_fields
+                and not (value == "" and _declares_choices(cls, key))
             }
             req = TypeAdapter(cls).validate_json(
                 json.dumps({**values, **models}), strict=True
             )
             for field in dataclasses.fields(req):
                 choices = field.metadata.get("choices")
-                if choices is not None and getattr(req, field.name) not in choices:
-                    raise ValueError(f"{name}.{field.name} must be one of {choices}")
+                value = getattr(req, field.name)
+                if choices is not None and value not in choices:
+                    raise ValueError(
+                        f"{name}.{field.name} must be one of {choices}, got {value!r}"
+                    )
             full = dataclasses.asdict(req)
             sections[name] = {
                 key: value

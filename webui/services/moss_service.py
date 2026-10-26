@@ -23,7 +23,7 @@ from library.moss.requests import (
 from library.moss.validation import training_output_paths, validate_request
 from scripts.moss.workflow import parse_workflow
 from webui.services.qwen21_service import FormField, form_fields
-from webui.services.qwen21_workspace import check_component_headers
+from webui.services.qwen21_workspace import check_component_headers, read_header
 
 Scalar = str | int | float | bool | None
 RequestT = TypeVar(
@@ -79,7 +79,7 @@ def read_schema(model_fields: frozenset[str]) -> FormSchema:
                 ("generate", GenerateRequest),
                 ("tune", TuneSwapRequest),
             )
-        }
+        },
     )
 
 
@@ -103,18 +103,29 @@ def text_encoder_path(base: Path, precision: str) -> Path:
 
 
 def resolve_values(values: dict[str, Scalar]) -> ResolvedPaths:
+    # The panel posts the training form; the `vae` / `text_encoder` overrides are
+    # not TrainRequest fields (they belong to the cache / generate phases), so
+    # they ride along for display only and are peeled off before validation.
+    values = dict(values)
+    vae = str(values.pop("vae", "") or "")
+    text_encoder = str(values.pop("text_encoder", "") or "")
     req = request_from_values(TrainRequest, values)
     root = resolve_model_dir(req.model_dir)
     base = variant_dir(req.model_dir, "base")
+    precision = text_encoder or DEFAULT_TEXT_ENCODER
     return ResolvedPaths(
         model_dir=str(root),
-        dit=str(variant_dir(req.model_dir, req.model) / "transformer"),
-        text_encoder=str(
-            text_encoder_path(
-                base, getattr(req, "text_encoder", DEFAULT_TEXT_ENCODER)
-            )
+        dit=str(
+            resolve_under_home(req.dit)
+            if req.dit
+            else variant_dir(req.model_dir, req.model) / "transformer"
         ),
-        vae=str(base / "vae"),
+        text_encoder=str(
+            text_encoder_path(base, precision)
+            if precision == "bf16"
+            else quantized_te_file(precision)
+        ),
+        vae=str(resolve_under_home(vae) if vae else base / "vae"),
         tokenizer=str(base / "tokenizer"),
     )
 
@@ -147,43 +158,238 @@ def require_component(path: Path, label: str) -> None:
     check_component_headers(path)
 
 
+def require_tokenizer(path: Path) -> None:
+    """The Qwen3.5 tokenizer, including the chat template the pipeline needs.
+
+    ``prompt_ids`` formats every prompt with ``add_generation_prompt=True,
+    enable_thinking=True``, which fails at run time when the folder only holds
+    ``tokenizer.json`` + ``tokenizer_config.json`` (ComfyUI ships exactly that:
+    transformers keeps the template in ``chat_template.jinja``).
+    """
+    require_directory(path, "MOSS tokenizer")
+    config = path / "tokenizer_config.json"
+    if not config.is_file():
+        raise FileNotFoundError(f"MOSS tokenizer config.json not found: {path}")
+    if (path / "chat_template.jinja").is_file():
+        return
+    try:
+        declared = json.loads(config.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"MOSS tokenizer config.json is not JSON: {config} ({exc})"
+        ) from exc
+    template = declared.get("chat_template") if isinstance(declared, dict) else None
+    if (isinstance(template, str) and template.strip()) or (
+        isinstance(template, dict) and template
+    ):
+        return
+    raise ValueError(
+        f"MOSS tokenizer has no chat template: {path} "
+        "(the Base pack ships chat_template.jinja; fetch it from "
+        "OpenMOSS-Team/MOSS-Image-Base/tokenizer/)"
+    )
+
+
+def quantized_te_file(precision: str) -> Path:
+    """The single quantised TE file the worker's loader reads (catalog row)."""
+    from library import downloads
+
+    names = {"int8": downloads.MOSS_TE_INT8_FILE, "fp8": downloads.MOSS_TE_FP8_FILE}
+    if precision not in names:
+        raise ValueError(
+            f"Unknown MOSS text encoder precision: {precision!r}; "
+            f"expected one of {tuple(names)}"
+        )
+    row = downloads.by_id().get(f"moss_te_{precision}")
+    if row is None:
+        raise ValueError(
+            f"MOSS text encoder asset row moss_te_{precision} is missing from the "
+            "catalog; re-run `make download-model ARGS=moss-te-" + precision + "`"
+        )
+    return row.dest / names[precision]
+
+
+def require_text_encoder(base: Path, precision: str) -> Path:
+    """Resolve and preflight the Qwen3.5-9B text encoder for ``precision``.
+
+    ``bf16`` is Base's unquantised shard folder and goes through the generic
+    component check. ``int8`` / ``fp8`` — the shipped default — are one
+    quantised file, which that check rejects on purpose (the Qwen line only
+    loads bf16), so their header is validated here instead: the MOSS
+    ``language_model.*`` namespace, one ``comfy_quant`` per quantised linear
+    with its ``weight_scale``, and the ``config.json`` the loader builds the
+    model from.
+    """
+    if precision == "bf16":
+        path = base / "text_encoder"
+        require_component(path, "MOSS text encoder")
+        return path
+    path = quantized_te_file(precision)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"MOSS text encoder file not found: {path} "
+            f"(fetch it with `make download-model ARGS=moss-te-{precision}`)"
+        )
+    if not (path.parent / "config.json").is_file():
+        raise FileNotFoundError(
+            f"MOSS text encoder config.json not found: {path.parent}"
+        )
+    header = read_header(path)
+    if not any(key.startswith("language_model.") for key in header.tensors):
+        raise ValueError(
+            f"MOSS text encoder must use the language_model.* namespace: {path}"
+        )
+    quantized = {
+        key[: -len(".comfy_quant")]
+        for key in header.tensors
+        if key.endswith(".comfy_quant")
+    }
+    if not quantized:
+        raise ValueError(f"MOSS text encoder is not quantised: {path}")
+    missing = sorted(
+        key for key in quantized if f"{key}.weight_scale" not in header.tensors
+    )
+    if missing:
+        raise ValueError(
+            f"MOSS text encoder is missing weight_scale for {missing[:3]}: {path}"
+        )
+    return path
+
+
+_DIT_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "transformer.")
+# Must stay in step with `library.moss.checkpoint._SUPPORTED_DTYPES`; duplicated
+# because that module imports torch and the browser preflight must stay torch-free.
+_WEIGHT_DTYPES = ("F16", "BF16", "F32")
+
+
+def require_weights_file(path: Path, label: str) -> None:
+    """A single-file DiT: a 16-bit safetensors that looks like MOSS-Image.
+
+    Header-only and torch-free, so the browser form can check the file before a
+    GPU job is queued; the worker's loader re-validates every key and shape
+    (`library.moss.checkpoint`). The dtype check is the loader's whitelist, not a
+    quantized blacklist: a file the worker would refuse must fail here too.
+    """
+    if path.is_dir():
+        raise ValueError(
+            f"{label} must be a single .safetensors file, not a folder: {path}"
+        )
+    if not path.is_file():
+        raise FileNotFoundError(f"{label} file not found: {path}")
+    if path.suffix.lower() != ".safetensors":
+        raise ValueError(f"{label} must be a .safetensors file: {path}")
+    header = read_header(path)
+    for key, tensor in header.tensors.items():
+        if key.endswith((".comfy_quant", ".weight_scale")):
+            raise ValueError(
+                f"Quantized {label} is unsupported: {path}; select 16-bit weights "
+                f"({key})"
+            )
+        if tensor.dtype not in _WEIGHT_DTYPES:
+            raise ValueError(
+                f"Unsupported {label}: {path}; select 16-bit weights "
+                f"(BF16 / FP16 / FP32), got {key} = {tensor.dtype}"
+            )
+    names = set(header.tensors)
+    for prefix in _DIT_PREFIXES:
+        if names and all(key.startswith(prefix) for key in names):
+            names = {key[len(prefix) :] for key in names}
+            break
+    if "shared_block_modulation.weight" not in names or not (
+        "layers.0.proj.qkv.weight" in names or "layers.0.proj.q.weight" in names
+    ):
+        raise ValueError(f"{label} is not a MOSS-Image DiT: {path}")
+
+
+def require_vae_file(path: Path, label: str) -> None:
+    """A single-file FLUX.2 VAE: a safetensors with VAE keys (header only).
+
+    Header-only and torch-free, so the browser form can check the file before a
+    GPU job is queued; `library.moss.checkpoint.load_vae_file` re-infers the
+    config and loads the state strictly.
+    """
+    if path.is_dir():
+        raise ValueError(
+            f"{label} must be a single .safetensors file, not a folder: {path}"
+        )
+    if not path.is_file():
+        raise FileNotFoundError(f"{label} file not found: {path}")
+    if path.suffix.lower() != ".safetensors":
+        raise ValueError(f"{label} must be a .safetensors file: {path}")
+    header = read_header(path)
+    for key, tensor in header.tensors.items():
+        if key.endswith(".num_batches_tracked"):
+            continue
+        if key.endswith((".comfy_quant", ".weight_scale")):
+            raise ValueError(
+                f"Quantized {label} is unsupported: {path}; select 16-bit weights "
+                f"({key})"
+            )
+        if tensor.dtype not in _WEIGHT_DTYPES:
+            raise ValueError(
+                f"Unsupported {label}: {path}; select 16-bit weights "
+                f"(BF16 / FP16 / FP32), got {key} = {tensor.dtype}"
+            )
+    names = set(header.tensors)
+    diffusers_layout = {"encoder.conv_in.weight", "decoder.conv_in.weight"} <= names
+    bfl_layout = {
+        "encoder.down.0.block.0.conv1.weight",
+        "decoder.up.0.block.0.conv1.weight",
+    } <= names
+    if not (diffusers_layout or bfl_layout):
+        raise ValueError(f"{label} is not a FLUX.2 VAE: {path}")
+
+
 def validate_paths(req) -> None:
     base = variant_dir(req.model_dir, "base")
     if isinstance(req, CacheRequest):
         require_directory(resolve_under_home(req.src), "Image source")
         output_path(req.out)
         if not req.skip_text:
-            require_component(
-                text_encoder_path(base, req.text_encoder), "MOSS text encoder"
-            )
-            require_directory(base / "tokenizer", "MOSS tokenizer")
+            require_text_encoder(base, req.text_encoder)
+            require_tokenizer(base / "tokenizer")
         if not req.skip_latents:
-            require_component(base / "vae", "MOSS VAE")
+            if req.vae:
+                require_vae_file(resolve_under_home(req.vae), "MOSS VAE")
+            else:
+                require_component(base / "vae", "MOSS VAE")
     elif isinstance(req, TrainRequest):
         training_output_paths(req.output)
-        require_component(
-            variant_dir(req.model_dir, req.model) / "transformer", "MOSS transformer"
-        )
-        output_path(req.output)
-    elif isinstance(req, GenerateRequest):
-        output_path(req.out_dir)
-        require_component(base / "vae", "MOSS VAE")
-        if not req.decode_only:
+        if req.dit:
+            require_weights_file(resolve_under_home(req.dit), "MOSS transformer")
+        else:
             require_component(
                 variant_dir(req.model_dir, req.model) / "transformer",
                 "MOSS transformer",
             )
-            require_component(
-                text_encoder_path(base, req.text_encoder), "MOSS text encoder"
-            )
-            require_directory(base / "tokenizer", "MOSS tokenizer")
+        output_path(req.output)
+    elif isinstance(req, GenerateRequest):
+        output_path(req.out_dir)
+        if req.vae:
+            require_vae_file(resolve_under_home(req.vae), "MOSS VAE")
+        else:
+            require_component(base / "vae", "MOSS VAE")
+        if not req.decode_only:
+            if req.dit:
+                require_weights_file(resolve_under_home(req.dit), "MOSS transformer")
+            else:
+                require_component(
+                    variant_dir(req.model_dir, req.model) / "transformer",
+                    "MOSS transformer",
+                )
+            require_text_encoder(base, req.text_encoder)
+            require_tokenizer(base / "tokenizer")
         for value in (req.lora, req.prompts_file, *req.example.split(",")):
             if value and not resolve_under_home(value.strip()).is_file():
                 raise FileNotFoundError(f"MOSS input file not found: {value}")
     elif isinstance(req, TuneSwapRequest):
-        require_component(
-            variant_dir(req.model_dir, req.model) / "transformer", "MOSS transformer"
-        )
+        if req.dit:
+            require_weights_file(resolve_under_home(req.dit), "MOSS transformer")
+        else:
+            require_component(
+                variant_dir(req.model_dir, req.model) / "transformer",
+                "MOSS transformer",
+            )
         output_path(req.output)
         if not req.sizes:
             require_directory(resolve_under_home(req.cache), "MOSS cache")
@@ -197,6 +403,8 @@ def pin_request_paths(req: RequestT) -> RequestT:
         "output",
         "out_dir",
         "model_dir",
+        "dit",
+        "vae",
         "lora",
         "prompts_file",
         "resume",
@@ -249,13 +457,18 @@ def prepare_job_args(command: str, args: list[str]) -> list[str]:
 def task_context(command: str, args: list[str]) -> dict:
     if command == "moss-cache-train":
         cache, req = parse_workflow(args)
-        return {
+        context = {
             "model_type": "moss",
             "phase": "cache-train",
             "cache_dir": cache.out,
             "output": req.output,
             "model": req.model,
         }
+        if req.dit:
+            context["dit"] = Path(req.dit).name
+        if cache.vae:
+            context["vae"] = Path(cache.vae).name
+        return context
     req = REQUEST_TYPES[command].from_argv(args)
     context = {
         "model_type": "moss",
@@ -267,6 +480,10 @@ def task_context(command: str, args: list[str]) -> dict:
             context[{"out_dir": "output_dir", "out": "cache_dir"}.get(attr, attr)] = (
                 getattr(req, attr)
             )
+    if getattr(req, "dit", ""):
+        context["dit"] = Path(req.dit).name
+    if getattr(req, "vae", ""):
+        context["vae"] = Path(req.vae).name
     return context
 
 

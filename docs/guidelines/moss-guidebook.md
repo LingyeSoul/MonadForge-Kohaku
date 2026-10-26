@@ -1,6 +1,6 @@
 # MOSS-Image LoRA Guidebook
 
-A guide to training and testing LoRAs for MOSS-Image in the WebUI. Open it with `python -m webui` and set the top-bar **Model** dropdown to **MOSS-Image** (`python -m webui` opens the same panel in its own window). The panel is in English, or in Chinese when the WebUI language is Chinese.
+A guide to training and testing LoRAs for MOSS-Image in the WebUI. Open it with `python -m webui` and set the top-bar **Model** dropdown to **MOSS-Image** (`python -m webui` opens the same panel in its own window). Panel headings follow the UI language. MOSS inputs always use the original English parameter keys; the side reference shows the original English help and a Chinese explanation together. Basic settings start open and can be collapsed. Search opens matching groups once and still allows manual collapse.
 
 The MOSS line is **alpha**: one style set so far (30 images of one artist), with many A/Bs on it, and flags and defaults may still move. The numbers below come from those A/Bs and from benchmarks on a 16 GB RTX 5070 Ti.
 
@@ -97,6 +97,22 @@ Press **Run preprocessing**. The status line counts images, captions and cached 
 | `precision` | `auto` | DiT compute dtype; `auto` = bf16 on sm_80+, fp16 on V100/T4 (see §4.3) |
 
 Rank, alpha, lr and the adapter type are in §4. **Train** reads `cache`; **Preprocess, then train** runs Preprocess first and points `cache` at its `out`.
+
+**Where the fields live.** The Train tab is not one long list: the schema's group and the field's role decide which expansion panel a knob lands in, and each panel is split into headed sub-blocks (headings follow the UI language; inputs use original parameter keys and the side reference is English + Chinese):
+
+| Panel | Holds | Sub-blocks |
+|---|---|---|
+| Basic settings (基本设置) | the ten knobs you touch every run: `cache`, `output`, `model`, `dit`, `epochs`, `rank`, `alpha`, `lr`, `batch_size`, `grad_checkpointing` | one grid |
+| Training (训练) | schedule, caption sampling, noise schedule | Steps & optimiser, Caption, σ |
+| Performance (性能) | memory, compile, precision | Memory, Compile, Precision |
+| Paths (路径) | shared model root and training resume state | — |
+| Architecture (架构) | adapter family, channel scaling, reference conditioning | Adapter, Channel, Reference |
+| Generate (生成) | the Test tab's sampling knobs, so they never mix into a training card | Prompt sources, Sampling, Reference image, DAVE, Model, VAE & decoding, Spectrum, Output, Performance |
+| Swap tuning (显存调参) | benchmark model, workload, sweep and JSON report | Model, Workload, Performance, Sweep, Output |
+
+`algo` is owned by the method selector above the form. LoRA-only controls hide for LoKr/LoHa; SVD slices need `weight_svd`, calibration paths need their feature enabled, and REPA, reference-image, DAVE and Spectrum controls follow their own switches. `token_batch` needs a packed batch. Counts change with these conditions; hidden values remain in the profile and only inactive action values reset to defaults.
+
+Training, generation and tuning keep separate values even for same-name fields such as `seed`, `precision`, `rank` and `output`. Only `model_dir` is shared across phases within a profile. The tuning output is a JSON report, and its steps count timed training steps. Profile switching resets field editing buffers; pending saves and submissions retain the profile/stage that initiated them.
 
 ### 3.4 Test
 

@@ -8,6 +8,8 @@ export interface FieldMeta {
   nullable?: boolean
   path_kind?: 'file' | 'directory' | 'either'
   path_extensions?: string
+  /** Output destinations may not exist until the job writes them. */
+  path_must_exist?: boolean
   multiline?: boolean
   key: string
   value: unknown

@@ -3,7 +3,6 @@ reference into sized jobs, and the GUI's i2i tab chains its jobs through the pan
 
 from __future__ import annotations
 
-import os
 
 import pytest
 from PIL import Image
@@ -55,3 +54,25 @@ def test_plain_jobs_unchanged():
 
     (job,) = _jobs(GenerateRequest(prompt="a", prompt_format="text"))
     assert not {k for k in job if k.startswith("ref")}
+
+
+def test_a_different_dit_or_quant_invalidates_a_saved_latent():
+    """`--dit` / `--quant` change the denoising base, so a resume must not reuse."""
+    from dataclasses import replace
+    from pathlib import Path
+
+    from library.moss.generate import _fingerprint, _jobs, _latent_path
+
+    plain = GenerateRequest(prompt="a", prompt_format="text")
+    (job,) = _jobs(plain)
+    folder = _fingerprint(plain, job)
+    dit_a = _fingerprint(replace(plain, dit="a.safetensors"), job)
+    dit_b = _fingerprint(replace(plain, dit="b.safetensors"), job)
+    int8 = _fingerprint(replace(plain, quant="int8"), job)
+    assert folder != dit_a and dit_a != dit_b and folder != int8
+    out = Path("out")
+    assert _latent_path(out, dit_a).name != _latent_path(out, dit_b).name
+    # A folder run keeps the names its earlier latents already have.
+    assert _latent_path(out, folder).name.endswith(
+        f"_{folder['model']}_s{folder['seed']}.safetensors"
+    )

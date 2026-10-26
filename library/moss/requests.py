@@ -74,6 +74,19 @@ def variant_dir(model_dir: str | Path | None, variant: str) -> Path:
 
 
 _MODEL_DIR_HELP = f"folder holding MOSS-Image-Base/ and MOSS-Image-SFT/ (default: ${MODEL_DIR_ENV} or models/{MODEL_DIR_NAME})"
+_DIT_HELP = (
+    "DiT from a single .safetensors file instead of --model's transformer/ folder "
+    "(ComfyUI layout: fused proj.qkv, optional model.diffusion_model. prefix, and an "
+    "fp16-fix fold in the metadata is undone on load). The text encoder / VAE that "
+    "cache and generate load still come from --model_dir; quantized single files "
+    "are refused"
+)
+_VAE_HELP = (
+    "VAE from a single .safetensors file instead of --model_dir's "
+    "MOSS-Image-Base/vae/ folder (ComfyUI flux2-vae: BFL/ldm or diffusers keys; the "
+    "config is inferred from the shapes). The DiT / text encoder still come from "
+    "model / --model_dir"
+)
 
 
 @dataclass
@@ -124,6 +137,7 @@ class CacheRequest(Request):
     vae_dtype: str = _f(
         "fp32", "VAE encode dtype", choices=("fp32", "bf16"), advanced=True
     )
+    vae: str = _f("", _VAE_HELP)
     max_text_tokens: int = _f(
         4096, "TE truncation length (the model's own limit)", advanced=True
     )
@@ -168,7 +182,9 @@ class ColorizeCacheRequest(Request):
         "sparse captions + 1: embeds_v1 … embeds_v{variants-1} hold tag-dropped "
         "colour captions (at least 2)",
     )
-    tag_dropout: float = _f(0.8, "share of the colour caption's tags a sparse caption drops")
+    tag_dropout: float = _f(
+        0.8, "share of the colour caption's tags a sparse caption drops"
+    )
     seed: int = _f(0, "RNG seed of the pair draw, holdout and sparse captions")
     staging: str = _f(
         "post_image_dataset/i2i/colorize/staging",
@@ -194,8 +210,11 @@ class ColorizeCacheRequest(Request):
         advanced=True,
     )
     te_file: str = _f(
-        "", "quantized TE file instead of the catalog's (fp8 / int8 only)", advanced=True
+        "",
+        "quantized TE file instead of the catalog's (fp8 / int8 only)",
+        advanced=True,
     )
+    vae: str = _f("", _VAE_HELP)
     model_dir: str = _f("", _MODEL_DIR_HELP, advanced=True)
 
 
@@ -221,10 +240,14 @@ class GenerateRequest(Request):
         "in JSON or a LoRA cached as text (not applied to example)",
         choices=("text", "layout_json"),
     )
-    model: str = _f("base", "which DiT", choices=VARIANTS)
+    model: str = _f(
+        "base", "which DiT (ignored for the DiT when dit is set)", choices=VARIANTS
+    )
+    dit: str = _f("", _DIT_HELP)
     quant: str = _f(
         "",
-        "quantized frozen DiT base: empty = bf16, int8 or fp8 (e4m3, sm89+). Halves "
+        "quantized frozen DiT base: empty = unquantized at precision, int8 or fp8 "
+        "(e4m3, sm89+). Halves "
         "the base's VRAM; LoRAs still apply on top",
         choices=("", "int8", "fp8"),
     )
@@ -323,6 +346,7 @@ class GenerateRequest(Request):
         "C++ toolchain on Windows",
         advanced=True,
     )
+    vae: str = _f("", _VAE_HELP)
     shift: float = _f(
         DEFAULT_SHIFT, "scheduler shift (pipeline default)", advanced=True
     )
@@ -404,10 +428,22 @@ class TrainRequest(Request):
         "restores the adapter, optimizer, LR schedule and RNG streams at the "
         "last completed epoch",
         advanced=True,
+        group="Paths",
     )
-    model: str = _f("base", "which DiT to train on", choices=VARIANTS)
+    model: str = _f(
+        "base",
+        "which DiT to train on (ignored for the DiT when dit is set)",
+        choices=VARIANTS,
+    )
+    dit: str = _f("", _DIT_HELP)
     epochs: int = _f(8, "passes over the cache")
-    max_steps: int = _f(0, "stop after this many steps (0 = epochs decide)")
+    max_steps: int = _f(
+        0,
+        "sample-count limit, not optimizer updates (0 = epochs decide); "
+        "caps epochs times the number of samples",
+        advanced=True,
+        group="Training",
+    )
     algo: str = _f(
         "lora",
         "adapter: lora, or LyCORIS lokr (Kronecker product) / loha (Hadamard "
@@ -425,12 +461,16 @@ class TrainRequest(Request):
         -1,
         "lokr only: cap on the small Kronecker factor's side (-1 = near-square "
         "split; LyCORIS's usual 4 / 8 / 16 give a larger full-rank w2)",
+        advanced=True,
+        group="Architecture",
     )
     down_init: str = _f(
         "weight_svd",
         "lora only, down-projection init: weight_svd (the base weight's top-r right "
         "singular vectors / sqrt 3, Anima's SVD-Down) or kaiming",
         choices=("kaiming", "weight_svd"),
+        advanced=True,
+        group="Architecture",
     )
     svd_slice: int = _f(
         0,
@@ -441,6 +481,7 @@ class TrainRequest(Request):
         "dc_isolate every slice shares row 0, the DC direction. Stamped as "
         "ss_svd_slice. 0 = the top-r",
         advanced=True,
+        group="Architecture",
     )
     svd_slice_count: int = _f(
         0,
@@ -449,6 +490,7 @@ class TrainRequest(Request):
         "slice 0 holding the whole top of the spectrum. Needs svd_slice < N. "
         "0 = contiguous",
         advanced=True,
+        group="Architecture",
     )
     channel_scaling_alpha: float = _f(
         0.5,
@@ -456,12 +498,15 @@ class TrainRequest(Request):
         "target's input channel c by mean|x[c]|^alpha inside the down projection, so "
         "Adam's step no longer favours the few high-magnitude channels (on MOSS: ch 42 "
         "into ffn_up_gate). Same output, plain LoRA on disk. 0 = off",
+        advanced=True,
+        group="Architecture",
     )
     channel_stats: str = _f(
         "library/moss/calibration/channel_stats.safetensors",
         "per-target mean|x| calibration for channel_scaling_alpha (from "
         "scripts/calibration/moss_channel_stats.py on Base)",
         advanced=True,
+        group="Architecture",
     )
     dc_isolate: bool = _f(
         True,
@@ -471,12 +516,15 @@ class TrainRequest(Request):
         "gradient is centered. Same output at init, plain LoRA on disk, composes "
         "with channel scaling. Pairs with lr 5e-5; at lr 1e-4 it over-fits (text "
         "artifacts)",
+        advanced=True,
+        group="Architecture",
     )
     channel_mean: str = _f(
         "library/moss/calibration/channel_mean.safetensors",
         "per-target signed token-mean x̄ for dc_isolate (from "
         "scripts/calibration/moss_channel_stats.py on Base)",
         advanced=True,
+        group="Architecture",
     )
     lr: float = _f(
         5e-5,
@@ -488,8 +536,16 @@ class TrainRequest(Request):
         "adamw (torch), adamw16 (16-bit parameter and moments, fp32 math, "
         "KohakuMoss's AdamW16) or muon (Muon on the LoRA matrices, AdamW elsewhere)",
         choices=("adamw", "adamw16", "muon"),
+        advanced=True,
+        group="Training",
     )
-    warmup_ratio: float = _f(0.05, "linear warmup, as a fraction of all steps")
+    warmup_ratio: float = _f(
+        0.05,
+        "linear warmup, as a fraction of estimated optimizer updates "
+        "(accounting for batch_size and grad_accum)",
+        advanced=True,
+        group="Training",
+    )
     batch_size: int = _f(
         1,
         "samples per packed forward. 1 keeps the per-sample loop; > 1 packs each "
@@ -503,25 +559,35 @@ class TrainRequest(Request):
         "tokens (0 = no cap, use batch_size alone). A sample larger than the cap "
         "still gets a batch of its own; this bounds activation memory and keeps "
         "the compiled block's token count in a narrow band",
+        advanced=True,
+        group="Performance",
     )
     grad_accum: int = _f(
         1,
         "batches per optimizer update (gradient accumulation). Steps, epochs and "
         "the loss log still count samples; warmup counts updates",
+        advanced=True,
+        group="Training",
     )
     save_every_epochs: int = _f(
         0,
         "also save every N epochs into <output dir>/<name>/<name>_eN (0 = final only)",
+        advanced=True,
+        group="Training",
     )
     caption_dropout: float = _f(
         0.0,
         "probability of training a step on the empty-prompt embedding (CFG's "
         "uncond), read from library/moss/asset/empty_prompt.safetensors",
+        advanced=True,
+        group="Training",
     )
     plain_caption_rate: float = _f(
         0.2,
         "probability of training a step on the plain Anima caption instead of its "
         "layout JSON; only a caption_format=layout_json cache carries the plain one",
+        advanced=True,
+        group="Training",
     )
     caption_variant_rate: float = _f(
         0.0,
@@ -531,6 +597,7 @@ class TrainRequest(Request):
         "a plain caption the share of variant steps is (1 - plain_caption_rate) "
         "x this. Only a cache built with variants carries them",
         advanced=True,
+        group="Training",
     )
     ref_timestep: float = _f(
         0.0,
@@ -538,12 +605,14 @@ class TrainRequest(Request):
         "cache with *.moss_ref files); 0 = clean, as the reference is. Negative = "
         "the image's timestep. Stamped in the LoRA metadata",
         advanced=True,
+        group="Architecture",
     )
     ref_isolate: bool = _f(
         False,
         "the reference tokens attend only to themselves; image and text still "
         "attend to them. Stamped in the LoRA metadata",
         advanced=True,
+        group="Architecture",
     )
     repa_weight: float = _f(
         0.0,
@@ -551,11 +620,13 @@ class TrainRequest(Request):
         "the Gram MSE between block repa_layer's image tokens and the image's "
         "PE-Spatial patch tokens. 0 = off",
         advanced=True,
+        group="Architecture",
     )
     repa_layer: int = _f(
         11,
         "block whose output REPA aligns; the gradient reaches the LoRA in blocks <= it",
         advanced=True,
+        group="Architecture",
     )
     repa_pe_root: str = _f(
         "post_image_dataset/lora",
@@ -563,12 +634,16 @@ class TrainRequest(Request):
         "(<root>/<source dir>/{stem}_anima_pe_spatial.safetensors; "
         "make preprocess-pe-spatial writes them)",
         advanced=True,
+        group="Architecture",
     )
     lora_dtype: str = _f(
         "bf16",
-        "dtype the LoRA is saved in; training keeps fp32 masters and runs the "
-        "rank GEMMs in bf16",
+        "dtype the LoRA is saved in, independent of DiT precision; adapters "
+        "are initialized in fp32, with bf16 rank GEMMs on the bf16 lane and "
+        "fp32 adapter math on the fp16 lane",
         choices=("bf16", "fp16", "fp32"),
+        advanced=True,
+        group="Architecture",
     )
     precision: str = _f(
         "auto",
@@ -585,11 +660,10 @@ class TrainRequest(Request):
         "compute dtype is bf16). online (default): the stream carries a scale c, "
         "each block's two AdaLN gate rows carry c and every stream-reading "
         "RMSNorm's eps carries c^2 (upstream FP16_FIX='online', c=1/16); the "
-        "weights are untouched, the math is exact, the stream stays 16-bit so the "
-        "fused kernels still run. fp32_residual: the stream is carried in fp32 "
-        "with fp16 matmuls (upstream FP16_FIX='fp32_residual'); cannot overflow "
-        "from magnitude, but the fused residual GEMM is skipped and the stream "
-        "costs 2x its bytes",
+        "weights are untouched and the stream stays 16-bit. fp32_residual: the "
+        "stream is carried in fp32 with fp16 matmuls (upstream "
+        "FP16_FIX='fp32_residual'), costing twice the stream bytes. The current "
+        "fp16 trainer disables fused block ops because its adapters compute in fp32",
         choices=FP16_FIXES,
         advanced=True,
     )
@@ -644,6 +718,7 @@ class TrainRequest(Request):
         "against free VRAM, with a --blocks_to_swap suggestion; off, epoch 1 is "
         "shuffled like the rest",
         advanced=True,
+        group="Performance",
     )
     compile: bool = _f(
         True,
@@ -659,8 +734,11 @@ class TrainRequest(Request):
         "(an existing setting wins): long captions that vary per step, such as "
         "colorize's OCR layouts, fragment the allocator's pool without it",
         advanced=True,
+        group="Performance",
     )
-    log_every: int = _f(10, "full log line every N steps", advanced=True)
+    log_every: int = _f(
+        10, "full log line every N steps", advanced=True, group="Training"
+    )
     seed: int = _f(0, "RNG seed", advanced=True)
     model_dir: str = _f("", _MODEL_DIR_HELP, advanced=True)
 
@@ -681,7 +759,12 @@ class TuneSwapRequest(Request):
         "",
         "synthetic WxH:text_tokens instead of the cache (e.g. 1024x1024:300)",
     )
-    model: str = _f("base", "which DiT to time", choices=VARIANTS)
+    model: str = _f(
+        "base",
+        "which DiT to time (ignored for the DiT when dit is set)",
+        choices=VARIANTS,
+    )
+    dit: str = _f("", _DIT_HELP)
     precision: str = _f(
         "auto",
         "DiT compute dtype; must match the training run",
@@ -697,8 +780,18 @@ class TuneSwapRequest(Request):
         DEFAULT_FP16_FIX_C, "online: the stream scale", advanced=True
     )
     rank: int = _f(32, "LoRA rank (the adapters and AdamW state take VRAM too)")
+    compile: bool = _f(
+        True,
+        "torch.compile each block per arm, as the training run does. A fused "
+        "Triton block is compiled only after a probe shows dynamo can trace its "
+        "kernels; off measures the eager (fused) step, about as fast and with no "
+        "recompile per arm",
+        advanced=True,
+        group="Performance",
+    )
     batch_size: int = _f(
-        1, "packed batch size to time; match the training run (see docs/moss/packed_batches.md)"
+        1,
+        "packed batch size to time; match the training run (see docs/moss/packed_batches.md)",
     )
     token_batch: int = _f(
         0, "packed token cap to time; 0 = batch_size alone (needs batch_size >= 2)"
@@ -708,7 +801,9 @@ class TuneSwapRequest(Request):
         "swap counts to try, ascending (at most num_layers - 2)",
     )
     patience: int = _f(
-        2, "stop after this many arms in a row slower than the best so far"
+        2,
+        "stop after this many successfully timed arms in a row without a new "
+        "best time (ties count; arms that do not fit are skipped)",
     )
     margin_gb: float = _f(
         1.0,

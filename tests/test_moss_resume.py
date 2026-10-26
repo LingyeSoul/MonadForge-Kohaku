@@ -55,6 +55,18 @@ def _request(path, epochs, resume=""):
     )
 
 
+def test_the_resume_signature_covers_the_dit_file():
+    """A state trained on one DiT must not resume onto another."""
+    from library.moss.train import _RESUME_KEYS, resume_mismatch
+
+    assert "dit" in _RESUME_KEYS
+    current = {"model": "base", "dit": ""}
+    # A state written before `dit` existed is exactly an empty-dit run.
+    assert resume_mismatch({"model": "base"}, current) == {}
+    mismatch = resume_mismatch({"model": "base"}, {**current, "dit": "a.safetensors"})
+    assert set(mismatch) == {"dit"}
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the trainer targets CUDA")
 def test_resume_replays_the_packed_run(monkeypatch, tmp_path):
     def tiny(*args, **kwargs):

@@ -16,14 +16,14 @@
       <template #append-inner>
         <FieldHelpButton :field-key="field.key" @help="emit('help-click', field.key)" />
         <v-icon
-          v-if="exists === true"
+          v-if="requiresExisting && exists === true"
           icon="mdi-check-circle"
           color="success"
           size="small"
           class="mr-1"
         />
         <v-icon
-          v-else-if="exists === false"
+          v-else-if="requiresExisting && exists === false"
           icon="mdi-alert-circle"
           color="warning"
           size="small"
@@ -146,11 +146,13 @@ const props = defineProps<{ field: FieldMeta; modelValue?: string }>()
 const emit = defineEmits<{ update: [value: string]; 'help-click': [key: string] }>()
 const configStore = useConfigStore()
 const { t } = useI18n()
-const browserTitle = computed(() => t(props.field.path_kind === 'directory' ? 'cfSelectDirectory' : props.field.path_kind === 'either' ? 'cfSelectPath' : 'cfSelectModel'))
+const browserTitle = computed(() => t(props.field.path_kind === 'directory' ? 'cfSelectDirectory' : props.field.path_kind === 'either' ? 'cfSelectPath' : props.field.path_extensions && props.field.path_extensions !== '.safetensors' ? 'cfSelectFile' : 'cfSelectModel'))
 
 const currentValue = computed(() => props.modelValue !== undefined ? props.modelValue : configStore.getFieldValue(props.field.key) as string)
+const requiresExisting = computed(() => props.field.path_must_exist !== false)
 
 const hintText = computed(() => {
+  if (!requiresExisting.value) return t('cfOutputDestinationHint')
   const desc = props.field.description
   const descEn = props.field.description_en
   if (!desc && !descEn) return undefined
@@ -197,14 +199,14 @@ async function checkExists(path: string, request: number) {
 }
 
 function onInput(val: string | null) { emit('update', val ?? '') }
-watch(currentValue, (val, previous) => {
+watch([currentValue, requiresExisting], ([val, mustExist], [previous]) => {
   const request = ++validationRequest
   validationController?.abort()
   if (validateTimer) clearTimeout(validateTimer)
   exists.value = null
   validatedKind.value = null
-  validating.value = Boolean(val)
-  if (val) validateTimer = setTimeout(() => void checkExists(val, request), previous === undefined ? 0 : 500)
+  validating.value = Boolean(val) && mustExist
+  if (val && mustExist) validateTimer = setTimeout(() => void checkExists(val, request), previous === undefined ? 0 : 500)
 }, { immediate: true, flush: 'sync' })
 
 // ── File browser dialog ───────────────────────────────────────

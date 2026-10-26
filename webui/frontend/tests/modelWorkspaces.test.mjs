@@ -189,7 +189,10 @@ test('unavailable saved V100 runtime blocks submission without falling back', as
     return response({ runtimes: [{ name: 'default', available: true, python: '/python/default', error: null }, { name: 'v100', available: false, python: null, error: 'V100 missing' }] })
   })
   const workspace = useModelWorkspace()
-  await assert.rejects(useMossWorkspace().submit('generate', {}), /V100 missing/)
+  const moss = useMossWorkspace()
+  moss.schema = parseSchema(schema('moss'))
+  moss.draft = initialDraft(moss.schema)
+  await assert.rejects(moss.submit('generate', {}), /V100 missing/)
   assert.equal(workspace.runtimeProfile, 'v100')
   assert.deepEqual(calls, ['/api/system/runtimes'])
 })
@@ -382,4 +385,143 @@ test('switching methods while a profile loads prevents stale selection and draft
   assert.equal(qwen.configProfile, '')
   assert.equal(qwen.draft, previousDraft)
   assert.equal(qwen.profile, 'default')
+})
+
+function deferred() {
+  let resolve, reject
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no })
+  return { promise, resolve, reject }
+}
+
+test('a late save of profile A cannot replace profile B or assign A to B in the catalog', async t => {
+  const { moss, documents, storage } = configWorkspace(t)
+  await moss.loadProfileCatalog()
+  moss.selectConfigMethod('lora')
+  await moss.selectConfigProfile('default')
+  moss.update('train', 'rank', 19)
+  const gate = deferred(), originalFetch = globalThis.fetch
+  let sent
+  t.mock.method(globalThis, 'fetch', (url, init) => {
+    if (url === '/api/moss/profiles/default' && init?.method === 'PUT') {
+      sent = JSON.parse(init.body)
+      return gate.promise
+    }
+    return originalFetch(url, init)
+  })
+  const saving = moss.save()
+  moss.selectConfigMethod('lokr')
+  await moss.selectConfigProfile('kr')
+  gate.resolve(response(sent))
+  await saving
+  assert.equal(sent.train.rank, 19)
+  assert.equal(moss.profile, 'kr')
+  assert.equal(moss.configProfile, 'kr')
+  assert.deepEqual(moss.draft, documents.moss.kr)
+  assert.equal(moss.dirty, false)
+  assert.equal(moss.profileAlgorithms.kr, 'lokr')
+  assert.equal(storage.get('monadforge-moss-profile'), 'kr')
+})
+
+test('editing while save is pending preserves the newer draft as unsaved', async t => {
+  const { moss } = configWorkspace(t)
+  await moss.loadProfileCatalog()
+  const gate = deferred(), originalFetch = globalThis.fetch
+  let sent
+  t.mock.method(globalThis, 'fetch', (url, init) => {
+    if (init?.method === 'PUT') { sent = JSON.parse(init.body); return gate.promise }
+    return originalFetch(url, init)
+  })
+  moss.update('train', 'rank', 16)
+  const saving = moss.save()
+  moss.update('train', 'rank', 24)
+  gate.resolve(response(sent))
+  await saving
+  assert.equal(moss.draft.train.rank, 24)
+  assert.equal(JSON.parse(moss.saved).train.rank, 16)
+  assert.equal(moss.dirty, true)
+})
+
+test('failed creation of A cannot roll back a newer selection of B', async t => {
+  const { moss, documents } = configWorkspace(t)
+  await moss.loadProfileCatalog()
+  moss.selectConfigMethod('lora')
+  const gate = deferred(), originalFetch = globalThis.fetch
+  t.mock.method(globalThis, 'fetch', (url, init) => {
+    if (url.endsWith('/new-profile') && init?.method === 'PUT') return gate.promise
+    return originalFetch(url, init)
+  })
+  const creating = moss.createConfigProfile('new-profile')
+  moss.selectConfigMethod('lokr')
+  await moss.selectConfigProfile('kr')
+  gate.reject(new Error('write failed'))
+  await assert.rejects(creating, /write failed/)
+  assert.equal(moss.profile, 'kr')
+  assert.equal(moss.configMethod, 'lokr')
+  assert.deepEqual(moss.draft, documents.moss.kr)
+})
+
+test('latest profile load wins when two responses arrive in reverse order', async t => {
+  const { moss, documents } = configWorkspace(t)
+  await moss.loadProfileCatalog()
+  const a = deferred(), b = deferred()
+  t.mock.method(globalThis, 'fetch', url => url.endsWith('/default') ? a.promise : b.promise)
+  const first = moss.loadProfile('default'), second = moss.loadProfile('kr')
+  assert.equal(moss.loading, true)
+  b.resolve(response(documents.moss.kr))
+  await second
+  a.resolve(response(documents.moss.default))
+  await first
+  assert.equal(moss.profile, 'kr')
+  assert.equal(moss.loading, false)
+  assert.deepEqual(moss.draft, documents.moss.kr)
+})
+
+for (const phase of ['cache', 'train', 'generate', 'tune', 'chain']) {
+  test(`${phase} submission snapshots its own stage and runtime before async work`, async t => {
+    setup(t)
+    const moss = useMossWorkspace(), workspace = useModelWorkspace()
+    // The same keys intentionally carry different values in every stage.
+    const spec = { model_field_names: ['model_dir'] }
+    const stages = ['cache', 'train', 'generate', 'tune']
+    stages.forEach((stage, i) => { spec[stage] = [field('model_dir', '/moss-A'), field('seed', i + 1), field('output', `${stage}-A`)] })
+    moss.schema = parseSchema(spec)
+    moss.draft = initialDraft(moss.schema)
+    const original = structuredClone(JSON.parse(JSON.stringify(moss.draft)))
+    const gate = deferred(), calls = []
+    t.mock.method(globalThis, 'fetch', async (url, init) => {
+      if (url === '/api/system/runtimes') return gate.promise
+      calls.push({ url, body: JSON.parse(init.body) })
+      return response({ task_id: 'test-job' })
+    })
+    const submission = phase === 'chain' ? moss.chain() : moss.submit(phase, {})
+    moss.profile = 'profile-B'
+    moss.update('models', 'model_dir', '/moss-B')
+    for (const stage of stages) moss.update(stage, 'seed', 100)
+    workspace.runtimeProfile = 'curation'
+    workspace.select('qwen21')
+    gate.resolve(response({ runtimes: [
+      { name: 'default', available: true, python: '/python/default', error: null },
+      { name: 'curation', available: true, python: '/python/curation', error: null },
+    ] }))
+    await submission
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].url, phase === 'chain' ? '/api/moss/chain' : `/api/moss/jobs/${phase}`)
+    assert.equal(calls[0].body.runtime_profile, 'default')
+    for (const stage of phase === 'chain' ? ['cache', 'train'] : [phase]) {
+      const values = phase === 'chain' ? calls[0].body[stage].values : calls[0].body.values
+      assert.deepEqual(values, { ...original[stage], ...original.models })
+    }
+    assert.equal(moss.draft.train.seed, 100)
+  })
+}
+
+test('same-name MOSS labels and help are scoped to their request phase', async () => {
+  const { modelFieldHelp } = await import('../src/i18n/modelWorkspace.ts')
+  assert.equal(modelFieldLabel('moss', 'en', 'output', '', 'train'), 'LoRA output')
+  assert.equal(modelFieldLabel('moss', 'en', 'output', '', 'tune'), 'Tuning report (JSON)')
+  assert.equal(modelFieldLabel('moss', 'cn', 'steps', '', 'tune'), '计时训练步数')
+  assert.equal(modelFieldLabel('moss', 'cn', 'steps', '', 'generate'), '采样步数')
+  assert.match(modelFieldHelp('moss', 'cn', 'output', '', 'tune'), /JSON/)
+  assert.doesNotMatch(modelFieldHelp('moss', 'cn', 'seed', '', 'train'), /同一张图/)
+  assert.equal(modelFieldLabel('qwen21', 'cn', 'output', 'Qwen output', 'tune'), 'Qwen output')
 })

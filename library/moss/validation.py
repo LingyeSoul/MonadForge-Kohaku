@@ -8,7 +8,13 @@ from pathlib import Path
 
 from library.env import resolve_under_home
 
-from .requests import CacheRequest, GenerateRequest, TrainRequest, TuneSwapRequest
+from .requests import (
+    CacheRequest,
+    ColorizeCacheRequest,
+    GenerateRequest,
+    TrainRequest,
+    TuneSwapRequest,
+)
 
 
 def training_output_paths(output: str) -> tuple[Path, Path]:
@@ -24,8 +30,35 @@ def training_output_paths(output: str) -> tuple[Path, Path]:
     return path, report
 
 
+def validate_single_file(value: str, field: str) -> None:
+    """`--dit` / `--vae`: an existing .safetensors file, never a folder."""
+    if not value:
+        return
+    path = resolve_under_home(value)
+    if path.is_dir():
+        raise ValueError(
+            f"{field} must be a single .safetensors file, not a folder: {value!r} "
+            "(use model_dir / model for a diffusers folder)"
+        )
+    if not path.is_file():
+        raise ValueError(f"{field} does not exist: {value!r}")
+    if path.suffix.lower() != ".safetensors":
+        raise ValueError(f"{field} must be a .safetensors file: {value!r}")
+
+
+def validate_dit(dit: str) -> None:
+    """`--dit`: the single-file replacement for `--model`'s transformer folder."""
+    validate_single_file(dit, "dit")
+
+
 def validate_request(
-    req: CacheRequest | GenerateRequest | TrainRequest | TuneSwapRequest,
+    req: (
+        CacheRequest
+        | ColorizeCacheRequest
+        | GenerateRequest
+        | TrainRequest
+        | TuneSwapRequest
+    ),
 ) -> None:
     for field in dataclasses.fields(req):
         value = getattr(req, field.name)
@@ -39,7 +72,14 @@ def validate_request(
             raise ValueError(
                 "resolution must be at least 16 and max_text_tokens positive"
             )
+        # `--vae` is only opened for the latent pass, so a skip must not
+        # require it (the browser preflight makes the same allowance).
+        if not req.skip_latents:
+            validate_single_file(req.vae, "vae")
+    if isinstance(req, ColorizeCacheRequest):
+        validate_single_file(req.vae, "vae")
     if isinstance(req, TrainRequest):
+        validate_dit(req.dit)
         training_output_paths(req.output)
         if req.resume and not resolve_under_home(req.resume).is_file():
             raise ValueError(f"resume state not found: {req.resume}")
@@ -76,6 +116,10 @@ def validate_request(
         ):
             raise ValueError("invalid sigma distribution or logging interval")
     if isinstance(req, GenerateRequest):
+        # `decode_only` never opens the DiT; the VAE and out_dir are all it reads.
+        if not req.decode_only:
+            validate_dit(req.dit)
+        validate_single_file(req.vae, "vae")
         if req.width <= 0 or req.height <= 0 or req.width % 16 or req.height % 16:
             raise ValueError("width and height must be positive multiples of 16")
         if req.steps < 1 or req.cfg < 0 or req.shift <= 0:
@@ -103,6 +147,7 @@ def validate_request(
         ):
             raise ValueError("invalid Spectrum forecast parameters")
     if isinstance(req, TuneSwapRequest):
+        validate_dit(req.dit)
         if req.rank < 1 or req.patience < 1 or req.steps < 1 or req.warmup < 0:
             raise ValueError(
                 "rank, patience and timed steps must be positive; warmup non-negative"

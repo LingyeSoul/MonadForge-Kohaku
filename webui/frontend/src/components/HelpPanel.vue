@@ -23,7 +23,17 @@
           {{ activeFieldKey }}
         </div>
 
-        <div v-if="fieldHelpText" class="field-help-text mb-3">
+        <template v-if="bilingualHelp">
+          <section lang="en" class="field-help-original mb-4" data-testid="field-help-original">
+            <h3 class="text-caption mb-2">English · 英文原文</h3>
+            <div class="field-help-text">{{ bilingualHelp.original }}</div>
+          </section>
+          <section lang="zh-CN" data-testid="field-help-translation">
+            <h3 class="text-subtitle-2 mb-2">中文释义 · {{ bilingualHelp.translatedLabel }}</h3>
+            <div class="field-help-text mb-3">{{ bilingualHelp.translation }}</div>
+          </section>
+        </template>
+        <div v-else-if="fieldHelpText" class="field-help-text mb-3">
           {{ fieldHelpText }}
         </div>
         <div v-else class="text-medium-emphasis text-body-2 mb-3 font-italic">
@@ -31,7 +41,7 @@
         </div>
 
         <v-chip
-          v-if="fieldOrigin"
+          v-if="fieldOrigin && !bilingualHelp"
           size="small"
           :color="originColor(fieldOrigin)"
           variant="tonal"
@@ -56,10 +66,11 @@
 <script setup lang="ts">
 import { ref, watch, computed, nextTick } from 'vue'
 import { useI18n } from '../composables/useI18n'
+import type { FieldHelp } from '../utils/fieldHelp'
 
 const props = defineProps<{
   variant?: string
-  fieldHelp: Record<string, string>
+  fieldHelp: Record<string, FieldHelp>
   guideHtml: string
   height?: string | number
   maxHeight?: string | number
@@ -76,6 +87,7 @@ const fieldHelpText = computed(() => {
   if (!activeFieldKey.value) return ''
   return props.fieldHelp[activeFieldKey.value] || ''
 })
+const bilingualHelp = computed(() => typeof fieldHelpText.value === 'object' ? fieldHelpText.value : null)
 
 const fieldOrigin = computed(() => activeFieldOrigin.value)
 

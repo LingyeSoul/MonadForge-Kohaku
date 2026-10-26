@@ -96,6 +96,69 @@ This is the pre-Ampere fallback, not an Ampere speed option — keep `auto`/`bf1
 at 1024² still needs the swap plan a bf16 16 GB card uses (`tune_swap.py` measures it,
 and it now takes the same `--precision` / `--fp16_fix` so the plan matches the run).
 
+## ComfyUI single-file DiT
+
+`--dit` (train, generate, tune) takes the DiT from **one ComfyUI `.safetensors`**
+instead of `MOSS-Image-Base/transformer/`. The file holds only the DiT, so
+`--model_dir` still supplies the text encoder and VAE (or `--vae` a single file,
+see below): `cache` and `generate` need them, while training reads only the cache
+and needs neither (its empty prompt is the shipped
+`library/moss/asset/empty_prompt.safetensors`; the text encoder is used only when
+that asset is missing).
+
+```bash
+make daemon-run ARGS="scripts/moss/train.py --dit /path/moss_image_base_fp16_fixed.safetensors --cache post_image_dataset/moss/<set>"
+```
+
+What the loader handles, all from the header before any weight is read:
+
+- fused `layers.N.proj.qkv.weight` split into q / k / v (ComfyUI's chunk order);
+- a `model.diffusion_model.` / `diffusion_model.` / `transformer.` key prefix stripped;
+- the architecture inferred from the tensor shapes — `rope_base` comes back out of
+  the file's own `rope.bands` when that table is fp32. A 16-bit table (or one with
+  a single band) cannot state the base exactly, so those files need a `<file>.json`
+  sidecar — `foo.json` or `foo.safetensors.json` — with `{"rope_base": …}`; every
+  other key in it must agree with the inferred shapes;
+- an **fp16-fix fold undone on load**. `moss_image_base_fp16_fixed` carries
+  `kohakumoss_fp16_fix` (c = 1/16) with the fold baked into its weights; loading
+  divides it back out (exact for a power-of-two c), so the LoRA trains in the
+  official parameterisation and merges onto the diffusers base like any other.
+  `--precision fp16` then applies its runtime `online` fold once, exactly as it
+  does with the folder base.
+
+In the WebUI it is the `dit` field of the Paths section. Preflight checks the
+file's **header** (16-bit, MOSS-Image DiT, no `comfy_quant` / `weight_scale`) instead
+of requiring `transformer/`, and the resolved-paths panel shows the file it will
+load. At run time the loader's `un-folded fp16-fix c=…` line means the fold was
+undone — no extra flag is needed, and `--precision fp16` still folds once at run time.
+
+Refused: quantized single files (ComfyUI `comfy_quant` / `weight_scale`, int8 / fp8)
+— the loader reads 16-bit weights, and `--quant` quantizes a *loaded* base for
+inference only — and per-block folds (`via="proj"`), which need a runtime residual
+rescale the model does not implement. LoRA metadata records the file as `base_dit`
+(plus `base_fold_c` when its fold was undone).
+
+### ComfyUI single-file VAE
+
+`--vae` (cache, generate) takes the FLUX.2 VAE from **one `.safetensors`** instead
+of `MOSS-Image-Base/vae/`. Both key layouts load — ComfyUI's BFL / ldm `flux2-vae`
+(`encoder.down.0.block.0.…`, `decoder.up.…`, the mid attention's 1×1 convs) and a
+diffusers export — the config (block widths, layers per block, latent channels,
+patch size, attention) is inferred from the shapes, and the state then loads
+**strictly**, so a wrong file fails with its missing / unexpected keys instead of
+half-loading. Decode semantics are unchanged: latents stay fp32 and `--vae_dtype`
+picks the decode dtype.
+
+```bash
+make daemon-run ARGS="scripts/moss/cache.py --vae /path/flux2-vae.safetensors --src post_image_dataset/resized/<set>"
+make daemon-run ARGS="scripts/moss/generate.py --vae /path/flux2-vae.safetensors ..."
+```
+
+In the WebUI it is the `vae` field of the Paths section; preflight checks the
+file's **header** (`encoder.conv_in` / `bn` keys, floating 16-/32-bit weights)
+instead of requiring `vae/`. The DiT and text encoder still come from `--dit` /
+`--model_dir`.
+
 ## Training
 
 - **Defaults**: `--rank 32`, alpha 128 for `lora` (scale 4; `lokr` / `loha` use
@@ -147,6 +210,27 @@ and it now takes the same `--precision` / `--fp16_fix` so the plan matches the r
   report (per-step loss) lands beside the LoRA.
 - **`--fit_report`** (off): trains the largest sample (longest caption) at step 1 and
   reports its peak against free VRAM, with a `--blocks_to_swap` suggestion.
+- **Run report**: `python tasks.py moss-report [--progress <file> --log <file>]` (or
+  `--json`) reads a live or finished run without touching it -- moving-average loss,
+  loss deciles, throughput, peak VRAM, epoch cadence, ETA, checkpoints and samples, plus
+  an anomaly scan (rising loss, stall, dead pid, OOM / NaN / grad spikes in the log).
+  It needs nothing but the two files, so it also works on a run whose trainer is already
+  gone. Add `--checkpoint <lora.safetensors>` to validate the saved adapter from its
+  safetensors header alone (base model, rank, per-module `alpha`, dtype lane, block
+  coverage against `ss_num_blocks`, and the per-block target matrix -- 42 x 6 = 252
+  modules for the default targets) -- no torch, no GPU, no weight load.
+- **Kernel warm-up**: `python tasks.py moss-prewarm --from-cache` times the vendored
+  Triton/tilelang kernels on the dataset's real token lengths before training so the
+  first steps reuse those tables (`--dry-run` prints the plan without CUDA). On the
+  fp16 lane and on sm70 most of that plan is not consulted -- read the payoff note in
+  `docs/moss/kernels.md` before expecting a speedup.
+- **Finishing a run**: the trainer writes `<output>.safetensors` and a `<output>.json`
+  summary at the end (no per-epoch file with `--save_every_epochs 0`). Check it with one
+  stdlib command -- `python tasks.py moss-report --progress <stream> --log <trainer log>
+  --checkpoint <output>.safetensors` -- which prints the run digest plus a `## Checkpoint`
+  block (7 checks; a bad head ends `exit 2`). Measured on the 105-image V100 run: warm-up
+  cost is zero there (first step 6.53 s, median 6.53 s over 1200 steps), so the kernel
+  prewarm above is a no-op for the fp16/SDPA lane.
 - **Caption dropout** (`--caption_dropout`, default 0): keep 0. On caststation 0.05 and 0.1
   weakened the style under CFG, because the uncond prediction picks up the style and CFG
   cancels part of it (`_archive/moss_lora/caption_dropout.md`).

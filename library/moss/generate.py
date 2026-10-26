@@ -363,10 +363,22 @@ def vision_embeds(
 
     def path(j):
         key = "\0".join(
-            map(str, ("vision", precision, j["ref"], j["ref_mtime"], j["width"],
-                      j["height"], j["prompt"]))
+            map(
+                str,
+                (
+                    "vision",
+                    precision,
+                    j["ref"],
+                    j["ref_mtime"],
+                    j["width"],
+                    j["height"],
+                    j["prompt"],
+                ),
+            )
         )
-        return cache_dir / f"v_{hashlib.sha1(key.encode()).hexdigest()[:16]}.safetensors"
+        return (
+            cache_dir / f"v_{hashlib.sha1(key.encode()).hexdigest()[:16]}.safetensors"
+        )
 
     out, missing = {}, []
     for j in jobs:
@@ -402,22 +414,22 @@ def vision_embeds(
     return out
 
 
-def ref_latents(model_dir, jobs: list[dict], device) -> dict[str, torch.Tensor]:
+def ref_latents(model_dir, jobs: list[dict], device, vae="") -> dict[str, torch.Tensor]:
     """Per job key, its reference fitted to the job's size and then to
     ``ref_size`` (as ``cache.cache_refs`` builds ``*.moss_ref``), ``(1,128,h,w)``
     fp32 on the CPU."""
     from library.moss.cache import fit, load_rgb, ref_size, to_pixels
     from library.moss.model import encode
 
-    vae = load_vae(model_dir, device=device)
+    encoder = load_vae(model_dir, device=device, vae=vae)
     out = {}
     for j in jobs:
         w, h = j["width"], j["height"]
         rw, rh = ref_size(w, h, j["ref_scale"])
         image = fit(fit(load_rgb(Path(j["ref"])), w, h), rw, rh)
-        out[j["key"]] = encode(to_pixels(image), vae).float().cpu()
+        out[j["key"]] = encode(to_pixels(image), encoder).float().cpu()
         print(f"[ref] {j['key']}: {w}x{h} -> {rw}x{rh}", flush=True)
-    del vae
+    del encoder
     empty_cache()
     return out
 
@@ -463,11 +475,15 @@ def _fingerprint(req: GenerateRequest, job: dict) -> dict:
     }
     # Stamped only off bf16, so bf16 latents without the field still match.
     te = {} if req.text_encoder == "bf16" else {"text_encoder": req.text_encoder}
+    # `dit` / `quant` change the denoising base itself, so they must invalidate a
+    # saved latent exactly like `model` does.
     return dict(
         {k: v for k, v in job.items() if k != "skip"},
         **te,
         uncond_skip=list(job["skip"]),
         model=req.model,
+        dit=str(resolve_under_home(req.dit)) if req.dit else None,
+        quant=req.quant or None,
         lora=str(resolve_under_home(req.lora)) if req.lora else None,
         lora_multiplier=req.lora_multiplier if req.lora else None,
         batched=req.batched,
@@ -481,14 +497,26 @@ def _fingerprint(req: GenerateRequest, job: dict) -> dict:
     )
 
 
+def _variant_tag(rec: dict) -> str:
+    """The base discriminator in a saved file's name (stable for folder runs)."""
+    dit = rec.get("dit")
+    tag = Path(str(dit)).stem if dit else str(rec["model"])
+    quant = rec.get("quant")
+    if quant:
+        tag = f"{tag}-{quant}"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", tag)
+
+
 def _latent_path(out_dir: Path, rec: dict) -> Path:
     return (
-        out_dir / "latents" / f"{rec['key']}_{rec['model']}_s{rec['seed']}.safetensors"
+        out_dir
+        / "latents"
+        / f"{rec['key']}_{_variant_tag(rec)}_s{rec['seed']}.safetensors"
     )
 
 
 def _image_path(out_dir: Path, rec: dict) -> Path:
-    return out_dir / f"{rec['key']}_{rec['model']}_s{rec['seed']}.png"
+    return out_dir / f"{rec['key']}_{_variant_tag(rec)}_s{rec['seed']}.png"
 
 
 def save_latent(path: Path, latent: torch.Tensor, record: dict) -> None:
@@ -585,7 +613,7 @@ def _denoise_pending(req, model_dir, out_dir, pending, device) -> None:
     seen = [j for j in jobs if j.get("ref_vision")]
     seen = vision_embeds(model_dir, seen, out_dir / "_te_cache", req.text_encoder)
     refs = [j for j in jobs if j.get("ref")]
-    refs = ref_latents(model_dir, refs, device) if refs else {}
+    refs = ref_latents(model_dir, refs, device, req.vae) if refs else {}
 
     t0 = time.time()
     precision, fix, fix_c = _resolve_lane(req, device)
@@ -597,10 +625,12 @@ def _denoise_pending(req, model_dir, out_dir, pending, device) -> None:
         quant=req.quant,
         fp16_fix=fix,
         fp16_fix_c=fix_c,
+        dit=req.dit,
     )
     compute = transformer.layers[0].proj["q"].weight.dtype
+    loaded = Path(req.dit).name if req.dit else req.model
     print(
-        f"[dit] {req.model} loaded in {time.time() - t0:.1f}s, "
+        f"[dit] {loaded} loaded in {time.time() - t0:.1f}s, "
         f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB, "
         f"{str(compute).removeprefix('torch.')}"
         + (
@@ -694,30 +724,70 @@ def _vae_dtype(name: str) -> torch.dtype:
     }[name]
 
 
-def _decode_all(model_dir, out_dir, records, device, vae_dtype, vae_compile) -> None:
-    """Decode each record's latent from disk; an existing PNG is kept."""
-    todo = [r for r in records if not _image_path(out_dir, r).is_file()]
+def _decode_stamp(vae_dtype: str, vae: str) -> dict:
+    """What produced the PNGs in an output folder (the VAE is the only variable)."""
+    return {
+        "vae": str(resolve_under_home(vae)) if vae else "",
+        "vae_dtype": vae_dtype,
+    }
+
+
+def _read_decode_stamp(out_dir: Path) -> dict | None:
+    path = out_dir / "decode.json"
+    if not path.is_file():
+        return None
+    try:
+        stamp = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return stamp if isinstance(stamp, dict) else None
+
+
+def _decode_all(
+    model_dir, out_dir, records, device, vae_dtype, vae_compile, vae=""
+) -> None:
+    """Decode each record's latent from disk; an existing PNG is kept.
+
+    A PNG is only reused when it was decoded by the same VAE lane: switching
+    `--vae` (or `vae_dtype`) re-decodes, instead of silently keeping an image
+    the new decoder would not produce. A folder without `decode.json` predates
+    this stamp, so it keeps its PNGs for the default folder VAE.
+    """
+    stamp = _decode_stamp(vae_dtype, vae)
+    previous = _read_decode_stamp(out_dir)
+    stale = (previous is not None and previous != stamp) or (
+        previous is None and bool(stamp["vae"])
+    )
+    todo = (
+        list(records)
+        if stale
+        else [r for r in records if not _image_path(out_dir, r).is_file()]
+    )
     for r in records:
         r["image"] = str(_image_path(out_dir, r))
-    if not todo:
-        return
-    from diffusers.image_processor import VaeImageProcessor
+    if todo:
+        from diffusers.image_processor import VaeImageProcessor
 
-    vae = load_vae(
-        model_dir, dtype=_vae_dtype(vae_dtype), device=device, compile=vae_compile
-    )
-    processor = VaeImageProcessor(vae_scale_factor=16)
-    for rec in todo:
-        torch.cuda.reset_peak_memory_stats()
-        image = decode(load_latent(_latent_path(out_dir, rec)).to(device), vae)
-        processor.postprocess(image, output_type="pil")[0].save(rec["image"])
-        rec["decode_peak_gib"] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
-        print(
-            f"[vae] {rec['key']} -> {rec['image']} (peak {rec['decode_peak_gib']} GiB)",
-            flush=True,
+        decoder = load_vae(
+            model_dir,
+            dtype=_vae_dtype(vae_dtype),
+            device=device,
+            compile=vae_compile,
+            vae=vae,
         )
-    del vae
-    empty_cache()
+        processor = VaeImageProcessor(vae_scale_factor=16)
+        for rec in todo:
+            torch.cuda.reset_peak_memory_stats()
+            image = decode(load_latent(_latent_path(out_dir, rec)).to(device), decoder)
+            processor.postprocess(image, output_type="pil")[0].save(rec["image"])
+            rec["decode_peak_gib"] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
+            print(
+                f"[vae] {rec['key']} -> {rec['image']} (peak {rec['decode_peak_gib']} GiB)",
+                flush=True,
+            )
+        del decoder
+        empty_cache()
+    (out_dir / "decode.json").write_text(json.dumps(stamp, indent=2), encoding="utf-8")
 
 
 def run_generate(req: GenerateRequest) -> Path:
@@ -770,7 +840,9 @@ def run_generate(req: GenerateRequest) -> Path:
         if pending:
             _denoise_pending(req, model_dir, out_dir, pending, device)
 
-    _decode_all(model_dir, out_dir, records, device, req.vae_dtype, req.vae_compile)
+    _decode_all(
+        model_dir, out_dir, records, device, req.vae_dtype, req.vae_compile, req.vae
+    )
     manifest = _write_manifest(out_dir, req, records)
     print(f"manifest -> {manifest}", flush=True)
     return out_dir

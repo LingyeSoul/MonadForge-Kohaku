@@ -11,6 +11,31 @@ else
     PYTHON="python"
 fi
 
+# The WebUI serves the built Vue app from webui/frontend/dist. Without that
+# directory FastAPI exposes only /api/* and every page load is a bare 404, so
+# build it on the first run (setup-linux.sh step 4 does the same) instead of
+# opening a broken tab.
+DIST_INDEX="webui/frontend/dist/index.html"
+if [ ! -f "$DIST_INDEX" ]; then
+    if ! command -v node &>/dev/null && [ -x "tools/node/bin/node" ]; then
+        export PATH="$PWD/tools/node/bin:$PATH"
+    fi
+    if ! command -v node &>/dev/null; then
+        echo "[ERROR] WebUI frontend is not built ($DIST_INDEX is missing) and Node.js is not installed." >&2
+        echo "        Without it http://127.0.0.1:8000/ returns 404 (only /api/* is served)." >&2
+        echo "        Run ./setup-linux.sh (installs portable Node.js and builds), or install Node.js then:" >&2
+        echo "          cd webui/frontend && npm install && npm run build" >&2
+        exit 1
+    fi
+    echo "WebUI frontend not built yet — building (npm ci + vite build) ..."
+    if ! ( cd webui/frontend \
+        && node ../../scripts/webui/ensure_npm_deps.mjs --ensure --clean \
+        && npm run build ); then
+        echo "[ERROR] Frontend build failed; see the output above." >&2
+        exit 1
+    fi
+fi
+
 WEBUI_URL="http://127.0.0.1:8000"
 ANALYZER_URL="http://127.0.0.1:8320"
 

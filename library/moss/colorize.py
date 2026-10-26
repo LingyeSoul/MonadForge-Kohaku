@@ -214,14 +214,28 @@ def run_colorize_cache(req) -> Path:
         "fp32",
         False,
         False,
+        req.vae,
     )
 
-    todo = [j for j in jobs if not ref_path(j[0], j[3]).exists()]
+    stamp = moss_cache.vae_stamp(req.vae)
+
+    def ref_current(stem, held, w, h) -> bool:
+        path = ref_path(stem, held)
+        if not path.is_file():
+            return False
+        meta = moss_cache.cache_metadata(path)
+        return (
+            meta.get("target") == f"{w}x{h}"
+            and meta.get("ref_scale") == str(req.ref_scale)
+            and meta.get("vae", "") == stamp
+        )
+
+    todo = [j for j in jobs if not ref_current(j[0], j[3], *j[4])]
     if todo:
         from library.moss.loader import load_vae
         from library.moss.model import encode as vae_encode
 
-        vae = load_vae(req.model_dir, device=device)
+        vae = load_vae(req.model_dir, device=device, vae=req.vae)
         for i, (stem, cond, _, held, (w, h)) in enumerate(todo, 1):
             rw, rh = moss_cache.ref_size(w, h, req.ref_scale)
             page = moss_cache.fit(moss_cache.load_rgb(cond), w, h)
@@ -235,6 +249,7 @@ def run_colorize_cache(req) -> Path:
                     "target": f"{w}x{h}",
                     "ref_scale": str(req.ref_scale),
                     "condition": str(cond),
+                    "vae": stamp,
                 },
             )
             print(f"  ref {i}/{len(todo)} {stem}: {w}x{h} -> {rw}x{rh}", flush=True)

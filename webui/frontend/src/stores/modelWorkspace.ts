@@ -43,9 +43,10 @@ export const useModelWorkspace = defineStore('model-workspace', () => {
     runtimeError.value = ''
   }
   async function runtimeForSubmit(): Promise<RuntimeProfileName> {
+    const name = runtimeProfile.value
     if (!runtimes.value.length) await loadRuntimes()
-    const selected = runtimes.value.find(entry => entry.name === runtimeProfile.value)
-    if (!selected?.available) throw new Error(selected?.error || `Runtime ${runtimeProfile.value} is unavailable`)
+    const selected = runtimes.value.find(entry => entry.name === name)
+    if (!selected?.available) throw new Error(selected?.error || `Runtime ${name} is unavailable`)
     return selected.name
   }
   function select(value: ModelFamily): void {

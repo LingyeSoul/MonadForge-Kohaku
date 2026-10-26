@@ -17,10 +17,14 @@ so none page at any prompt length.
 
 from __future__ import annotations
 
+import logging
+import os
 from pathlib import Path
 
 import torch
+from accelerate import init_empty_weights
 
+from library.env import resolve_under_home
 from library.moss.model import MOSSImageTransformer
 from library.moss.requests import variant_dir
 from library.runtime.device import clean_memory as empty_cache
@@ -28,6 +32,13 @@ from library.runtime.device import free_vram_gb
 
 MAX_SEQUENCE_LENGTH = 4096
 TE_PRECISIONS = ("bf16", "fp8", "int8")
+
+logger = logging.getLogger(__name__)
+
+# MONADFORGE_MOSS_COMPILE_PROBE=0 trusts the stack without testing it.
+PROBE_ENV = "MONADFORGE_MOSS_COMPILE_PROBE"
+_OFF = frozenset({"0", "false", "off", "no"})
+_PROBE: bool | None = None
 
 
 def te_reserve_gb(max_tokens: int) -> float:
@@ -235,6 +246,62 @@ def resolve_compute_dtype(precision="auto", device=None) -> torch.dtype:
     raise ValueError(f"precision must be auto, bf16 or fp16, not {precision!r}")
 
 
+def _load_folder(model_dir, variant, dtype):
+    """The published diffusers `transformer/` folder of one variant."""
+    tr = MOSSImageTransformer.from_pretrained(
+        variant_dir(model_dir, variant) / "transformer", torch_dtype=dtype
+    ).eval()
+    tr.base_file = None
+    tr.base_fold = None
+    return tr
+
+
+def _load_single_file(dit, dtype):
+    """A ComfyUI single file: header check, inferred arch, one tensor at a time.
+
+    The file holds only the DiT (fused `proj.qkv`, optionally a key prefix and an
+    fp16-fix fold in its weights); `library.moss.checkpoint` splits, strips and
+    un-folds it, so the result is interchangeable with the diffusers folder and
+    the fp16 guards below apply exactly as they do there. The host peak is the
+    model plus one weight: each tensor is assigned as it is read.
+    """
+    from library.moss import checkpoint
+
+    path = resolve_under_home(dit)
+    if path.is_dir():
+        raise ValueError(
+            f"dit={dit!r} is a folder: a single-file DiT is one .safetensors "
+            "(keep --model/--model_dir for a diffusers folder)"
+        )
+    if not path.is_file():
+        raise ValueError(f"dit={dit!r} is not a file")
+    checkpoint.assert_compute_weights(path)
+    fold = checkpoint.fold_record(path)
+    cfg = checkpoint.arch_config(path)
+    with init_empty_weights():
+        tr = MOSSImageTransformer(**cfg)
+    plan = checkpoint.inspect(
+        path, {key: tuple(t.shape) for key, t in tr.state_dict().items()}
+    )
+    for name, tensor in checkpoint.read_state(path, plan, dtype, fold):
+        checkpoint.assign(tr, name, tensor)
+    tr.eval().requires_grad_(False)
+    tr.base_file = str(path)
+    tr.base_fold = fold
+    print(
+        f"[dit] {path.name}: {len(plan)} tensors, "
+        f"{cfg['num_layers']} blocks x {cfg['dim']}, "
+        f"{str(dtype).removeprefix('torch.')}"
+        + (
+            f", un-folded fp16-fix c={fold['c']:g} from the weights"
+            if fold is not None
+            else ""
+        ),
+        flush=True,
+    )
+    return tr
+
+
 def load_transformer(
     model_dir,
     variant="base",
@@ -243,8 +310,16 @@ def load_transformer(
     quant="",
     fp16_fix=None,
     fp16_fix_c=None,
+    dit="",
 ):
     """The DiT in its compute dtype (``dtype=None``: resolved for this device).
+
+    ``dit`` loads a **ComfyUI single file** (one ``.safetensors`` holding only
+    the DiT) instead of ``variant_dir(model_dir, variant) / "transformer"``: fused
+    ``proj.qkv`` rows are split into q / k / v, key prefixes stripped, the
+    architecture inferred from the file's shapes, and its fp16-fix fold undone on
+    load (``library.moss.checkpoint``). The text encoder and VAE still come from
+    ``model_dir``.
 
     fp16 compute turns on the residual-stream guard: the 42-block stream exceeds
     fp16's 65504 ceiling and overflows to NaN without one. ``fp16_fix`` picks it
@@ -262,9 +337,11 @@ def load_transformer(
     """
     if dtype is None:
         dtype = resolve_compute_dtype("auto", device)
-    tr = MOSSImageTransformer.from_pretrained(
-        variant_dir(model_dir, variant) / "transformer", torch_dtype=dtype
-    ).eval()
+    tr = (
+        _load_single_file(dit, dtype)
+        if dit
+        else _load_folder(model_dir, variant, dtype)
+    )
     if dtype == torch.float16:
         from library.moss.requests import DEFAULT_FP16_FIX, DEFAULT_FP16_FIX_C
 
@@ -288,10 +365,113 @@ def load_transformer(
     return tr
 
 
+def triton_compile_ok() -> bool:
+    """Whether ``torch.compile`` can trace this Triton stack (probed once, cached).
+
+    Dynamo derives a Triton kernel's mutated-argument list by generating TTIR from
+    the call's example arguments, where a runtime scalar such as a norm ``eps``
+    arrives as a Python ``float``. The vendored kernels do ``eps.to(tl.float32)``,
+    so on a torch/triton pair that hands scalars through untraced the probe raises
+    ``AttributeError``; torch then assumes *every* input is mutated and the
+    compiled graph reinterprets a buffer at the wrong dtype (``float != Half``
+    inside the first ``mm``). That is a hard crash on step 1 of a fused run, so
+    the compatibility is measured rather than assumed.
+    """
+    global _PROBE
+    if _PROBE is not None:
+        return _PROBE
+    if os.environ.get(PROBE_ENV, "1").strip().lower() in _OFF:
+        _PROBE = True
+        return True
+    if not torch.cuda.is_available():
+        _PROBE = True  # nothing to fuse without a card; fuse() declines anyway
+        return True
+    healthy, transient = _probe_triton_compile()
+    # A transient failure (the probe could not run, e.g. OOM) says nothing about
+    # this torch/triton pair, so it must not be cached as a permanent verdict.
+    if not transient:
+        _PROBE = healthy
+    return healthy
+
+
+def _probe_matches(reference: torch.Tensor, got: torch.Tensor) -> bool:
+    """Whether a compiled probe reproduced the eager result, dtype included.
+
+    The mismatch this guards against is a *dtype* one (a fp32 buffer reaching the
+    fp16 projection), so the dtype is compared before the values: a fp32 answer
+    that happens to hold the right numbers is still a broken graph.
+    """
+    if got.dtype != reference.dtype or got.shape != reference.shape:
+        return False
+    return bool(torch.allclose(got, reference, atol=2e-2, rtol=2e-2))
+
+
+def _probe_triton_compile() -> bool:
+    """Compile the real fused norm plus a projection, and check what comes out.
+
+    The incompatibility is not a trace-time exception: dynamo *warns* that it
+    cannot introspect the kernel and assumes every argument is mutated, so the
+    first real step feeds a fp32 buffer to a fp16 GEMM (``expected mat1 and mat2
+    to have the same dtype ... float != c10::Half``). A synthetic kernel cannot
+    be trusted to reproduce that, so the probe runs the vendored op at a small
+    training shape and compares against the eager result. ~5 s, once per process.
+    """
+    from library.moss import ops
+
+    def forward(x, weight, shift, scale, seg, proj):
+        y = ops.rms_norm_mod(x, weight, shift, scale, seg, 1e-6)
+        return y @ proj
+
+    rows, dim = 16, 256
+    transient = False
+    try:
+        device = torch.device("cuda")
+        x = torch.randn(rows, dim, device=device, dtype=torch.float16)
+        weight = torch.ones(dim, device=device, dtype=torch.float16)
+        shift = torch.zeros(1, dim, device=device, dtype=torch.float16)
+        scale = torch.zeros(1, dim, device=device, dtype=torch.float16)
+        seg = torch.zeros(rows, device=device, dtype=torch.int32)
+        proj = torch.randn(dim, dim, device=device, dtype=torch.float16)
+        args = (x, weight, shift, scale, seg, proj)
+        reference = forward(*args)
+        got = torch.compile(forward, dynamic=True)(*args)
+        healthy = _probe_matches(reference, got)
+        reason = "compiled result differs from the eager one" if not healthy else ""
+    except torch.cuda.OutOfMemoryError as err:
+        # Not a torch/triton incompatibility: the card could not run the probe.
+        # Report it, but do not poison the once-per-process cache with a verdict
+        # that says nothing about this stack.
+        healthy = False
+        transient = True
+        reason = f"{type(err).__name__}: {str(err).splitlines()[0][:200]}"
+    except Exception as err:  # noqa: BLE001 — any failure means do not compile
+        healthy = False
+        reason = f"{type(err).__name__}: {str(err).splitlines()[0][:200]}"
+    if not healthy:
+        logger.warning(
+            "torch.compile cannot run the fused MOSS Triton kernels correctly on "
+            "this torch/triton pair (%s); compiling is skipped and the fused "
+            "kernels run eagerly. Set %s=0 to compile anyway.",
+            reason,
+            PROBE_ENV,
+        )
+    return healthy, transient
+
+
 def compile_blocks(blocks) -> None:
     """``torch.compile(dynamic=True)`` on each block's ``forward`` (instance
     attribute, so swap hooks stay outside the graph). One graph for every joint
-    length; must run after ``LoRANetwork.apply_to`` / ``load_for_inference``."""
+    length; must run after ``LoRANetwork.apply_to`` / ``load_for_inference``.
+
+    Compiling a *fused* block first checks that dynamo can trace the Triton
+    kernels (:func:`triton_compile_ok`); when it cannot, the blocks keep running
+    their fused ops eagerly instead of crashing inside the graph. The reference
+    branch has no Triton kernel to trace and always compiles.
+    """
+    if any(getattr(block, "fused", False) for block in blocks) and not (
+        triton_compile_ok()
+    ):
+        return
     limit = max(torch._dynamo.config.recompile_limit, 16)
     torch._dynamo.config.recompile_limit = limit
     # dynamic=True otherwise lifts float attributes (the LoRA's scale ·
@@ -302,13 +482,21 @@ def compile_blocks(blocks) -> None:
         block.forward = torch.compile(block.forward, dynamic=True)
 
 
-def load_vae(model_dir, dtype=torch.float32, device=None, compile=False):
-    from diffusers import AutoencoderKLFlux2
+def load_vae(model_dir, dtype=torch.float32, device=None, compile=False, vae=""):
+    """The FLUX.2 VAE in `dtype`: `vae=` reads one ComfyUI / diffusers
+    `.safetensors` (either key layout, config inferred; `library.moss.checkpoint`),
+    otherwise `<base>/vae/`."""
+    if vae:
+        from library.moss.checkpoint import load_vae_file
 
-    vae = AutoencoderKLFlux2.from_pretrained(
-        variant_dir(model_dir, "base") / "vae", torch_dtype=dtype
-    ).eval()
+        model = load_vae_file(resolve_under_home(vae), dtype)
+    else:
+        from diffusers import AutoencoderKLFlux2
+
+        model = AutoencoderKLFlux2.from_pretrained(
+            variant_dir(model_dir, "base") / "vae", torch_dtype=dtype
+        ).eval()
     if compile:
-        vae.to(memory_format=torch.channels_last)
-        vae.decode = torch.compile(vae.decode, dynamic=True)
-    return vae.to(device) if device is not None else vae
+        model.to(memory_format=torch.channels_last)
+        model.decode = torch.compile(model.decode, dynamic=True)
+    return model.to(device) if device is not None else model

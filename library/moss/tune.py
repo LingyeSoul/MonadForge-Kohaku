@@ -127,6 +127,8 @@ class _Bench:
     def __init__(self, req: TuneSwapRequest, transformer, network, samples, device):
         self.req = req
         self.transformer = transformer
+        self.fp32_adapters = getattr(network, "fp32_compute", False)
+        self.attached = None
         self.params = list(network.parameters())
         self.samples = samples
         self.latents, self.embeds, self.refs = [], [], []
@@ -145,7 +147,7 @@ class _Bench:
         """Place, budget, compile, time; always leaves the DiT back on CPU."""
         req = self.req
         result = {"blocks_to_swap": swap, "grad_checkpointing": grad_checkpointing}
-        attached = place(self.transformer, self.device, swap, reserve_gb=0.0)
+        self.attached = place(self.transformer, self.device, swap, reserve_gb=0.0)
         try:
             empty_cache()
             free = free_vram_gb()
@@ -168,22 +170,28 @@ class _Bench:
                 for p in self.params:
                     p.grad = None
                 empty_cache()
+                # The aborted forward can leave a swapped block's weights
+                # mid-move (the offloader queues the CPU copy and the forward
+                # dies before the next hook waits for it), so a retry would
+                # read them on the wrong device. Place the model again.
+                self._replace(swap)
                 if grad_checkpointing:
                     break
                 budget = round(budget - req.budget_step, 6)
             result["skipped"] = "does not fit"
             return result
         finally:
-            self._restore(attached)
+            self._restore()
 
     def _time(self, budget: float, grad_checkpointing: bool) -> dict:
         req = self.req
         blocks = self.transformer.layers
         _unwrap(blocks)
-        fuse(self.transformer)
+        fuse(self.transformer, fp32_adapters=self.fp32_adapters)
         set_activation_memory_budget(budget)
         torch._dynamo.reset()
-        compile_blocks(blocks)
+        if req.compile:
+            compile_blocks(blocks)
         if grad_checkpointing:
             checkpoint_blocks(blocks)
         optimizer = torch.optim.AdamW(self.params, lr=1e-6)
@@ -232,7 +240,17 @@ class _Bench:
             "free_gb": round(free_vram_gb(), 3),
         }
 
-    def _restore(self, attached) -> None:
+    def _replace(self, swap: int) -> None:
+        """Drop the current placement and put the DiT back on the card."""
+        attached, self.attached = self.attached, None
+        if attached is not None:
+            attached.detach()
+        _unwrap(self.transformer.layers)
+        empty_cache()
+        self.attached = place(self.transformer, self.device, swap, reserve_gb=0.0)
+
+    def _restore(self) -> None:
+        attached, self.attached = self.attached, None
         _unwrap(self.transformer.layers)
         set_activation_memory_budget(1.0)
         torch._dynamo.reset()
@@ -293,6 +311,7 @@ def run_tune(req: TuneSwapRequest) -> dict:
         dtype=resolve_compute_dtype(req.precision, device),
         fp16_fix=req.fp16_fix,
         fp16_fix_c=req.fp16_fix_c,
+        dit=req.dit,
     )
     transformer.requires_grad_(False)
     network = LoRANetwork(
@@ -336,6 +355,7 @@ def run_tune(req: TuneSwapRequest) -> dict:
         "batch_size": req.batch_size,
         "token_batch": req.token_batch,
         "rank": req.rank,
+        "compile": req.compile,
         "margin_gb": req.margin_gb,
         "tolerance": req.tolerance,
         "arms": arms,

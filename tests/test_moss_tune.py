@@ -1,4 +1,5 @@
 import pytest
+import torch
 
 from library.moss.requests import TuneSwapRequest
 from library.moss.train import budget_for_free, step_reserve_gb
@@ -67,3 +68,66 @@ def test_pick_respects_margin():
 def test_request_round_trip():
     req = TuneSwapRequest(sizes="1024x1024:300", swap_grid="16,24", reference=False)
     assert TuneSwapRequest.from_argv(req.to_argv()) == req
+
+
+def test_an_oom_replaces_the_model_before_the_next_budget(monkeypatch):
+    """An aborted forward can leave swapped blocks on the CPU; a plain retry then
+    reads them on the wrong device, so the arm must place the model again."""
+    from types import SimpleNamespace
+
+    from library.moss import tune
+
+    class Attached:
+        def __init__(self, tag: int):
+            self.tag = tag
+            self.detached = False
+
+        def detach(self) -> None:
+            self.detached = True
+
+    placements: list[int] = []
+
+    def fake_place(_model, _device, swap, **_kwargs):
+        placements.append(swap)
+        return Attached(len(placements))
+
+    monkeypatch.setattr(tune, "place", fake_place)
+    monkeypatch.setattr(tune, "empty_cache", lambda: None)
+    monkeypatch.setattr(tune, "free_vram_gb", lambda: 10.0)
+    monkeypatch.setattr(tune, "budget_for_free", lambda *_args, **_kwargs: 0.5)
+
+    bench = tune._Bench.__new__(tune._Bench)
+    bench.transformer = SimpleNamespace(layers=[], to=lambda *_a, **_k: None)
+    bench.device = "cuda"
+    bench.attached = None
+    bench.params = []
+    bench.joint = 4000
+    bench.fp32_adapters = False
+    bench.req = TuneSwapRequest(steps=1)
+
+    attempts: list[float] = []
+
+    def fake_time(budget, _grad_checkpointing):
+        attempts.append(budget)
+        if len(attempts) == 1:
+            raise torch.OutOfMemoryError("fixture: out of memory")
+        return {"s_per_step": 1.0, "peak_allocated_gb": 1.0, "peak_reserved_gb": 1.0}
+
+    monkeypatch.setattr(bench, "_time", fake_time, raising=False)
+
+    result = bench.arm(8)
+    assert result["blocks_to_swap"] == 8
+    assert result["oom_budgets"] == [0.5]
+    assert result["s_per_step"] == 1.0
+    # Placed once for the arm, then again after the OOM; the retry ran lower.
+    assert placements == [8, 8]
+    assert attempts[1] < attempts[0]
+    assert bench.attached is None  # _restore took the last placement back
+
+
+def test_tune_request_carries_the_compile_switch():
+    """The tuning form can turn compilation off, like the training form can."""
+    req = TuneSwapRequest(compile=False)
+    assert req.to_argv() == ["--no-compile"]
+    assert TuneSwapRequest.from_argv(req.to_argv()) == req
+    assert TuneSwapRequest().compile is True

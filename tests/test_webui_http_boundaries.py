@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -42,6 +44,20 @@ def test_spa_serves_assets_and_routes_but_not_unknown_api(static_client):
     response = static_client.get("/api/nonexistent")
     assert response.status_code == 404
     assert response.json()["detail"]
+
+
+def test_missing_frontend_build_is_reported(tmp_path, monkeypatch, caplog):
+    """A missing dist/ must not look like a broken app: say why / is a 404."""
+    from webui import server
+
+    missing = tmp_path / "dist"
+    monkeypatch.setattr(server, "_DIST_DIR", missing)
+    monkeypatch.setattr(server, "_INDEX_HTML", missing / "index.html")
+    monkeypatch.setattr("library.config.io.migrate_custom_configs", lambda: None)
+    with caplog.at_level(logging.WARNING, logger="webui"):
+        client = TestClient(server.create_app())
+    assert client.get("/").status_code == 404
+    assert any("frontend build missing" in r.message for r in caplog.records)
 
 
 @pytest.mark.parametrize(

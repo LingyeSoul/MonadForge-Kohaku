@@ -27,7 +27,8 @@ def browse_directory(dir_path: str, ext: str | None = None) -> dict:
     dir_path:
         Relative to ROOT or absolute. Empty string falls back to ROOT.
     ext:
-        If set, only include files with this extension (e.g. ``.safetensors``).
+        If set, only include files whose suffix is in this comma-separated list
+        (e.g. ``.safetensors`` or ``.png,.jpg``); case-insensitive.
 
     Returns
     -------
@@ -37,7 +38,13 @@ def browse_directory(dir_path: str, ext: str | None = None) -> dict:
         dir_path = str(ROOT)
     resolved = resolve_path(dir_path, expect_file=False)
     if resolved is None:
-        return {"current_dir": dir_path, "parent": None, "subdirs": [], "files": [], "error": "Directory not found"}
+        return {
+            "current_dir": dir_path,
+            "parent": None,
+            "subdirs": [],
+            "files": [],
+            "error": "Directory not found",
+        }
 
     subdirs = []
     for p in sorted(resolved.iterdir()):
@@ -45,24 +52,29 @@ def browse_directory(dir_path: str, ext: str | None = None) -> dict:
             subdirs.append({"name": p.name, "path": str(p)})
 
     files = []
+    wanted = {
+        suffix.strip().lower() for suffix in (ext or "").split(",") if suffix.strip()
+    }
     for p in sorted(
         (f for f in resolved.iterdir() if f.is_file()),
         key=lambda f: f.name,
     ):
-        if ext and p.suffix != ext:
+        if wanted and p.suffix.lower() not in wanted:
             continue
-        if not ext and p.suffix not in _MODEL_EXTS:
+        if not wanted and p.suffix not in _MODEL_EXTS:
             continue
         stat = p.stat()
         size = stat.st_size
         mtime = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
-        files.append({
-            "name": p.name,
-            "path": str(p),
-            "size": size,
-            "size_human": _human_size(size),
-            "mtime": mtime,
-        })
+        files.append(
+            {
+                "name": p.name,
+                "path": str(p),
+                "size": size,
+                "size_human": _human_size(size),
+                "mtime": mtime,
+            }
+        )
 
     parent = str(resolved.parent) if resolved.parent != resolved else None
     try:

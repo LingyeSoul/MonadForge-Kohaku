@@ -11,6 +11,8 @@ import { spawnSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { installArgs } from "./npm_args.mjs";
+
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const frontendDir = resolve(scriptDir, "../../webui/frontend");
 const lockPath = resolve(frontendDir, "package-lock.json");
@@ -311,18 +313,30 @@ function verifyAfterInstall() {
   }
 }
 
+function npmMajorVersion() {
+  const result = runNpm(["--version"]);
+  if (result.error || result.status === null) {
+    fail(`npm could not be started (${result.error?.message ?? "unknown error"})`);
+  }
+  const major = Number.parseInt(String(result.stdout || "").trim().split(".")[0], 10);
+  if (!Number.isFinite(major) || result.status !== 0) {
+    fail(
+      `npm --version failed (status ${result.status}): ${String(result.stderr || "").trim()}`,
+    );
+  }
+  return major;
+}
+
 function installFromLock() {
   const offline = process.argv.includes("--offline") || process.env.ANIMA_NPM_OFFLINE === "1";
   console.log(
     `[npm-security] repairing frontend tree with npm ci --ignore-scripts (${offline ? "offline" : "prefer-offline"} mode)`,
   );
-  const result = runNpm([
-    "ci",
-    "--ignore-scripts",
-    offline ? "--offline" : "--prefer-offline",
-    "--no-audit",
-    "--no-fund",
-  ]);
+  const args = installArgs(npmMajorVersion(), offline);
+  const result = runNpm(args);
+  if (result.error || result.status === null) {
+    fail(`npm ci could not be started (${result.error?.message ?? "unknown error"})`);
+  }
   if (result.stdout) process.stdout.write(result.stdout);
   if (result.stderr) process.stderr.write(result.stderr);
   return result.status === 0;

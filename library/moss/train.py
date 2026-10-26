@@ -378,8 +378,12 @@ def empty_prompt_embeds(req: TrainRequest) -> torch.Tensor:
 
 
 RESUME_FORMAT = 1
+# `dit` arrived with the single-file DiT; a state file written before it has no
+# `dit` key, and an empty one is exactly what those runs trained on.
+_RESUME_DEFAULTS = {"dit": ""}
 _RESUME_KEYS = (
     "model",
+    "dit",
     "algo",
     "rank",
     "alpha",
@@ -476,6 +480,19 @@ def save_resume_state(
     torch.save(_cpu_tree(state), path)
 
 
+def resume_mismatch(saved: dict, current: dict) -> dict:
+    """The keys a saved state disagrees on.
+
+    ``dit`` arrived after the first resume format, so a state file written before
+    it has no key: an empty ``dit`` is exactly what those runs trained on.
+    """
+    return {
+        key: (saved.get(key, _RESUME_DEFAULTS.get(key)), current[key])
+        for key in current
+        if saved.get(key, _RESUME_DEFAULTS.get(key)) != current[key]
+    }
+
+
 def load_resume_state(
     path: Path,
     *,
@@ -494,11 +511,7 @@ def load_resume_state(
         raise SystemExit(f"unsupported MOSS resume format in {path}")
     saved = state["signature"]
     current = resume_signature(req)
-    mismatch = {
-        key: (saved.get(key), current.get(key))
-        for key in current
-        if saved.get(key) != current.get(key)
-    }
+    mismatch = resume_mismatch(saved, current)
     if mismatch:
         raise SystemExit(
             "resume state does not match this run: "
@@ -637,6 +650,7 @@ def train(
         dtype=compute,
         fp16_fix=req.fp16_fix,
         fp16_fix_c=req.fp16_fix_c,
+        dit=req.dit,
     )
     transformer.requires_grad_(False)
     transformer.ref_timestep = req.ref_timestep if req.ref_timestep >= 0 else None
@@ -735,7 +749,7 @@ def train(
             f"on {len(repa_targets)}/{len(samples)} samples",
             flush=True,
         )
-    fused = fuse(transformer)
+    fused = fuse(transformer, fp32_adapters=getattr(network, "fp32_compute", False))
     if fused:
         print(f"[kernels] fused block ops on {fused} blocks", flush=True)
     if req.compile:
@@ -802,6 +816,12 @@ def train(
     }
     if req.token_batch > 0:
         meta["token_batch"] = req.token_batch
+    if req.dit:
+        # Provenance only: an fp16-fix fold in the file was undone on load, so the
+        # LoRA is in the official parameterisation like every folder-trained run.
+        meta["base_dit"] = Path(req.dit).name
+        if getattr(transformer, "base_fold", None) is not None:
+            meta["base_fold_c"] = f"{transformer.base_fold['c']:g}"
     if compute == torch.float16:
         # A sample is only the trained model when the fix (and c) match.
         meta["fp16_fix"] = req.fp16_fix
